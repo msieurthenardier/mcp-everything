@@ -57,6 +57,7 @@ Or in any client's MCP configuration:
 | `sandbox_read_file` / `sandbox_write_file` | Move text in and out of a sandbox. |
 | `set_project_network` | Turn a sandbox's outbound network on or off. |
 | `discover_tools` | Regenerate tools, optionally for executables you built by hand. |
+| `connect_mcp_server` / `disconnect_mcp_server` | Proxy an MCP server that runs inside a project's sandbox. |
 | `uninstall_project` | Delete a project's container, volume and tools. |
 
 Repositories can be given as `owner/name` (GitHub), `github:owner/name`,
@@ -76,7 +77,9 @@ commit.
    scripts of the installed Python distribution, `bin` entries of
    `package.json` (including workspace packages), Cargo and Go binaries,
    gem executables, and anything installed to `/opt/mcpe/bin`.
-6. **Generate.** Each executable is run with `--help` (the top-level command
+6. **Proxy.** Commands that turn out to be MCP servers are connected to
+   instead (see below).
+7. **Generate.** Each remaining executable is run with `--help` (the top-level command
    also with `-h` and `help`), and so is each subcommand it lists, two levels
    deep. Options become typed properties, value choices become enums, and
    every tool also accepts `args`, `stdin`, `cwd` and `timeout_seconds`.
@@ -100,6 +103,50 @@ JavaScript in the checkout), `<slug>__npm_run` (package scripts) and
 
 Inside a sandbox the checkout is `/workspace/repo` and `/workspace/work` is
 scratch space, which is the default working directory of generated tools.
+
+### Projects that are MCP servers
+
+If the installed project is itself an MCP server, it is started inside its
+sandbox and its tools are republished here under the project's prefix:
+
+```
+install_project("modelcontextprotocol/servers")
+servers__read_graph({})                 # tool of mcp-server-memory, proxied
+servers__get_sum({ a: 2, b: 40 })       # tool of mcp-server-everything, proxied
+```
+
+Detection is by probing. A command is started without arguments and offered
+an MCP handshake over stdio when the package that provides it depends on an
+MCP SDK (`@modelcontextprotocol/*` or `fastmcp` on npm, `mcp` or `fastmcp` on
+PyPI), or, failing that, when the repository's root manifests or name point to
+MCP. Commands that answer are proxied; the rest are reported in a warning.
+
+Servers that need arguments, environment variables or a different entry point
+are registered by hand:
+
+```
+connect_mcp_server(project: "servers",
+                   command: ["mcp-server-filesystem", "/workspace/work"])
+connect_mcp_server(project: "some-api-server",
+                   command: ["node", "build/index.js"],
+                   env: { "API_KEY": "..." })
+```
+
+How it behaves:
+
+- A server process is started on first use with `docker exec -i`, shared by
+  later calls, stopped after `MCPE_MCP_IDLE_TIMEOUT` seconds without use, and
+  restarted on the next call. It is also stopped, inside the sandbox, when a
+  call exceeds `MCPE_TOOL_TIMEOUT`.
+- The sandbox's network policy applies: a server that calls an external API
+  needs `set_project_network(project, true)`.
+- Only tools are proxied, over stdio. Upstream resources, prompts, sampling
+  and HTTP transports are not.
+- Arguments are forwarded as given and validated by the upstream server. Of
+  its results, text, images and audio are passed on; embedded text resources
+  become text; everything else is dropped.
+- Proxied tools count toward `MCPE_MAX_TOOLS_PER_PROJECT`; a warning says so
+  when some did not fit.
 
 ### When the automatic build is not enough
 
@@ -152,6 +199,14 @@ What it does not do:
   `[sandboxed <repo>]`, but a malicious project can still put misleading text
   in front of the model. Review what you install, and keep approval prompts
   on for generated tools.
+- **Proxied MCP servers describe themselves.** Their tool descriptions are
+  bounded and labelled like generated ones, but their argument schemas are
+  passed through as the server wrote them, including any text inside.
+- **Server environment values are stored in plain text** in the registry file
+  (`registry.json`, readable only by you) so the server can be restarted.
+  They are handed to Docker through a private temporary file, not the command
+  line, and are never echoed back by any tool. `disconnect_mcp_server` or
+  `uninstall_project` removes them.
 - **License is reported, not enforced.** The license found in the repository
   is shown at install time with a warning when none is found; the server does
   not verify that a repository is open source.
@@ -171,6 +226,8 @@ Environment variables, all optional:
 | `MCPE_INSTALL_TIMEOUT` | `900` | Build time limit, seconds. |
 | `MCPE_TOOL_TIMEOUT` | `120` | Default time limit of a tool call, seconds. |
 | `MCPE_MAX_TOOLS_PER_PROJECT` | `40` | Cap on generated tools per project. |
+| `MCPE_MCP_STARTUP_TIMEOUT` | `30` | Seconds a proxied MCP server may take to answer the handshake. |
+| `MCPE_MCP_IDLE_TIMEOUT` | `600` | Seconds of inactivity before a proxied MCP server is stopped. |
 | `MCPE_MAX_OUTPUT_BYTES` | `100000` | Cap on captured stdout and stderr, each. |
 | `MCPE_IMAGE`, `MCPE_IMAGE_<ECOSYSTEM>` | see table | Override sandbox images. Images need `sh`, `git` and coreutils `timeout`. |
 | `MCPE_NAME_PREFIX` | `mcpe-` | Prefix of container and volume names. |
@@ -208,6 +265,7 @@ src/forge/      repository reference parsing, GitHub/GitLab search
 src/sandbox/    Docker wrapper: probe, container lifecycle, exec, network
 src/install/    build system detection, install recipes, orchestration
 src/toolgen/    --help parser, help crawler, tool naming, argv construction
+src/proxy/      client sessions to MCP servers running inside sandboxes
 src/registry.ts persistent project registry (shared between sessions)
 src/server.ts   MCP server: built-in tools and dispatch to generated tools
 ```

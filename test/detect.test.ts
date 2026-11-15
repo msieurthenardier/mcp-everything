@@ -79,6 +79,28 @@ describe("detect", () => {
   });
 });
 
+describe("MCP SDK detection", () => {
+  const hint = (files: Record<string, string>) => detect(probe(files)).mcpHint;
+
+  it("recognizes MCP SDK dependencies in each ecosystem", () => {
+    expect(hint({ "package.json": JSON.stringify({ dependencies: { "@modelcontextprotocol/sdk": "^1" } }) })).toBe(true);
+    expect(hint({ "package.json": JSON.stringify({ peerDependencies: { fastmcp: "*" } }) })).toBe(true);
+    expect(hint({ "pyproject.toml": '[project]\nname = "x"\ndependencies = ["httpx", "mcp[cli]>=1.2"]\n' })).toBe(true);
+    expect(hint({ "pyproject.toml": '[tool.poetry.dependencies]\nfastmcp = "^2"\n' })).toBe(true);
+    expect(hint({ "requirements.txt": "requests\nmcp==1.9.0\n" })).toBe(true);
+    expect(hint({ "Cargo.toml": '[package]\nname = "x"\n[dependencies]\nrmcp = "0.1"\n' })).toBe(true);
+    expect(hint({ "go.mod": "module x\nrequire github.com/mark3labs/mcp-go v0.30.0\n" })).toBe(true);
+  });
+
+  it("does not fire on lookalikes or dev-only tooling", () => {
+    expect(hint({ "package.json": JSON.stringify({ devDependencies: { "@modelcontextprotocol/inspector": "1" }, dependencies: { express: "4" } }) })).toBe(false);
+    expect(hint({ "pyproject.toml": '[project]\nname = "x"\ndependencies = ["mcpadapt", "pymcp-tools", "mcp-proxy-thing"]\n' })).toBe(false);
+    expect(hint({ "requirements.txt": "mcpower==1\n# mcp is great\n" })).toBe(false);
+    expect(hint({ "go.mod": "module x\n" })).toBe(false);
+    expect(hint({})).toBe(false);
+  });
+});
+
 describe("parseMakeTargets", () => {
   it("lists explicit targets and skips variables, patterns and special targets", () => {
     const targets = parseMakeTargets(

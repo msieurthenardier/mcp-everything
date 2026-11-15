@@ -6,39 +6,11 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
-import { Docker, parseProbeOutput, type ExecOptions, type ExecResult } from "../src/sandbox/docker.js";
+import { parseProbeOutput } from "../src/sandbox/docker.js";
 import { App } from "../src/server.js";
 import type { ProjectRecord, ToolDef } from "../src/types.js";
-import { record } from "./helpers.js";
-
-interface ExecCall {
-  container: string;
-  argv: string[];
-  opts: ExecOptions;
-}
-
-/** Docker double: records what would run and replays canned results. */
-class FakeDocker extends Docker {
-  calls: ExecCall[] = [];
-  next: Partial<ExecResult> = {};
-  exists = true;
-  network: Array<[string, boolean]> = [];
-  destroyed: string[] = [];
-
-  override async exec(container: string, argv: string[], opts: ExecOptions): Promise<ExecResult> {
-    this.calls.push({ container, argv, opts });
-    return { code: 0, stdout: "", stderr: "", timedOut: false, truncated: false, ...this.next };
-  }
-  override async ensureRunning(): Promise<boolean> {
-    return this.exists;
-  }
-  override async setNetwork(container: string, enabled: boolean): Promise<void> {
-    this.network.push([container, enabled]);
-  }
-  override async destroy(container: string): Promise<void> {
-    this.destroyed.push(container);
-  }
-}
+import { McpProxy } from "../src/proxy/mcp-proxy.js";
+import { FakeDocker, fakeUpstream, record, type FakeUpstream } from "./helpers.js";
 
 const tool: ToolDef = {
   name: "demo__demo_build",
@@ -52,6 +24,7 @@ const tool: ToolDef = {
 
 let dir: string;
 let docker: FakeDocker;
+let up: FakeUpstream;
 let app: App;
 
 function seed(...records: ProjectRecord[]): void {
@@ -61,13 +34,14 @@ const body = (res: Awaited<ReturnType<App["callTool"]>>) => (res.content[0] as {
 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-srv-"));
-  const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir });
+  const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_MCP_STARTUP_TIMEOUT: "1" });
   docker = new FakeDocker(cfg);
-  app = new App({ cfg, docker });
+  up = fakeUpstream();
+  app = new App({ cfg, docker, proxy: new McpProxy(cfg, docker, up.connector) });
   seed({ ...record("demo"), tools: [tool], commands: [{ name: "demo", origin: "test" }] });
 });
-afterEach(() => {
-  app.stop();
+afterEach(async () => {
+  await app.shutdown();
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -200,6 +174,135 @@ describe("built-in tools", () => {
       expect(res.isError).toBe(true);
     }
     expect(docker.calls).toEqual([]);
+  });
+});
+
+describe("proxied MCP servers", () => {
+  const connect = (extra: Record<string, unknown> = {}) => {
+    docker.next = { code: 1 }; // discovery finds no executables in this fake sandbox
+    return app.callTool("connect_mcp_server", { project: "demo", command: ["node", "server.js"], ...extra });
+  };
+
+  it("connect_mcp_server publishes the upstream tools with their own schemas", async () => {
+    const res = await connect();
+    expect(res.isError).toBe(false);
+    expect(body(res)).toMatch(/^Connected MCP server "node" of demo: 4 tool\(s\) published\. The sandbox is offline/);
+    expect(app.registry.get("demo")!.mcpServers).toEqual([
+      { name: "node", argv: ["node", "server.js"], cwd: "/workspace/repo", env: {}, origin: "registered" },
+    ]);
+    const add = app.listTools().find((t) => t.name === "demo__add")!;
+    expect(add.description).toBe('[sandboxed github:owner/demo] MCP tool `add` of server "node". Add two numbers');
+    expect(add.inputSchema).toEqual({ type: "object", properties: { a: { type: "number" }, b: { type: "number" } }, required: ["a", "b"] });
+  });
+
+  it("forwards calls with their arguments untouched", async () => {
+    await connect();
+    const res = await app.callTool("demo__add", { a: 2, b: 40 });
+    expect(res).toEqual({ content: [{ type: "text", text: "42" }], isError: false });
+    expect(up.received).toEqual([{ name: "add", arguments: { a: 2, b: 40 } }]);
+    const viaMeta = await app.callTool("call_project_tool", { tool: "demo__add", arguments: { a: 1, b: 1 } });
+    expect(body(viaMeta)).toBe("2");
+  });
+
+  it("rebuilds upstream results from known parts only", async () => {
+    await connect();
+    const res = await app.callTool("demo__mixed", {});
+    expect(res).toEqual({
+      isError: true,
+      content: [
+        { type: "text", text: "x".repeat(300) },
+        { type: "image", data: "aGk=", mimeType: "image/png" },
+        { type: "text", text: "[image omitted: 4 base64 characters]" },
+        { type: "text", text: "[file:///a.txt]\nembedded" },
+        { type: "text", text: "[resource link: file:///b.txt; resources are not proxied]" },
+      ],
+    });
+  });
+
+  it("caps proxied text like any other tool output", async () => {
+    const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_MAX_OUTPUT_BYTES: "100" });
+    const small = new App({ cfg, docker, proxy: new McpProxy(cfg, docker, up.connector) });
+    docker.next = { code: 1 };
+    await small.callTool("connect_mcp_server", { project: "demo", command: ["srv"] });
+    const res = await small.callTool("demo__mixed", {});
+    expect(res.content[0]).toEqual({ type: "text", text: `${"x".repeat(100)}\n[output truncated]` });
+    expect(res.content.filter((c) => c.type === "text")).toHaveLength(1);
+    await small.shutdown();
+  });
+
+  it("stores the environment but never prints its values", async () => {
+    const res = await connect({ name: "api", env: { API_KEY: "s3cret-value" } });
+    expect(body(res)).not.toContain("s3cret-value");
+    expect(body(res)).toContain('mcp server "api" (registered): node server.js; env: API_KEY');
+    expect(app.registry.get("demo")!.mcpServers![0]!.env).toEqual({ API_KEY: "s3cret-value" });
+    expect(body(await app.callTool("demo__whoami", {}))).toBe("api env=API_KEY");
+    expect(body(await app.callTool("project_info", { project: "demo" }))).not.toContain("s3cret-value");
+    expect(body(await app.callTool("list_projects", {}))).not.toContain("s3cret-value");
+  });
+
+  it("replaces a registration of the same name and restarts it with the new spec", async () => {
+    await connect({ name: "api", env: { A: "1" } });
+    await connect({ name: "api", env: { B: "2" } });
+    expect(app.registry.get("demo")!.mcpServers).toHaveLength(1);
+    expect(body(await app.callTool("demo__whoami", {}))).toBe("api env=B");
+  });
+
+  it("leaves the project unchanged when the server does not start", async () => {
+    up.answer = false;
+    const res = await connect();
+    expect(res.isError).toBe(true);
+    expect(body(res)).toMatch(/MCP server "node" \(node server\.js\) did not start: no MCP handshake within 1s/);
+    expect(app.registry.get("demo")!.mcpServers).toBeUndefined();
+    expect(app.listTools().map((t) => t.name)).toContain("demo__demo_build");
+  });
+
+  it.each([
+    [{ command: "node server.js" }, /"command" must be a non-empty array/],
+    [{ command: [] }, /"command" must be a non-empty array/],
+    [{ command: ["has space"] }, /program name/],
+    [{ command: ["./weird name!"], name: "bad name" }, /program name|"name" may only contain/],
+    [{ command: ["srv"], name: "bad name" }, /"name" may only contain/],
+    [{ command: ["srv"], env: { "BAD-KEY": "x" } }, /Invalid environment variable name/],
+    [{ command: ["srv"], env: { A: "x\ny" } }, /line breaks/],
+    [{ command: ["srv"], env: ["A=1"] }, /"env" must be an object/],
+    [{ command: ["srv"], cwd: "../../etc" }, /inside \/workspace/],
+  ])("connect_mcp_server rejects %j", async (args, message) => {
+    const res = await app.callTool("connect_mcp_server", { project: "demo", ...args });
+    expect(res.isError).toBe(true);
+    expect(body(res)).toMatch(message);
+    expect(up.launches).toEqual([]);
+  });
+
+  it("resolves a relative cwd against the checkout", async () => {
+    await connect({ cwd: "packages/server" });
+    expect(app.registry.get("demo")!.mcpServers![0]!.cwd).toBe("/workspace/repo/packages/server");
+  });
+
+  it("disconnect_mcp_server stops the server, forgets its secrets and removes its tools", async () => {
+    await connect({ name: "api", env: { API_KEY: "s3cret-value" } });
+    await app.callTool("demo__add", { a: 1, b: 1 });
+    const res = await app.callTool("disconnect_mcp_server", { project: "demo", name: "api" });
+    expect(res.isError).toBe(false);
+    expect(app.proxy.size).toBe(0);
+    expect(fs.readFileSync(path.join(dir, "registry.json"), "utf8")).not.toContain("s3cret-value");
+    expect(app.listTools().map((t) => t.name)).not.toContain("demo__add");
+    expect(body(await app.callTool("demo__add", { a: 1, b: 1 }))).toMatch(/Unknown tool "demo__add"/);
+    expect(body(await app.callTool("disconnect_mcp_server", { project: "demo", name: "api" }))).toMatch(/no MCP server named "api"/);
+  });
+
+  it("uninstall_project stops the project's servers", async () => {
+    await connect();
+    await app.callTool("demo__add", { a: 1, b: 1 });
+    expect(app.proxy.size).toBe(1);
+    await app.callTool("uninstall_project", { project: "demo" });
+    expect(app.proxy.size).toBe(0);
+  });
+
+  it("reports a tool whose server registration has vanished", async () => {
+    await connect();
+    const project = app.registry.get("demo")!;
+    app.registry.put({ ...project, mcpServers: [] });
+    expect(body(await app.callTool("demo__add", { a: 1, b: 1 }))).toMatch(/MCP server "node" of demo is no longer registered/);
   });
 });
 

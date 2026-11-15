@@ -11,9 +11,13 @@ async function main(): Promise<void> {
   app.start();
   await app.server.connect(new StdioServerTransport());
   const shutdown = () => {
-    app.stop();
-    void app.server.close().finally(() => process.exit(0));
+    void app
+      .shutdown()
+      .then(() => app.server.close())
+      .finally(() => process.exit(0));
   };
+  // The client hanging up (stdin closing) must also stop proxied servers.
+  process.stdin.on("end", shutdown);
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }
