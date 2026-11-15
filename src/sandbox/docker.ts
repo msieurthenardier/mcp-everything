@@ -45,6 +45,15 @@ const MANIFESTS = [
   "Makefile",
   "makefile",
   "GNUmakefile",
+  // Runtime version pins.
+  ".nvmrc",
+  ".node-version",
+  ".tool-versions",
+  ".python-version",
+  ".ruby-version",
+  "Gemfile",
+  "rust-toolchain.toml",
+  "rust-toolchain",
 ];
 
 // Runs in the probe image (busybox sh). Every untrusted value is a positional
@@ -293,18 +302,22 @@ export class Docker {
     }
   }
 
+  /** Remove a sandbox container but keep its volume (to rebuild on another image). */
+  async removeContainer(container: string): Promise<void> {
+    const label = '{{index .Config.Labels "mcp-everything"}}';
+    const c = await this.docker(["inspect", "--type", "container", "--format", label, container], { timeoutMs: 30_000 });
+    if (c.code !== 0) return;
+    if (c.stdout.trim() !== "1") throw new Error(`Refusing to remove container "${container}": it was not created by mcp-everything`);
+    const rm = await this.docker(["rm", "-f", container], { timeoutMs: 120_000 });
+    if (rm.code !== 0) throw new Error(`Failed to remove container ${container}: ${rm.stderr.trim()}`);
+  }
+
   /**
    * Remove a project's container and volume. Missing resources are not errors,
    * but anything not labelled as ours is left alone and reported.
    */
   async destroy(container: string, volume: string): Promise<void> {
-    const label = '{{index .Config.Labels "mcp-everything"}}';
-    const c = await this.docker(["inspect", "--type", "container", "--format", label, container], { timeoutMs: 30_000 });
-    if (c.code === 0) {
-      if (c.stdout.trim() !== "1") throw new Error(`Refusing to remove container "${container}": it was not created by mcp-everything`);
-      const rm = await this.docker(["rm", "-f", container], { timeoutMs: 120_000 });
-      if (rm.code !== 0) throw new Error(`Failed to remove container ${container}: ${rm.stderr.trim()}`);
-    }
+    await this.removeContainer(container);
     const v = await this.docker(["volume", "inspect", "--format", '{{index .Labels "mcp-everything"}}', volume], {
       timeoutMs: 30_000,
     });

@@ -62,7 +62,9 @@ claude mcp add mcp-everything -- node "$PWD/dist/index.js"
 | --- | --- |
 | `search_projects` | Search GitHub and GitLab; returns ids, stars, language, license. |
 | `install_project` | Clone, build and generate tools for a repository. |
-| `list_projects` / `project_info` | What is installed, its status, warnings, and every generated tool. |
+| `list_projects` / `project_info` | What is installed, its status, warnings, and its published tools. |
+| `find_project_tools` | Search every generated tool, published or not, by keyword. |
+| `select_project_tools` | Choose which of a project's tools are published in the tool list. |
 | `call_project_tool` | Call a generated tool by name, for clients that do not refresh their tool list. |
 | `sandbox_exec` | Run a shell command in a project's sandbox. |
 | `sandbox_read_file` / `sandbox_write_file` | Move text in and out of a sandbox. |
@@ -79,7 +81,8 @@ commit.
 
 1. **Clone.** A throwaway container clones the repository (shallow) into a
    fresh Docker volume and reports the root listing and manifest files.
-2. **Detect.** The manifests decide the build system and the base image.
+2. **Detect.** The manifests decide the build system, and the runtime
+   version the project asks for decides the image (see below).
 3. **Build.** A long-lived sandbox container runs a fixed recipe for that
    build system, with network access so dependencies can be downloaded.
 4. **Go offline.** The sandbox is disconnected from the network unless you
@@ -87,13 +90,17 @@ commit.
 5. **Discover.** Executables the build produced are collected: console
    scripts of the installed Python distribution, `bin` entries of
    `package.json` (including workspace packages), Cargo and Go binaries,
-   gem executables, and anything installed to `/opt/mcpe/bin`.
+   gem executables, and anything installed to `/opt/mcpe/bin`. Names that
+   resolve to the same file and print the same help are folded into one
+   command with aliases.
 6. **Proxy.** Commands that turn out to be MCP servers are connected to
-   instead (see below).
-7. **Generate.** Each remaining executable is run with `--help` (the top-level command
+   (see below).
+7. **Generate.** Each executable is run with `--help` (the top-level command
    also with `-h` and `help`), and so is each subcommand it lists, two levels
    deep. Options become typed properties, value choices become enums, and
    every tool also accepts `args`, `stdin`, `cwd` and `timeout_seconds`.
+8. **Publish.** A subset of the generated tools is advertised in the MCP tool
+   list; the rest stay searchable and callable (see below).
 
 | Detected by | Built with | Image |
 | --- | --- | --- |
@@ -115,6 +122,53 @@ JavaScript in the checkout), `<slug>__npm_run` (package scripts) and
 Inside a sandbox the checkout is `/workspace/repo` and `/workspace/work` is
 scratch space, which is the default working directory of generated tools.
 
+### Choosing the runtime version
+
+The image tag follows what the repository declares, in this order:
+
+1. **An exact pin**: `.nvmrc`, `.node-version`, `volta` in `package.json`,
+   `.python-version`, `.ruby-version`, the `ruby` line of a `Gemfile`, or
+   `.tool-versions`. A pin of Node 24.22.1 selects `node:24`.
+2. **A declared range**: `engines.node`, or `requires-python` (also read from
+   Poetry, `setup.cfg` and `setup.py`). For Node the newest supported release
+   line inside the range is used; for Python the default line if the range
+   allows it, otherwise the nearest one that does.
+3. **The default image** from the table above.
+
+A pin wins over a range because a range is a claim and a pin is what the
+project's own CI runs. If a build chosen from a range fails, it is rebuilt
+once on the next version the range allows. `project_info` shows which rule
+picked the image, and `install_project(image: ...)` overrides all of it.
+
+Rust and Go keep their default image and resolve versions themselves: rustup
+installs the toolchain named in `rust-toolchain.toml`, and the `go` command
+downloads the toolchain `go.mod` asks for.
+
+### Which tools are published
+
+Everything generated for a project goes into its catalog, but only up to
+`MCPE_MAX_TOOLS_PER_PROJECT` tools (default 40) are advertised to the client,
+since every advertised tool costs context in every conversation. The budget
+is spent in this order:
+
+1. each command's top-level tool and the project helpers, which can reach
+   everything the command can do;
+2. each proxied MCP server, but only as a whole. If a server's tools do not
+   all fit, none are advertised: a slice of a server is rarely a usable set;
+3. subcommand tools, with what is left.
+
+Nothing unpublished is lost:
+
+```
+find_project_tools(query: "open binary")          # search the whole catalog
+call_project_tool(tool: "rea__open_binary", arguments: { path: "/bin/ls" })
+select_project_tools(project: "rea", include: ["open_binary", "list_*"])
+```
+
+`select_project_tools` replaces the default with your own choice (patterns
+with `*`, an `exclude` list, and a per-project `max_tools`), and
+`reset: true` goes back. The choice is kept across reinstalls.
+
 ### Projects that are MCP servers
 
 If the installed project is itself an MCP server, it is started inside its
@@ -126,11 +180,22 @@ servers__read_graph({})                 # tool of mcp-server-memory, proxied
 servers__get_sum({ a: 2, b: 40 })       # tool of mcp-server-everything, proxied
 ```
 
-Detection is by probing. A command is started without arguments and offered
-an MCP handshake over stdio when the package that provides it depends on an
-MCP SDK (`@modelcontextprotocol/*` or `fastmcp` on npm, `mcp` or `fastmcp` on
-PyPI), or, failing that, when the repository's root manifests or name point to
-MCP. Commands that answer are proxied; the rest are reported in a warning.
+Detection is by handshake: a launch command is started in the sandbox and
+offered an MCP `initialize` over stdio. Candidates are tried in order of
+evidence, and a command is left alone once one of them answers:
+
+1. what the repository declares in `server.json` (the MCP registry manifest)
+   or `mcp.json` / `.mcp.json`. Those describe the published package
+   (`npx -y pkg mcp`), which is mapped onto the command built from the
+   checkout (`pkg mcp`). Entries with placeholders to fill in are skipped;
+2. the bare command, when the package that provides it depends on an MCP SDK
+   (`@modelcontextprotocol/*` or `fastmcp` on npm, `mcp` or `fastmcp` on
+   PyPI), or when the repository's manifests or name point to MCP;
+3. an MCP mode the command's own help advertises (`--mcp`, `mcp`,
+   `--stdio`).
+
+Launches that do not answer are reported in a warning. A command that is an
+MCP server only when given an argument keeps its command line tools too.
 
 Servers that need arguments, environment variables or a different entry point
 are registered by hand:
@@ -156,8 +221,8 @@ How it behaves:
 - Arguments are forwarded as given and validated by the upstream server. Of
   its results, text, images and audio are passed on; embedded text resources
   become text; everything else is dropped.
-- Proxied tools count toward `MCPE_MAX_TOOLS_PER_PROJECT`; a warning says so
-  when some did not fit.
+- A server's tools are published together or not at all (see "Which tools
+  are published"); either way they are all callable.
 
 ### When the automatic build is not enough
 
@@ -236,7 +301,7 @@ Environment variables, all optional:
 | `MCPE_DOCKER_RUNTIME` | Docker's default | Container runtime, e.g. `runsc`. |
 | `MCPE_INSTALL_TIMEOUT` | `900` | Build time limit, seconds. |
 | `MCPE_TOOL_TIMEOUT` | `120` | Default time limit of a tool call, seconds. |
-| `MCPE_MAX_TOOLS_PER_PROJECT` | `40` | Cap on generated tools per project. |
+| `MCPE_MAX_TOOLS_PER_PROJECT` | `40` | Cap on tools published per project (the catalog is not capped). |
 | `MCPE_MCP_STARTUP_TIMEOUT` | `30` | Seconds a proxied MCP server may take to answer the handshake. |
 | `MCPE_MCP_IDLE_TIMEOUT` | `600` | Seconds of inactivity before a proxied MCP server is stopped. |
 | `MCPE_MAX_OUTPUT_BYTES` | `100000` | Cap on captured stdout and stderr, each. |
@@ -249,8 +314,15 @@ Environment variables, all optional:
   program that documents itself differently gets a single pass-through tool
   that takes `args`. Positional arguments are never modelled, only described
   by the usage line in the tool description.
-- Every installed project adds its tool schemas to your client's context.
-  Uninstall what you are not using, or lower `MCPE_MAX_TOOLS_PER_PROJECT`.
+- Every installed project adds its published tool schemas to your client's
+  context. Uninstall what you are not using, narrow it with
+  `select_project_tools`, or lower `MCPE_MAX_TOOLS_PER_PROJECT`.
+- Version detection reads the repository root only, and trusts it. A project
+  that declares nothing gets the default image; one whose declarations are
+  wrong may need `install_project(image: ...)`.
+- Subcommand tools are generated for at most 25 subcommands per command and
+  two levels of nesting. The rest are reachable through the command's
+  top-level tool.
 - Only the repository root is built. Monorepos with several independent
   projects, Java, .NET, PHP and other ecosystems without a recipe need the
   manual path above.
@@ -274,8 +346,9 @@ Layout:
 ```
 src/forge/      repository reference parsing, GitHub/GitLab search
 src/sandbox/    Docker wrapper: probe, container lifecycle, exec, network
-src/install/    build system detection, install recipes, orchestration
-src/toolgen/    --help parser, help crawler, tool naming, argv construction
+src/install/    build system and runtime version detection, recipes, orchestration
+src/toolgen/    --help parser, help crawler, tool naming and publication,
+                argv construction, MCP launch detection
 src/proxy/      client sessions to MCP servers running inside sandboxes
 src/registry.ts persistent project registry (shared between sessions)
 src/server.ts   MCP server: built-in tools and dispatch to generated tools

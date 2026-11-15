@@ -148,7 +148,7 @@ describe("built-in tools", () => {
   });
 
   it("list_projects and project_info describe what is installed", async () => {
-    expect(body(await app.callTool("list_projects", {}))).toMatch(/^demo — github:owner\/demo \(ready\)[\s\S]*tools: 1$/);
+    expect(body(await app.callTool("list_projects", {}))).toMatch(/^demo — github:owner\/demo \(ready\)[\s\S]*tools: 1 published$/);
     const info = body(await app.callTool("project_info", { project: "owner/demo" }));
     expect(info).toContain("demo__demo_build: [sandboxed github:owner/demo] Runs `demo build`.");
     expect(info).toContain("arguments: release");
@@ -303,6 +303,133 @@ describe("proxied MCP servers", () => {
     const project = app.registry.get("demo")!;
     app.registry.put({ ...project, mcpServers: [] });
     expect(body(await app.callTool("demo__add", { a: 1, b: 1 }))).toMatch(/MCP server "node" of demo is no longer registered/);
+  });
+});
+
+describe("catalog, search and selection", () => {
+  /** A project whose catalog is larger than what it publishes. */
+  function seedCatalog(): void {
+    const mk = (name: string, description: string, over: Partial<ToolDef> = {}): ToolDef => ({
+      ...tool,
+      name,
+      description,
+      inputSchema: { type: "object", properties: { path: { type: "string" }, deep: { type: "boolean" } }, required: ["path"] },
+      ...over,
+    });
+    seed({
+      ...record("big"),
+      tools: [
+        mk("big__big", "[sandboxed x] Runs `big`.", { argv: ["big"] }),
+        mk("big__open_binary", "[sandboxed x] MCP tool `open_binary`. Open an app for analysis.", { kind: "mcp", argv: [], mcp: { server: "srv", tool: "open_binary" } }),
+        mk("big__list_strings", "[sandboxed x] MCP tool `list_strings`. List strings of the open binary.", { kind: "mcp", argv: [], mcp: { server: "srv", tool: "list_strings" } }),
+        mk("big__big_scan", "[sandboxed x] Runs `big scan`. Scan a directory.", { argv: ["big", "scan"] }),
+      ],
+      published: ["big__big"],
+      mcpServers: [{ name: "srv", argv: ["big", "mcp"], cwd: "/workspace/repo", env: {}, origin: "detected" }],
+    });
+  }
+
+  it("advertises only published tools, but keeps the whole catalog callable", async () => {
+    seedCatalog();
+    const names = app.listTools().map((t) => t.name);
+    expect(names).toContain("big__big");
+    expect(names).not.toContain("big__open_binary");
+    expect(names).not.toContain("big__big_scan");
+
+    docker.next = { stdout: "scanned" };
+    expect(body(await app.callTool("call_project_tool", { tool: "big__big_scan", arguments: { args: ["/x"] } }))).toContain("scanned");
+    expect(docker.calls[0]!.argv).toEqual(["big", "scan", "/x"]);
+    // A proxied tool that is not published is reachable the same way.
+    expect(body(await app.callTool("call_project_tool", { tool: "big__open_binary", arguments: {} }))).toMatch(/no such tool open_binary|rejected/);
+    expect(up.launches[0]!.server.argv).toEqual(["big", "mcp"]);
+  });
+
+  it("treats records without a published list as fully published", () => {
+    seed({ ...record("old"), published: undefined, tools: [{ ...tool, name: "old__a" }, { ...tool, name: "old__b" }] });
+    expect(app.listTools().map((t) => t.name)).toEqual(expect.arrayContaining(["old__a", "old__b"]));
+  });
+
+  it("find_project_tools ranks name matches first and marks unpublished tools", async () => {
+    seedCatalog();
+    const res = body(await app.callTool("find_project_tools", { query: "binary" }));
+    const lines = res.split("\n");
+    expect(lines[0]).toBe("2 of 5 generated tools match. Run one with call_project_tool(tool, arguments).");
+    // "binary" is in open_binary's name, only in list_strings' description.
+    expect(lines[1]).toBe("big__open_binary  [not published]");
+    expect(lines[3]).toBe("    arguments (* required): path*: string, deep: boolean");
+    expect(lines[4]).toBe("big__list_strings  [not published]");
+    expect(res).not.toContain("big__big_scan");
+  });
+
+  it("find_project_tools requires every keyword, ignores separators and case, and can scope to a project", async () => {
+    seedCatalog();
+    expect(body(await app.callTool("find_project_tools", { query: "Open-Binary" }))).toContain("big__open_binary");
+    expect(body(await app.callTool("find_project_tools", { query: "open scan" }))).toMatch(/^No generated tool matches "open scan" \(5 searched\)/);
+    expect(body(await app.callTool("find_project_tools", { query: "runs", project: "demo" }))).toMatch(/^1 of 1 generated tools match/);
+    const listing = body(await app.callTool("find_project_tools", { project: "big", limit: 2 }));
+    expect(listing).toMatch(/^4 of 4 generated tools match; showing the best 2\./);
+    expect(listing).toContain("big__big\n");
+    const empty = await app.callTool("find_project_tools", {});
+    expect(empty.isError).toBe(true);
+  });
+
+  it("find_project_tools can return full schemas", async () => {
+    seedCatalog();
+    const res = body(await app.callTool("find_project_tools", { query: "open_binary", schema: true }));
+    expect(res).toContain('schema: {"type":"object","properties":{"path":{"type":"string"},"deep":{"type":"boolean"}},"required":["path"]}');
+  });
+
+  it("select_project_tools publishes a chosen subset and reset restores the default", async () => {
+    seedCatalog();
+    const res = await app.callTool("select_project_tools", { project: "big", include: ["open_binary", "list_*"] });
+    expect(res.isError).toBe(false);
+    expect(body(res)).toContain("tool selection: include open_binary, list_*");
+    expect(body(res)).toContain("tools published (2) (+2 not published");
+    expect(app.registry.get("big")!.published).toEqual(["big__open_binary", "big__list_strings"]);
+    const names = app.listTools().map((t) => t.name);
+    expect(names).toContain("big__open_binary");
+    expect(names).not.toContain("big__big");
+
+    await app.callTool("select_project_tools", { project: "big", reset: true });
+    const record = app.registry.get("big")!;
+    expect(record.selection).toBeUndefined();
+    // Default policy with the default limit: everything fits.
+    expect(record.published).toEqual(["big__big", "big__open_binary", "big__list_strings", "big__big_scan"]);
+  });
+
+  it("select_project_tools records notes for selections that match nothing or too much", async () => {
+    seedCatalog();
+    const none = body(await app.callTool("select_project_tools", { project: "big", include: ["nope"] }));
+    expect(none).toContain("warning: Tools: The tool selection matches no tools, so none are published.");
+    const capped = body(await app.callTool("select_project_tools", { project: "big", include: ["*"], max_tools: 1 }));
+    expect(capped).toContain("warning: Tools: The tool selection matches 4 tools; only the first 1 are published (limit 1).");
+    // Notes describe the current selection only: the earlier one is gone.
+    expect(capped).not.toContain("matches no tools");
+  });
+
+  it.each([
+    [{}, /Pass include and\/or exclude patterns/],
+    [{ include: "open_binary" }, /"include" must be an array/],
+    [{ include: [""] }, /"include" must be an array/],
+    [{ reset: true, include: ["x"] }, /"reset" cannot be combined/],
+  ])("select_project_tools rejects %j", async (args, message) => {
+    seedCatalog();
+    const res = await app.callTool("select_project_tools", { project: "big", ...args });
+    expect(res.isError).toBe(true);
+    expect(body(res)).toMatch(message);
+  });
+
+  it("shows why the runtime image was chosen and which names a command also goes by", async () => {
+    seed({
+      ...record("rt"),
+      image: "node:24",
+      imageReason: "Node 24, pinned by .nvmrc (24.22.1)",
+      commands: [{ name: "rea", origin: "t", aliases: ["rea-agents"] }],
+    });
+    const info = body(await app.callTool("project_info", { project: "rt" }));
+    expect(info).toContain("build: generic in node:24;");
+    expect(info).toContain("runtime: Node 24, pinned by .nvmrc (24.22.1)");
+    expect(info).toContain("commands: rea (also rea-agents)");
   });
 });
 

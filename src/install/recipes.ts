@@ -7,7 +7,8 @@ import type { Ecosystem } from "../types.js";
  *
  *   - leave runnable executables in /opt/mcpe/bin (or, for Python, console
  *     scripts in the /opt/mcpe/venv virtualenv), and
- *   - print `MCPE_WARN <message>` for non-fatal problems.
+ *   - print `MCPE_WARN <message>` for non-fatal problems, and
+ *   - print `MCPE_SOFT_FAIL` when a core build step failed without aborting.
  */
 
 const PRELUDE = `
@@ -15,6 +16,9 @@ set -e
 mkdir -p ${BIN_DIR} ${WORK_DIR}
 cd ${REPO_DIR}
 warn() { echo "MCPE_WARN $*"; }
+# A core build step failed but the recipe can carry on: worth a retry on
+# another runtime version if the project allows one.
+soft_fail() { echo "MCPE_SOFT_FAIL"; warn "$@"; }
 need() { command -v "$1" >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq --no-install-recommends "$2" >/dev/null; }; }
 link_elves() {
   # Symlink freshly built ELF executables that never got "installed".
@@ -35,7 +39,7 @@ ${VENV_DIR}/bin/python -m pip install --quiet --upgrade pip
 if [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then
   if ! ${VENV_DIR}/bin/pip install .; then
     if [ -f requirements.txt ]; then
-      warn "pip install . failed; installed requirements.txt instead"
+      soft_fail "pip install . failed; installed requirements.txt instead"
       ${VENV_DIR}/bin/pip install -r requirements.txt
     else
       exit 1
@@ -63,7 +67,7 @@ else
   npm install
 fi
 if node -e 'const s=require("./package.json").scripts||{};process.exit(s.build?0:1)' 2>/dev/null; then
-  $run build || warn "build script failed; binaries that need a build step may be missing"
+  $run build || soft_fail "build script failed; binaries that need a build step may be missing"
 fi
 `;
 
@@ -73,11 +77,13 @@ cargo build --release --bins || cargo build --release
 find ${WORKSPACE}/target/release -maxdepth 1 -type f -perm -u+x ! -name '*.so' ! -name '*.d' ! -name '*.rlib' ! -name '.*' -exec cp {} ${BIN_DIR}/ ';'
 `;
 
+// GOTOOLCHAIN=auto lets the go command download the toolchain go.mod asks for
+// when it is newer than the image's (the official image disables that).
 // GOFLAGS is exported here rather than container-wide: `make` re-exports any
 // variable it inherited from the environment, which breaks Makefiles that use
 // GOFLAGS as a plain make variable.
 const GO = `
-export GOBIN=${BIN_DIR} GOFLAGS=-buildvcs=false
+export GOBIN=${BIN_DIR} GOFLAGS=-buildvcs=false GOTOOLCHAIN=auto
 failed=0
 go list -f '{{if eq .Name "main"}}{{.Dir}}{{end}}' ./... 2>/dev/null \\
   | sed -n 's|^${REPO_DIR}|.|p' \\
@@ -158,7 +164,7 @@ export function recipeFor(ecosystem: Ecosystem): string {
  */
 export const PYTHON_DISCOVERY = `
 import json, importlib.metadata as md
-out = {"scripts": [], "modules": [], "dists": [], "mcp_scripts": []}
+out = {"scripts": [], "modules": [], "dists": [], "mcp_scripts": [], "owners": {}}
 def req_name(req):
     name = ""
     for ch in req.strip().lower():
@@ -176,6 +182,8 @@ for d in md.distributions():
     out["dists"].append(str(d.metadata["Name"]))
     scripts = [ep.name for ep in d.entry_points if ep.group == "console_scripts"]
     out["scripts"].extend(scripts)
+    for script in scripts:
+        out["owners"][script] = str(d.metadata["Name"])
     if any(req_name(r) in ("mcp", "fastmcp") for r in (d.requires or [])):
         out["mcp_scripts"].extend(scripts)
     tops = set((d.read_text("top_level.txt") or "").split())
@@ -200,7 +208,7 @@ const fs = require("fs"), path = require("path");
 const root = ${JSON.stringify(REPO_DIR)}, binDir = ${JSON.stringify(BIN_DIR)};
 const SKIP = new Set(["node_modules", ".git", "test", "tests", "__tests__", "fixtures", "examples", "example", "docs", "dist", "build", "coverage", "vendor"]);
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
-const out = { bins: [], packages: [], missing: [], mcp: [] };
+const out = { bins: [], packages: [], missing: [], mcp: [], owners: {} };
 const MCP_SDK = (d) => d.startsWith("@modelcontextprotocol/") || d === "fastmcp" || d === "mcp-framework";
 function visit(dir, depth) {
   const file = path.join(dir, "package.json");
@@ -218,6 +226,7 @@ function visit(dir, depth) {
           if (!target.startsWith(root + path.sep)) continue;
           if (!fs.existsSync(target)) { out.missing.push(name); continue; }
           if (isMcp && !out.mcp.includes(name)) out.mcp.push(name);
+          if (typeof pkg.name === "string" && !(name in out.owners)) out.owners[name] = pkg.name;
           const link = path.join(binDir, name);
           if (fs.existsSync(link)) continue;
           const head = Buffer.alloc(2);

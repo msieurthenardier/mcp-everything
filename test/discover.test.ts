@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildTools, crawlCommand, mcpTools, type HelpNode, type SandboxExec } from "../src/toolgen/discover.js";
+import { buildTools, crawlCommand, mcpTools, selectPublished, toolMatches, type HelpNode, type SandboxExec } from "../src/toolgen/discover.js";
+import type { ToolDef } from "../src/types.js";
 import { MAX_TOOL_NAME } from "../src/toolgen/naming.js";
 import type { ProjectMeta } from "../src/types.js";
 
@@ -240,5 +241,142 @@ describe("mcpTools", () => {
       maxTools: 6,
     });
     expect(tools.map((t) => t.name)).toEqual(["p__t0", "p__t1", "p__t2", "p__t3", "p__t4", "p__cli"]);
+  });
+});
+
+describe("crawlCommand with known root help", () => {
+  it("does not fetch the top-level help again", async () => {
+    const calls: string[][] = [];
+    const root = await crawlCommand(fakeExec(calls), "demo", limits(), ROOT_HELP);
+    expect(root?.children.map((c) => c.path.join(" "))).toEqual(["demo build", "demo remote"]);
+    expect(calls.some((c) => c.join(" ") === "demo --help")).toBe(false);
+  });
+});
+
+describe("aliases", () => {
+  it("are mentioned on the command's top-level tool only", async () => {
+    const node = (await crawlCommand(fakeExec([]), "demo", limits()))!;
+    const tools = buildTools({
+      slug: "d",
+      repoId: "r",
+      meta: emptyMeta,
+      roots: [{ command: { name: "demo", origin: "t", aliases: ["demo-cli", "/opt/mcpe/bin/dm"] }, node }],
+      maxTools: 40,
+    });
+    expect(tools[0]!.description).toContain("Runs `demo`. Also installed as demo-cli, dm. Demo tool.");
+    expect(tools[1]!.description).not.toContain("Also installed");
+  });
+});
+
+/** A catalog shaped like a project with two commands, two MCP servers and subcommands. */
+function catalog(counts: { alpha: number; beta: number; subs: number }): ToolDef[] {
+  const tool = (name: string, over: Partial<ToolDef>): ToolDef => ({
+    name,
+    description: "",
+    inputSchema: { type: "object" },
+    kind: "cli",
+    argv: ["cli"],
+    options: [],
+    cwd: "/workspace/work",
+    ...over,
+  });
+  const mcp = (server: string, n: number) =>
+    Array.from({ length: n }, (_, i) => tool(`p__${server}_${i}`, { kind: "mcp", argv: [], mcp: { server, tool: `${server}-${i}` } }));
+  return [
+    ...mcp("alpha", counts.alpha),
+    ...mcp("beta", counts.beta),
+    tool("p__cli", { argv: ["cli"] }),
+    tool("p__other", { argv: ["other"] }),
+    tool("p__python", { kind: "code", argv: ["python", "-c"] }),
+    tool("p__make", { kind: "script", argv: ["make"] }),
+    ...Array.from({ length: counts.subs }, (_, i) => tool(`p__cli_sub${i}`, { argv: ["cli", `sub${i}`] })),
+  ];
+}
+
+describe("selectPublished: default policy", () => {
+  it("publishes everything when it all fits, in catalog order", () => {
+    const all = catalog({ alpha: 3, beta: 2, subs: 4 });
+    const { published, notes } = selectPublished(all, undefined, 40);
+    expect(published).toEqual(all.map((t) => t.name));
+    expect(notes).toEqual([]);
+  });
+
+  it("guarantees command gateways and helpers before anything else", () => {
+    const { published } = selectPublished(catalog({ alpha: 50, beta: 0, subs: 50 }), undefined, 4);
+    expect(published).toEqual(["p__cli", "p__other", "p__python", "p__make"]);
+  });
+
+  it("publishes an MCP server whole or not at all, and says how to reach the rest", () => {
+    // 10 slots: 4 gateways, then alpha (5) fits, beta (3) does not fit in the 1 left.
+    const { published, notes } = selectPublished(catalog({ alpha: 5, beta: 3, subs: 6 }), undefined, 10);
+    expect(published.filter((n) => n.startsWith("p__alpha"))).toHaveLength(5);
+    expect(published.filter((n) => n.startsWith("p__beta"))).toHaveLength(0);
+    // The slot beta could not use goes to a subcommand tool.
+    expect(published.filter((n) => n.includes("_sub"))).toEqual(["p__cli_sub0"]);
+    expect(published).toHaveLength(10);
+    expect(notes).toEqual([
+      expect.stringMatching(/^MCP server "beta" offers 3 tools, more than the 1 that fit under the limit of 10, so none of them are published individually\. Search them with find_project_tools/),
+    ]);
+  });
+
+  it("leaves a server far over the limit entirely to search, as with a 255-tool server", () => {
+    const { published, notes } = selectPublished(catalog({ alpha: 255, beta: 0, subs: 30 }), undefined, 40);
+    expect(published.some((n) => n.startsWith("p__alpha"))).toBe(false);
+    expect(published).toHaveLength(34); // 4 gateways + all 30 subcommand tools
+    expect(published.slice(0, 4)).toEqual(["p__cli", "p__other", "p__python", "p__make"]);
+    expect(notes[0]).toContain('MCP server "alpha" offers 255 tools');
+  });
+
+  it("applies exclude patterns and a per-project limit without an include list", () => {
+    const { published } = selectPublished(catalog({ alpha: 2, beta: 0, subs: 3 }), { include: [], exclude: ["python", "*_sub1", "alpha-0"], maxTools: 6 }, 40);
+    expect(published).toEqual(["p__alpha_1", "p__cli", "p__other", "p__make", "p__cli_sub0", "p__cli_sub2"]);
+  });
+});
+
+describe("selectPublished: explicit selection", () => {
+  const all = catalog({ alpha: 255, beta: 3, subs: 5 });
+
+  it("publishes exactly what the include patterns match", () => {
+    const { published, notes } = selectPublished(all, { include: ["alpha-7", "alpha_1?", "beta-*", "cli_sub4"], exclude: ["beta-1"] }, 40);
+    expect(published).toEqual(["p__alpha_7", "p__beta_0", "p__beta_2", "p__cli_sub4"]);
+    expect(notes).toEqual([]);
+  });
+
+  it("truncates an over-broad selection at the limit and says so", () => {
+    const { published, notes } = selectPublished(all, { include: ["alpha*"], exclude: [], maxTools: 100 }, 40);
+    expect(published).toHaveLength(100);
+    expect(notes).toEqual(["The tool selection matches 255 tools; only the first 100 are published (limit 100)."]);
+  });
+
+  it("reports a selection that matches nothing", () => {
+    const { published, notes } = selectPublished(all, { include: ["nope*"], exclude: [] }, 40);
+    expect(published).toEqual([]);
+    expect(notes).toEqual(["The tool selection matches no tools, so none are published."]);
+  });
+});
+
+describe("toolMatches", () => {
+  const tool: ToolDef = {
+    name: "httpie_cli__open_binary",
+    description: "",
+    inputSchema: {},
+    kind: "mcp",
+    argv: [],
+    options: [],
+    cwd: "/",
+    mcp: { server: "s", tool: "open-binary" },
+  };
+  it("matches the full name, the name without the project prefix, or the upstream name", () => {
+    expect(toolMatches(tool, ["httpie_cli__open_binary"])).toBe(true);
+    expect(toolMatches(tool, ["open_binary"])).toBe(true);
+    expect(toolMatches(tool, ["open-binary"])).toBe(true);
+    expect(toolMatches(tool, ["OPEN*"])).toBe(true);
+    expect(toolMatches(tool, ["binary"])).toBe(false);
+    expect(toolMatches(tool, ["cli__open_binary"])).toBe(false);
+  });
+  it("treats regex metacharacters in patterns literally", () => {
+    expect(toolMatches(tool, ["open.binary"])).toBe(false);
+    expect(toolMatches(tool, ["(open|close)_binary"])).toBe(false);
+    expect(toolMatches({ ...tool, mcp: { server: "s", tool: "a.b(c)" } }, ["a.b(c)"])).toBe(true);
   });
 });

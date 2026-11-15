@@ -3,6 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config.js";
+import { parseRepoRef } from "../../src/forge/repo-ref.js";
+import { Installer } from "../../src/install/installer.js";
+import { McpProxy } from "../../src/proxy/mcp-proxy.js";
+import { Registry } from "../../src/registry.js";
+import { Docker, type ExecOptions, type ExecResult } from "../../src/sandbox/docker.js";
 import { App } from "../../src/server.js";
 import { run } from "../../src/util/exec.js";
 
@@ -138,4 +143,53 @@ describe.skipIf(!enabled)("docker integration", () => {
     expect(c.code).not.toBe(0);
     expect(v.code).not.toBe(0);
   }, 60_000);
+});
+
+/**
+ * Real Docker, except that the first build is made to fail softly after
+ * leaving debris behind, to exercise the rebuild-on-another-image path.
+ */
+class FailsFirstBuild extends Docker {
+  private builds = 0;
+  override async exec(container: string, argv: string[], opts: ExecOptions): Promise<ExecResult> {
+    if (argv[0] === "sh" && argv[2]?.includes("soft_fail()") && this.builds++ === 0) {
+      const debris = "touch /workspace/repo/DEBRIS && mkdir -p /opt/mcpe/bin && touch /opt/mcpe/bin/stale && chmod +x /opt/mcpe/bin/stale";
+      await super.exec(container, ["sh", "-c", debris], { timeoutSec: 30 });
+      return { code: 0, stdout: "MCPE_SOFT_FAIL\nMCPE_WARN simulated build failure\n", stderr: "", timedOut: false, truncated: false };
+    }
+    return super.exec(container, argv, opts);
+  }
+}
+
+describe.skipIf(!enabled)("docker integration: rebuilding on another image", () => {
+  it("replaces the container, cleans the checkout and builds again", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-retry-"));
+    const cfg = loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: `${prefix}retry-` });
+    const docker = new FailsFirstBuild(cfg);
+    const registry = new Registry(dir);
+    // Both "versions" are the same image: what is under test is the mechanics.
+    const installer = new Installer(cfg, docker, registry, new McpProxy(cfg, docker), () => ({
+      image: "golang:1",
+      fallbacks: ["golang:1"],
+      reason: "test",
+    }));
+    try {
+      const record = await installer.install({ repo: parseRepoRef("tomnomnom/gron", cfg.hosts) });
+      expect(record.status).toBe("ready");
+      expect(record.warnings).toContain("The build did not succeed on golang:1 (simulated build failure); it was rebuilt on golang:1.");
+      expect(record.tools.map((t) => t.name)).toContain("gron__gron");
+
+      const state = await docker.exec(
+        record.container,
+        ["sh", "-c", "ls /opt/mcpe/bin; test -e /workspace/repo/DEBRIS && echo debris-left; git -C /workspace/repo status --porcelain | wc -l"],
+        { timeoutSec: 30 },
+      );
+      // Only the real build's output: no stale binary from the first container,
+      // no debris in the checkout, and a clean working tree.
+      expect(state.stdout.trim().split("\n")).toEqual(["gron", "0"]);
+    } finally {
+      for (const p of registry.list()) await installer.uninstall(p);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 600_000);
 });

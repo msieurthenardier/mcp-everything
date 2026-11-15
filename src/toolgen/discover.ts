@@ -58,10 +58,23 @@ async function fetchHelp(exec: SandboxExec, argv: string[], root: boolean, limit
   return null;
 }
 
-/** Recursively read `--help` for a command and its subcommands. */
-export async function crawlCommand(exec: SandboxExec, command: string, limits: CrawlLimits): Promise<HelpNode | null> {
+/** The top-level help text of a command, or null if it has none we recognize. */
+export function fetchRootHelp(exec: SandboxExec, command: string, limits: CrawlLimits): Promise<string | null> {
+  return fetchHelp(exec, [command], true, limits);
+}
+
+/**
+ * Recursively read `--help` for a command and its subcommands. Pass
+ * `rootText` when the top-level help has already been fetched.
+ */
+export async function crawlCommand(
+  exec: SandboxExec,
+  command: string,
+  limits: CrawlLimits,
+  rootText?: string,
+): Promise<HelpNode | null> {
   const visit = async (path: string[], blurb: string, parentText: string | null): Promise<HelpNode | null> => {
-    const text = await fetchHelp(exec, path, path.length === 1, limits);
+    const text = path.length === 1 && rootText !== undefined ? rootText : await fetchHelp(exec, path, path.length === 1, limits);
     if (!text) return null;
     // A program that ignores the extra word prints its own help again.
     if (parentText !== null && text.trim() === parentText.trim()) return null;
@@ -120,11 +133,15 @@ function tag(repoId: string): string {
   return `[sandboxed ${repoId}]`;
 }
 
-function cliTool(slug: string, repoId: string, node: HelpNode, used: Set<string>): ToolDef {
+function aliasNote(command: CommandSpec | undefined): string {
+  return command?.aliases?.length ? ` Also installed as ${command.aliases.map(baseName).join(", ")}.` : "";
+}
+
+function cliTool(slug: string, repoId: string, node: HelpNode, used: Set<string>, command?: CommandSpec): ToolDef {
   const display = [baseName(node.path[0]!), ...node.path.slice(1)].join(" ");
   const options = node.help.options.slice(0, MAX_OPTIONS_PER_TOOL);
   const summary = node.help.summary || node.blurb;
-  const pieces = [`${tag(repoId)} Runs \`${display}\`.`];
+  const pieces = [`${tag(repoId)} Runs \`${display}\`.${aliasNote(command).trimEnd()}`];
   if (summary) pieces.push(summary.endsWith(".") ? summary : `${summary}.`);
   if (node.help.usage) pieces.push(`Usage: ${node.help.usage}`);
   if (node.help.subcommands.length > 0) {
@@ -149,7 +166,7 @@ function cliTool(slug: string, repoId: string, node: HelpNode, used: Set<string>
 function passthroughTool(slug: string, repoId: string, command: CommandSpec, used: Set<string>): ToolDef {
   return {
     name: makeToolName(slug, [baseName(command.name)], used),
-    description: `${tag(repoId)} Runs \`${baseName(command.name)}\` (${command.origin}). No --help output was recognized, so pass everything via args.`,
+    description: `${tag(repoId)} Runs \`${baseName(command.name)}\` (${command.origin}).${aliasNote(command)} No --help output was recognized, so pass everything via args.`,
     inputSchema: schemaFor([]),
     kind: "cli",
     argv: [command.name],
@@ -263,11 +280,10 @@ export interface BuildInput {
 }
 
 /**
- * Turn crawl results into tool definitions. Proxied MCP tools come first: for
- * a project that is an MCP server they are the point. Then, breadth first: every command gets
- * its top-level tool, then the project-wide helpers, then subcommands level by
- * level (interleaved across commands) until the budget is spent. Whatever does
- * not fit stays reachable through the parent tool's `args`.
+ * Turn crawl results into the project's tool catalog: proxied MCP tools, then
+ * each command's top-level tool, the project-wide helpers, and subcommands
+ * level by level (interleaved across commands). `maxTools` bounds the catalog
+ * itself; what gets advertised to clients is decided by `selectPublished`.
  */
 export function buildTools(input: BuildInput): ToolDef[] {
   const used = new Set<string>();
@@ -284,7 +300,7 @@ export function buildTools(input: BuildInput): ToolDef[] {
     if (!room()) break;
     tools.push(
       root.node
-        ? cliTool(input.slug, input.repoId, root.node, used)
+        ? cliTool(input.slug, input.repoId, root.node, used, root.command)
         : passthroughTool(input.slug, input.repoId, root.command, used),
     );
   }
@@ -305,4 +321,97 @@ export function buildTools(input: BuildInput): ToolDef[] {
     level = level.map((nodes) => nodes.flatMap((n) => n.children));
   }
   return tools;
+}
+
+/** `*` wildcard pattern to an anchored, case-insensitive expression. */
+function globToRegExp(pattern: string): RegExp {
+  const body = pattern.trim().split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+  return new RegExp(`^${body}$`, "i");
+}
+
+/**
+ * Does a tool match a selection pattern? Patterns are tested against the
+ * generated name ("rea__open_binary"), the same without the project prefix
+ * ("open_binary"), and for proxied tools the upstream name ("open-binary").
+ */
+export function toolMatches(tool: ToolDef, patterns: string[]): boolean {
+  const names = [tool.name, tool.name.slice(tool.name.indexOf("__") + 2)];
+  if (tool.mcp) names.push(tool.mcp.tool);
+  return patterns.some((p) => {
+    const re = globToRegExp(p);
+    return names.some((n) => re.test(n));
+  });
+}
+
+export interface Publication {
+  /** Names of the tools to advertise, in catalog order. */
+  published: string[];
+  /** Things the operator should know about what was left out. */
+  notes: string[];
+}
+
+const isGateway = (t: ToolDef) => t.kind === "script" || t.kind === "code" || (t.kind === "cli" && t.argv.length === 1);
+
+/**
+ * Decide which catalog tools are advertised in the MCP tool list.
+ *
+ * With an explicit `include` selection, exactly the matching tools are
+ * published. Otherwise the default policy spends the budget so that nothing
+ * useful becomes unreachable:
+ *
+ *   1. every command's top-level tool and the project helpers, because they
+ *      can run anything the command can;
+ *   2. each proxied MCP server as a whole, if all of its tools still fit. A
+ *      server is never published in part: an arbitrary slice of its tools
+ *      costs context without being a usable toolset;
+ *   3. subcommand tools, breadth first, with what is left.
+ *
+ * Everything unpublished remains in the catalog, where find_project_tools
+ * finds it and call_project_tool runs it.
+ */
+export function selectPublished(
+  catalog: ToolDef[],
+  selection: { include: string[]; exclude: string[]; maxTools?: number } | undefined,
+  defaultMax: number,
+): Publication {
+  const max = selection?.maxTools ?? defaultMax;
+  const excluded = (t: ToolDef) => Boolean(selection?.exclude.length) && toolMatches(t, selection!.exclude);
+  const pool = catalog.filter((t) => !excluded(t));
+  const notes: string[] = [];
+  const chosen = new Set<string>();
+
+  if (selection?.include.length) {
+    const matched = pool.filter((t) => toolMatches(t, selection.include));
+    for (const t of matched.slice(0, max)) chosen.add(t.name);
+    if (matched.length > max) {
+      notes.push(`The tool selection matches ${matched.length} tools; only the first ${max} are published (limit ${max}).`);
+    }
+    if (matched.length === 0) notes.push("The tool selection matches no tools, so none are published.");
+  } else {
+    for (const t of pool) if (isGateway(t) && chosen.size < max) chosen.add(t.name);
+
+    const servers = new Map<string, ToolDef[]>();
+    for (const t of pool) {
+      if (t.kind !== "mcp" || !t.mcp) continue;
+      const list = servers.get(t.mcp.server) ?? [];
+      list.push(t);
+      servers.set(t.mcp.server, list);
+    }
+    for (const [server, tools] of servers) {
+      const room = max - chosen.size;
+      if (tools.length <= room) {
+        for (const t of tools) chosen.add(t.name);
+      } else {
+        notes.push(
+          `MCP server "${server}" offers ${tools.length} tools, more than the ${room} that fit under the limit of ${max}, so none of them are published individually. Search them with find_project_tools and run them with call_project_tool, or publish a subset with select_project_tools.`,
+        );
+      }
+    }
+
+    for (const t of pool) {
+      if (chosen.size >= max) break;
+      if (t.kind === "cli" && t.argv.length > 1) chosen.add(t.name);
+    }
+  }
+  return { published: catalog.filter((t) => chosen.has(t.name)).map((t) => t.name), notes };
 }

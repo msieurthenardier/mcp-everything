@@ -18,6 +18,8 @@ export interface Config {
     namePrefix: string;
     probeImage: string;
     images: Record<Ecosystem, string>;
+    /** Ecosystems whose image the operator chose; version detection leaves those alone. */
+    imageOverridden: Record<Ecosystem, boolean>;
   };
   installTimeoutSec: number;
   toolTimeoutSec: number;
@@ -60,6 +62,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const dataHome = env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
   const img = (eco: string, fallback: string) =>
     env[`MCPE_IMAGE_${eco.toUpperCase()}`] || env.MCPE_IMAGE || fallback;
+  const set = (eco: string) => Boolean(env[`MCPE_IMAGE_${eco.toUpperCase()}`] || env.MCPE_IMAGE);
   // Full (non-slim) Debian-based images: they ship git, a C toolchain and
   // coreutils `timeout`, which the install recipes rely on.
   const generic = "buildpack-deps:stable";
@@ -86,6 +89,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         autotools: img("autotools", generic),
         make: img("make", generic),
         generic: img("generic", generic),
+      },
+      imageOverridden: {
+        rust: set("rust"),
+        go: set("go"),
+        python: set("python"),
+        node: set("node"),
+        ruby: set("ruby"),
+        cmake: set("cmake"),
+        autotools: set("autotools"),
+        make: set("make"),
+        generic: set("generic"),
       },
     },
     installTimeoutSec: int(env.MCPE_INSTALL_TIMEOUT, 900),

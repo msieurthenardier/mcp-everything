@@ -52,6 +52,9 @@ export class FakeDocker extends Docker {
   override async destroy(container: string): Promise<void> {
     this.destroyed.push(container);
   }
+  override async removeContainer(container: string): Promise<void> {
+    this.destroyed.push(`container:${container}`);
+  }
 }
 
 export interface FakeUpstream {
@@ -62,6 +65,8 @@ export interface FakeUpstream {
   received: Array<{ name: string; arguments: unknown }>;
   /** When false, launched servers never answer the handshake. */
   answer: boolean;
+  /** Optional finer control: only launches this accepts are answered. */
+  answerIf?: (launch: Launch) => boolean;
   /** Live upstream server objects, to simulate a crash with .close(). */
   servers: Server[];
 }
@@ -75,7 +80,7 @@ export function fakeUpstream(): FakeUpstream {
   state.connector = (launch) => {
     state.launches.push(launch);
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-    if (state.answer) {
+    if (state.answer && (state.answerIf?.(launch) ?? true)) {
       const upstream = new Server({ name: "upstream", version: "1" }, { capabilities: { tools: {} } });
       upstream.setRequestHandler(ListToolsRequestSchema, async () => ({
         tools: [

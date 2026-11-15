@@ -58,6 +58,8 @@ export interface ParsedHelp {
 export interface CommandSpec {
   /** Name on PATH, or an absolute path inside the sandbox. */
   name: string;
+  /** Other names the same program is installed under. */
+  aliases?: string[];
   /** Where it came from, for humans: "console_script", "package.json bin", ... */
   origin: string;
 }
@@ -96,6 +98,14 @@ export interface McpServerSpec {
   origin: "detected" | "registered";
 }
 
+export interface ToolSelection {
+  /** Patterns (`*` wildcard) of tools to publish. */
+  include: string[];
+  exclude: string[];
+  /** Per-project replacement for MCPE_MAX_TOOLS_PER_PROJECT. */
+  maxTools?: number;
+}
+
 export type ProjectStatus = "installing" | "ready" | "failed";
 
 export interface ProjectRecord {
@@ -104,6 +114,8 @@ export interface ProjectRecord {
   ref?: string;
   commit?: string;
   image: string;
+  /** Why this image was chosen (version pin, declared range, default...). */
+  imageReason?: string;
   container: string;
   volume: string;
   ecosystems: Ecosystem[];
@@ -120,7 +132,15 @@ export interface ProjectRecord {
   commands: CommandSpec[];
   /** MCP servers inside the sandbox whose tools are proxied. */
   mcpServers?: McpServerSpec[];
+  /** Every tool generated for the project: the searchable, callable catalog. */
   tools: ToolDef[];
+  /**
+   * Names of the tools advertised in the MCP tool list. Absent in records
+   * written before the catalog existed, where every tool was published.
+   */
+  published?: string[];
+  /** An explicit choice of what to publish, made with select_project_tools. */
+  selection?: ToolSelection;
   /** Facts gathered at install time that tool generation reuses. */
   meta: ProjectMeta;
   installedAt: string;
