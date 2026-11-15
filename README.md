@@ -338,6 +338,13 @@ Environment variables, all optional:
   - The timeout is fixed when the sandbox is created, so projects installed
     before this setting existed need a reinstall (`install_project` with
     `reinstall: true`) to get it.
+  - To check a sandbox, run `docker inspect --format
+    '{{index .Config.Labels "mcp-everything.idle-timeout"}}' <container>`.
+    The container is named `MCPE_NAME_PREFIX` (default `mcpe-`) plus the
+    project's slug; `docker ps -a --filter label=mcp-everything=1` lists them
+    all. A number is the idle seconds it stops after, `0` means it was
+    created with the timeout disabled, and empty output means it predates
+    the setting and needs the reinstall above.
   - A running tool call, an install, a live proxied MCP server (until
     `MCPE_MCP_IDLE_TIMEOUT` closes it) or a process a tool leaves running
     keeps its sandbox up.

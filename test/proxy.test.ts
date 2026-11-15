@@ -254,7 +254,11 @@ describe("McpProxy start-up after an idle stop", () => {
     up.answer = false;
     docker.stateResult = "stopped";
     proxy = new McpProxy(cfg, docker, spied());
-    await expect(proxy.listTools("c1", spec(), 0.05)).rejects.toThrow(/did not start/);
+    const failure = proxy.listTools("c1", spec(), 0.05);
+    await expect(failure).rejects.toThrow(/did not start/);
+    await expect(failure).rejects.toThrow(
+      /MCP server "srv" \(srv\) did not start \(after restarting the sandbox\): no MCP handshake within 0\.05s/,
+    );
     expect(up.launches).toHaveLength(2);
     expect(cleanups).toEqual([1, 1]);
   });

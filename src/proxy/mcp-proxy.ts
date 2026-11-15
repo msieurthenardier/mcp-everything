@@ -139,7 +139,7 @@ export class McpProxy {
     container: string,
     server: McpServerSpec,
     startupSec: number,
-  ): Promise<{ ok: true; client: Client; launch: Launch; conn: Connection } | { ok: false; message: string }> {
+  ): Promise<{ ok: true; client: Client; launch: Launch; conn: Connection } | { ok: false; message: (afterRestart?: boolean) => string }> {
     const launch: Launch = { container, server, pidFile: `/tmp/mcpe-mcp-${randomBytes(6).toString("hex")}.pid` };
     const conn = this.connector(launch);
     const client = new Client({ name: "mcp-everything", version: "0.1.0" }, { capabilities: {} });
@@ -156,8 +156,10 @@ export class McpProxy {
           : describeError(e);
       return {
         ok: false,
-        message:
-          `MCP server "${server.name}" (${server.argv.join(" ")}) did not start: ${reason}` +
+        message: (afterRestart = false) =>
+          `MCP server "${server.name}" (${server.argv.join(" ")}) did not start` +
+          (afterRestart ? " (after restarting the sandbox)" : "") +
+          `: ${reason}` +
           (stderr ? `\n--- server stderr ---\n${stderr.slice(-1500)}` : ""),
       };
     } finally {
@@ -169,8 +171,8 @@ export class McpProxy {
     if (!(await this.docker.ensureRunning(container))) {
       throw new Error(`The sandbox ${container} no longer exists; reinstall the project.`);
     }
-    let attempt = await this.attempt(container, server, startupSec);
-    if (!attempt.ok) {
+    let first = await this.attempt(container, server, startupSec);
+    if (!first.ok) {
       // A sandbox that idled out between the check above and the launch fails
       // the handshake at once; start it and launch once more.
       let restartNote = "";
@@ -186,13 +188,13 @@ export class McpProxy {
       }
       if (restarted) {
         const second = await this.attempt(container, server, startupSec);
-        if (second.ok) attempt = second;
-        else throw new Error(second.message.replace("did not start:", "did not start (after restarting the sandbox):"));
+        if (second.ok) first = second;
+        else throw new Error(second.message(true));
       } else {
-        throw new Error(attempt.message + restartNote);
+        throw new Error(first.message() + restartNote);
       }
     }
-    const { client, launch, conn } = attempt;
+    const { client, launch, conn } = first;
     const session: Session = { key, client, launch, stderr: conn.stderr, lastUsed: Date.now(), inFlight: 0 };
     // The server exiting on its own retires the session; the next call restarts it.
     client.onclose = () => {
