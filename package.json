@@ -4,6 +4,10 @@
   "description": "An MCP server that turns any open source project on GitHub or GitLab into a sandboxed, dynamically generated toolset.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/msieurthenardier/mcp-everything.git"
+  },
   "bin": {
     "mcp-everything": "dist/index.js"
   },
@@ -16,6 +20,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/index.js",
     "test": "vitest run",

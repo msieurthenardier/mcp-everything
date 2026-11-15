@@ -20,15 +20,11 @@ ruff__ruff_check({ args: ["."], output_format: "json" })
 
 ## Setup
 
-```sh
-npm install
-npm run build
-```
-
-Register it with an MCP client. For Claude Code:
+No checkout is needed: `npx` can run the server straight from GitHub. For
+Claude Code:
 
 ```sh
-claude mcp add mcp-everything -- node /absolute/path/to/mcp-everything/dist/index.js
+claude mcp add mcp-everything -- npx -y github:msieurthenardier/mcp-everything
 ```
 
 Or in any client's MCP configuration:
@@ -37,12 +33,27 @@ Or in any client's MCP configuration:
 {
   "mcpServers": {
     "mcp-everything": {
-      "command": "node",
-      "args": ["/absolute/path/to/mcp-everything/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "github:msieurthenardier/mcp-everything"],
       "env": { "GITHUB_TOKEN": "optional, raises the search rate limit" }
     }
   }
 }
+```
+
+The first launch downloads and builds the server, which takes a few seconds;
+later launches reuse npm's cache. This form follows the default branch, so a
+new commit there is picked up the next time the server starts. To stay on a
+version you have looked at, pin a commit or tag:
+`github:msieurthenardier/mcp-everything#<commit-or-tag>`.
+
+### From a checkout
+
+```sh
+git clone https://github.com/msieurthenardier/mcp-everything.git
+cd mcp-everything
+npm install        # also builds dist/
+claude mcp add mcp-everything -- node "$PWD/dist/index.js"
 ```
 
 ## Built-in tools
