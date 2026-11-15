@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+.env
+coverage/
+# Snapshot/golden test artifacts are local-only, never committed.
+__snapshots__/
+*.snap
