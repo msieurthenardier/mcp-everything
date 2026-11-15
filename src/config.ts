@@ -28,6 +28,12 @@ export interface Config {
   mcpStartupTimeoutSec: number;
   /** Proxied MCP servers idle for this long are shut down. */
   mcpIdleSec: number;
+  /**
+   * A sandbox container stops itself after this long without activity; 0 keeps
+   * it running. Fixed when the container is created. (Not mcpIdleSec, which
+   * closes proxied MCP servers.)
+   */
+  sandboxIdleSec: number;
   maxToolsPerProject: number;
   maxOutputBytes: number;
 }
@@ -35,6 +41,12 @@ export interface Config {
 function int(value: string | undefined, fallback: number): number {
   const n = value === undefined ? NaN : Number.parseInt(value, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** Like int(), but 0 is a valid value. */
+function nonNegativeInt(value: string | undefined, fallback: number): number {
+  const n = value === undefined ? NaN : Number.parseInt(value, 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 const HOSTNAME = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
@@ -107,6 +119,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     helpTimeoutSec: int(env.MCPE_HELP_TIMEOUT, 10),
     mcpStartupTimeoutSec: int(env.MCPE_MCP_STARTUP_TIMEOUT, 30),
     mcpIdleSec: int(env.MCPE_MCP_IDLE_TIMEOUT, 600),
+    sandboxIdleSec: nonNegativeInt(env.MCPE_SANDBOX_IDLE_TIMEOUT, 1800),
     maxToolsPerProject: int(env.MCPE_MAX_TOOLS_PER_PROJECT, 40),
     maxOutputBytes: int(env.MCPE_MAX_OUTPUT_BYTES, 100_000),
   };

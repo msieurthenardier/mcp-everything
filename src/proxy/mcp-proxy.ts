@@ -130,19 +130,22 @@ export class McpProxy {
 
   private async kill(launch: Launch): Promise<void> {
     await this.docker
-      .exec(launch.container, ["sh", "-c", KILL_SCRIPT, "sh", launch.pidFile], { timeoutSec: 10 })
+      .exec(launch.container, ["sh", "-c", KILL_SCRIPT, "sh", launch.pidFile], { timeoutSec: 10, restart: false })
       .catch(() => undefined);
   }
 
-  private async open(key: string, container: string, server: McpServerSpec, startupSec: number): Promise<Session> {
-    if (!(await this.docker.ensureRunning(container))) {
-      throw new Error(`The sandbox ${container} no longer exists; reinstall the project.`);
-    }
+  /** One launch and handshake. On failure the client is closed and the server killed. */
+  private async attempt(
+    container: string,
+    server: McpServerSpec,
+    startupSec: number,
+  ): Promise<{ ok: true; client: Client; launch: Launch; conn: Connection } | { ok: false; message: string }> {
     const launch: Launch = { container, server, pidFile: `/tmp/mcpe-mcp-${randomBytes(6).toString("hex")}.pid` };
     const conn = this.connector(launch);
     const client = new Client({ name: "mcp-everything", version: "0.1.0" }, { capabilities: {} });
     try {
       await client.connect(conn.transport, { timeout: startupSec * 1000 });
+      return { ok: true, client, launch, conn };
     } catch (e) {
       await client.close().catch(() => undefined);
       await this.kill(launch);
@@ -151,13 +154,45 @@ export class McpProxy {
         e instanceof McpError && e.code === ErrorCode.RequestTimeout
           ? `no MCP handshake within ${startupSec}s`
           : describeError(e);
-      throw new Error(
-        `MCP server "${server.name}" (${server.argv.join(" ")}) did not start: ${reason}` +
+      return {
+        ok: false,
+        message:
+          `MCP server "${server.name}" (${server.argv.join(" ")}) did not start: ${reason}` +
           (stderr ? `\n--- server stderr ---\n${stderr.slice(-1500)}` : ""),
-      );
+      };
     } finally {
       conn.cleanup?.();
     }
+  }
+
+  private async open(key: string, container: string, server: McpServerSpec, startupSec: number): Promise<Session> {
+    if (!(await this.docker.ensureRunning(container))) {
+      throw new Error(`The sandbox ${container} no longer exists; reinstall the project.`);
+    }
+    let attempt = await this.attempt(container, server, startupSec);
+    if (!attempt.ok) {
+      // A sandbox that idled out between the check above and the launch fails
+      // the handshake at once; start it and launch once more.
+      let restartNote = "";
+      let restarted = false;
+      const stopped = await this.docker.state(container).then((st) => st === "stopped", () => false);
+      if (stopped) {
+        try {
+          restarted = await this.docker.ensureRunning(container);
+          if (!restarted) restartNote = `\n(restarting the sandbox failed: ${container} no longer exists)`;
+        } catch (e) {
+          restartNote = `\n(restarting the sandbox failed: ${describeError(e)})`;
+        }
+      }
+      if (restarted) {
+        const second = await this.attempt(container, server, startupSec);
+        if (second.ok) attempt = second;
+        else throw new Error(second.message.replace("did not start:", "did not start (after restarting the sandbox):"));
+      } else {
+        throw new Error(attempt.message + restartNote);
+      }
+    }
+    const { client, launch, conn } = attempt;
     const session: Session = { key, client, launch, stderr: conn.stderr, lastUsed: Date.now(), inFlight: 0 };
     // The server exiting on its own retires the session; the next call restarts it.
     client.onclose = () => {
