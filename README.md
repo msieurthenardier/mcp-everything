@@ -269,3 +269,7 @@ src/proxy/      client sessions to MCP servers running inside sandboxes
 src/registry.ts persistent project registry (shared between sessions)
 src/server.ts   MCP server: built-in tools and dispatch to generated tools
 ```
+
+## License
+
+[MIT](LICENSE)
