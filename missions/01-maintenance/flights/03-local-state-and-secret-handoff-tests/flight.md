@@ -4,9 +4,9 @@
 **Mission**: [Maintenance](../../mission.md)
 
 ## Contributing to Criteria
-- [ ] A test fails if a variable's value appears in the command line of a proxied launch or if the env file is not private, and env files left by a crash are removed at startup (finding 5).
-- [ ] A registry file written by a newer version is refused with a clear message and never rewritten (finding 6a).
-- [ ] Registry temp files left by a crash are removed at startup (finding 6d).
+- [x] A test fails if a variable's value appears in the command line of a proxied launch or if the env file is not private, and env files left by a crash are removed at startup (finding 5).
+- [x] A registry file written by a newer version is refused with a clear message and never rewritten (finding 6a).
+- [x] Registry temp files left by a crash are removed at startup (finding 6d).
 
 ---
 
@@ -98,7 +98,7 @@ Out of scope here: emptying the registry on a stat error (squawk 0017), quaranti
 
 ### Completion Checklist
 - [x] All legs completed
-- [ ] Code merged
+- [x] Code merged
 - [x] Tests passing
 - [x] Documentation updated
 

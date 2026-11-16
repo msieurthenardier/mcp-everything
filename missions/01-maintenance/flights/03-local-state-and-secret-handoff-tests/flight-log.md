@@ -143,3 +143,7 @@ Filled in at the debrief. During the flight these were recorded only in the Flig
 - The Developer read every test line the flight added and found three cases that pass for the wrong reason, after two review cycles had not. Put to the operator as a squawk candidate.
 - From the debrief: the Deviations section above was filled in; sortie 04 gained what this flight learned about the registry's lock and its version check.
 - The operator's decisions at the debrief: squawks 0035 (three weak tests) and 0036 (the lock's release) logged as `open`, `routine`; squawk 0034 raised to `grounding` for further work on `src/registry.ts`; the Reviewer prompt in the crew file gains a paragraph asking which source change makes each new test fail; flight set to `completed`; all of it committed to this branch so it is part of pull request #13.
+
+### 2026-11-16 — after the merge (Flight Director)
+- The operator merged pull request #13 (`f8c2f10`) with the debrief on it. The check ran on the push to `main` (run 43941422193, success). Mission criteria 3 to 5 and this flight's "Code merged" are checked off, in the commit that carries the [mission debrief](../../mission-debrief.md).
+

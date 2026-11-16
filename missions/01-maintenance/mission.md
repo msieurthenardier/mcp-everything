@@ -1,6 +1,6 @@
 # Mission: Maintenance
 
-**Status**: active
+**Status**: completed
 
 ## Outcome
 Resolve codebase health issues identified in maintenance report 2026-11-15: a change to `main` is checked before it reaches the people who install from it, a failed or interrupted install no longer leaves a sandbox online, and the state mcp-everything leaves on disk is reconciled when it starts.
@@ -18,9 +18,9 @@ This mission takes the bounded Action Required findings: 7, 4, 5, 6a, and the Ad
 ## Success Criteria
 - [x] Every pull request and every push to `main` runs install, typecheck, unit tests and build on a hosted runner, and `engines`, the README and a Node version file state the same Node floor (finding 7).
 - [x] After an install fails or is interrupted, the project's sandbox is off the network, its record says so, and the record does not stay `installing`; shutdown cannot hang; `disconnectMcp` does not store an emptied record when the sandbox is gone; the install failure branches have unit tests (finding 4).
-- [ ] A test fails if a variable's value appears in the command line of a proxied launch or if the env file is not private, and env files left by a crash are removed at startup (finding 5).
-- [ ] A registry file written by a newer version is refused with a clear message and never rewritten (finding 6a).
-- [ ] Registry temp files left by a crash are removed at startup (finding 6d).
+- [x] A test fails if a variable's value appears in the command line of a proxied launch or if the env file is not private, and env files left by a crash are removed at startup (finding 5).
+- [x] A registry file written by a newer version is refused with a clear message and never rewritten (finding 6a).
+- [x] Registry temp files left by a crash are removed at startup (finding 6d).
 
 ## Stakeholders
 The operator, who maintains the project and runs it daily with two clients; and anyone who installs it with `npx` from the default branch.
