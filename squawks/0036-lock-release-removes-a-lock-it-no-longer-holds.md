@@ -11,7 +11,7 @@
 
 Make the release remove the lock only if it is still this process's: write a token into the lock file when taking it, and on release remove the file only if it still holds that token.
 
-**Scope gate**: the release only. Whether and when a lock may be taken from a live writer is a design question and belongs to [sortie 04](../sorties/04-ownership-on-a-shared-machine/flight.md). If the fix cannot be made without deciding that, stop and escalate.
+**Scope gate**: the release only. Whether and when a lock may be taken from a live writer is a design question and belongs to [sortie 04](../missions/02-sandbox-ownership-on-a-shared-machine/flights/01-owned-sandboxes/flight.md). If the fix cannot be made without deciding that, stop and escalate.
 
 ## Evidence
 - `src/registry.ts`, `Registry.lock` — `fs.closeSync(fs.openSync(lockFile, "wx", 0o600)); return () => fs.rmSync(lockFile, { force: true });`, and further down `if (age > 10_000 || Date.now() > deadline) fs.rmSync(lockFile, { force: true });`.

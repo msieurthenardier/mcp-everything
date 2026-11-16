@@ -11,7 +11,7 @@ The first routine-maintenance inspection, run after sorties 01 to 03, assessed t
 This mission takes the bounded Action Required findings: 7, 4, 5, 6a, and the Advisory 6d that shares a flight with 6a. It does **not** take:
 
 - **Finding 1a** (the README says the agent never sees variable values). It is squawk [0014](../../squawks/0014-readme-says-the-agent-never-sees-variable-values.md), severity grounding, and should be completed before this mission starts.
-- **Findings 1b, 2 and 3** (who may read a project's variables, what a slug identifies, who owns a sandbox). They need design and go to one sortie after this mission, with squawk 0008. Logged on 2026-11-16 as [sortie 04](../../sorties/04-ownership-on-a-shared-machine/flight.md), with the operator's wider scope (several agentic systems on one machine). Flight 03's tests are the net that sortie will rely on.
+- **Findings 1b, 2 and 3** (who may read a project's variables, what a slug identifies, who owns a sandbox). They need design and go to one sortie after this mission, with squawk 0008. Logged on 2026-11-16 as [sortie 04](../02-sandbox-ownership-on-a-shared-machine/flights/01-owned-sandboxes/flight.md), with the operator's wider scope (several agentic systems on one machine). Flight 03's tests are the net that sortie will rely on.
 - **Eleven Advisory findings** logged as squawks 0015 to 0025, for a turnaround.
 - **The structure of `installer.ts` and `server.ts`.** The Architect advised against refactoring before the design sortie changes the launch path. Flight 02 touches `disconnectMcp` only as far as its finding requires.
 
