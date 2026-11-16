@@ -352,7 +352,7 @@ export class App {
     this.proxy = opts.proxy ?? new McpProxy(this.cfg, this.docker);
     this.installer = new Installer(this.cfg, this.docker, this.registry, this.proxy);
     this.server = new Server(
-      { name: "mcp-everything", version: "0.1.0" },
+      { name: "mcp-everything", version: "0.2.0" },
       { capabilities: { tools: { listChanged: true } }, instructions: INSTRUCTIONS },
     );
 

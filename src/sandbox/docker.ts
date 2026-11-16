@@ -27,6 +27,12 @@ export interface ExecOptions {
   maxBytes?: number;
   env?: Record<string, string>;
   onOutput?: (chunk: string) => void;
+  /**
+   * Start the sandbox and run the command once more when the first attempt
+   * failed only because the container was stopped. Default true; cleanup that
+   * must not wake a stopped sandbox passes false.
+   */
+  restart?: boolean;
 }
 
 export interface ExecResult extends RunResult {
@@ -91,6 +97,75 @@ for f in "$@"; do
 done
 `;
 
+// Entrypoint of every sandbox with an idle timeout: $1 is the timeout and $2 the
+// poll interval, both in seconds. Exits 0 (stopping the container) once nothing
+// has run for the timeout. Activity is any process besides PID 1, this shell and
+// its sleep, or a gap in the PIDs of successive sleeps (a process was created
+// and ended between polls). Time comes from /proc/uptime, and the loop uses
+// builtins only, so it never sees its own children as activity. PATH is fixed
+// because the container's own puts project-writable directories first.
+// The loop's only fork is its sleep, and that fork fails at the sandbox's
+// process limit. A failed fork exits a non-interactive dash or busybox shell,
+// which would stop the container, so it runs under `command eval` (an error
+// there does not abort the shell) and is retried at once. A poll that had to
+// retry counts as activity, and the first failure is announced once on stderr.
+const WATCHDOG_SCRIPT = `
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+idle="$1"; poll="$2"
+read up _ < /proc/uptime; last=\${up%%.*}
+prev=0; warned=0
+while :; do
+  starved=0
+  until command eval 'sleep "$poll" & pid=$!' 2>/dev/null; do
+    starved=1
+    [ "$warned" = 1 ] || { warned=1; echo "watchdog: cannot fork (process limit reached); retrying" >&2; }
+  done
+  active=$starved
+  [ "$pid" -eq $((prev + 1)) ] || active=1
+  prev=$pid
+  for d in /proc/[0-9]*; do
+    case "\${d#/proc/}" in 1|$$|$pid) ;; *) active=1 ;; esac
+  done
+  read up _ < /proc/uptime; now=\${up%%.*}
+  if [ "$active" = 1 ]; then last=$now
+  elif [ $((now - last)) -ge $((idle + poll)) ]; then exit 0
+  fi
+  wait "$pid"
+done
+`;
+
+/** How often the watchdog looks, given the idle timeout. */
+export function watchdogPollSec(idleSec: number): number {
+  return Math.min(15, Math.max(1, Math.floor(idleSec / 4)));
+}
+
+/**
+ * True when a result is, in its entirety, one of docker's own "could not exec,
+ * the container is stopped" failures: the command never started.
+ */
+export function isStoppedExecFailure(r: {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  truncated: boolean;
+}): boolean {
+  if (r.timedOut || r.truncated) return false;
+  const out = r.stdout.trim();
+  const err = r.stderr.trim();
+  if (r.code === 1) {
+    return out === "" && /^Error response from daemon: [Cc]ontainer \S+ is not running$/.test(err);
+  }
+  if (r.code === 128) {
+    return (
+      err === "" &&
+      (out === "cannot exec in a stopped state" ||
+        out === "OCI runtime exec failed: exec failed: cannot exec in a stopped container")
+    );
+  }
+  return false;
+}
+
 export function parseProbeOutput(stdout: string): ProbeData {
   const data: ProbeData = { commit: "", entries: [], files: {} };
   const b64 = (s: string | undefined) => Buffer.from(s ?? "", "base64").toString("utf8");
@@ -110,7 +185,7 @@ export function parseProbeOutput(stdout: string): ProbeData {
 export class Docker {
   constructor(private readonly cfg: Config) {}
 
-  private docker(args: string[], opts: Parameters<typeof run>[2] = {}): Promise<RunResult> {
+  protected docker(args: string[], opts: Parameters<typeof run>[2] = {}): Promise<RunResult> {
     return run(this.cfg.docker.bin, args, opts);
   }
 
@@ -216,6 +291,7 @@ export class Docker {
       LD_LIBRARY_PATH: `${PREFIX}/lib:${PREFIX}/lib64`,
       GIT_TERMINAL_PROMPT: "0",
     };
+    const idle = this.cfg.sandboxIdleSec;
     const res = await this.docker(
       [
         "run", "-d", "--init",
@@ -223,6 +299,7 @@ export class Docker {
         "--hostname", "sandbox",
         "--label", "mcp-everything=1",
         "--label", `mcp-everything.project=${opts.project}`,
+        "--label", `mcp-everything.idle-timeout=${idle}`,
         ...this.limits(),
         // Root inside the container needs these to run package managers
         // (chown/setuid when unpacking and dropping privileges); nothing else.
@@ -232,9 +309,9 @@ export class Docker {
         "-v", `${opts.volume}:${WORKSPACE}`,
         "-w", REPO_DIR,
         ...Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
-        "--entrypoint", "sleep",
-        opts.image,
-        "infinity",
+        ...(idle > 0
+          ? ["--entrypoint", "/bin/sh", opts.image, "-c", WATCHDOG_SCRIPT, "watchdog", String(idle), String(watchdogPollSec(idle))]
+          : ["--entrypoint", "sleep", opts.image, "infinity"]),
       ],
       { timeoutMs: 120_000 },
     );
@@ -246,6 +323,14 @@ export class Docker {
    * so it is killed inside the container, with a host-side kill as backstop.
    */
   async exec(container: string, argv: string[], opts: ExecOptions): Promise<ExecResult> {
+    const first = await this.execOnce(container, argv, opts);
+    if (opts.restart === false || !isStoppedExecFailure(first)) return first;
+    // The sandbox idled out between the caller's liveness check and this exec.
+    if (!(await this.ensureRunning(container))) return first;
+    return this.execOnce(container, argv, opts);
+  }
+
+  private async execOnce(container: string, argv: string[], opts: ExecOptions): Promise<ExecResult> {
     const secs = Math.max(1, Math.floor(opts.timeoutSec));
     const args = ["exec", "-i"];
     if (opts.cwd) args.push("-w", opts.cwd);

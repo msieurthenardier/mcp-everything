@@ -38,13 +38,24 @@ export class FakeDocker extends Docker {
   exists = true;
   network: Array<[string, boolean]> = [];
   destroyed: string[] = [];
+  /** What `state` reports; a failed handshake consults it. */
+  stateResult: "running" | "stopped" | "missing" = "running";
+  ensureCalls: string[] = [];
 
+  /** Nothing here may reach the real docker binary. */
+  protected override docker(args: string[]): never {
+    throw new Error(`FakeDocker reached the docker binary: ${args.join(" ")}`);
+  }
   override async exec(container: string, argv: string[], opts: ExecOptions): Promise<ExecResult> {
     this.calls.push({ container, argv, opts });
     return { code: 0, stdout: "", stderr: "", timedOut: false, truncated: false, ...this.next };
   }
-  override async ensureRunning(): Promise<boolean> {
+  override async ensureRunning(container: string): Promise<boolean> {
+    this.ensureCalls.push(container);
     return this.exists;
+  }
+  override async state(): Promise<"running" | "stopped" | "missing"> {
+    return this.stateResult;
   }
   override async setNetwork(container: string, enabled: boolean): Promise<void> {
     this.network.push([container, enabled]);

@@ -178,3 +178,104 @@ describe("dockerConnector", () => {
     expect(fs.existsSync(path.join(dir, "tmp"))).toBe(false);
   });
 });
+
+describe("McpProxy start-up after an idle stop", () => {
+  let cleanups: number[];
+  /** The fake connector, with a cleanup spy on every connection (index = launch order). */
+  const spied = () => {
+    cleanups = [];
+    return (launch: Parameters<typeof up.connector>[0]) => {
+      const i = cleanups.push(0) - 1;
+      const conn = up.connector(launch);
+      return { ...conn, cleanup: () => void cleanups[i]!++ };
+    };
+  };
+  const failFirst = () => {
+    up.answerIf = (l) => l !== up.launches[0];
+    docker.stateResult = "stopped";
+    proxy = new McpProxy(cfg, docker, spied());
+  };
+
+  it("restarts a stopped sandbox and launches once more with a fresh launch", async () => {
+    failFirst();
+    await proxy.listTools("c1", spec(), 0.05);
+    expect(docker.ensureCalls).toEqual(["c1", "c1"]);
+    expect(up.launches).toHaveLength(2);
+    expect(up.launches[1]!.pidFile).not.toBe(up.launches[0]!.pidFile);
+    expect(cleanups).toEqual([1, 1]);
+    expect(kills()).toEqual([up.launches[0]!.pidFile]);
+    await proxy.closeAll();
+    // The session holds the second launch.
+    expect(kills()).toEqual([up.launches[0]!.pidFile, up.launches[1]!.pidFile]);
+  });
+
+  it.each(["running", "missing"] as const)("does not relaunch when the sandbox is %s", async (state) => {
+    up.answer = false;
+    docker.stateResult = state;
+    proxy = new McpProxy(cfg, docker, spied());
+    await expect(proxy.listTools("c1", spec(), 0.05)).rejects.toThrow(/did not start: no MCP handshake within 0\.05s/);
+    expect(up.launches).toHaveLength(1);
+    expect(docker.ensureCalls).toEqual(["c1"]);
+    expect(cleanups).toEqual([1]);
+  });
+
+  it("does not relaunch when Docker.state rejects", async () => {
+    up.answer = false;
+    docker.state = async () => {
+      throw new Error("daemon down");
+    };
+    await expect(proxy.listTools("c1", spec(), 0.05)).rejects.toThrow(/did not start: no MCP handshake/);
+    expect(up.launches).toHaveLength(1);
+  });
+
+  it("does not relaunch when the restart reports the sandbox gone", async () => {
+    up.answer = false;
+    docker.stateResult = "stopped";
+    const original = docker.ensureRunning.bind(docker);
+    let n = 0;
+    docker.ensureRunning = async (c: string) => ((n++ === 0 ? await original(c) : false));
+    await expect(proxy.listTools("c1", spec(), 0.05)).rejects.toThrow(/did not start: no MCP handshake/);
+    expect(up.launches).toHaveLength(1);
+  });
+
+  it("does not relaunch when the restart throws, and mentions why", async () => {
+    up.answer = false;
+    docker.stateResult = "stopped";
+    let n = 0;
+    docker.ensureRunning = async () => {
+      if (n++ > 0) throw new Error("Failed to start sandbox c1: boom");
+      return true;
+    };
+    await expect(proxy.listTools("c1", spec(), 0.05)).rejects.toThrow(/did not start[^]*Failed to start sandbox c1: boom/);
+    expect(up.launches).toHaveLength(1);
+  });
+
+  it("gives up after one relaunch", async () => {
+    up.answer = false;
+    docker.stateResult = "stopped";
+    proxy = new McpProxy(cfg, docker, spied());
+    const failure = proxy.listTools("c1", spec(), 0.05);
+    await expect(failure).rejects.toThrow(/did not start/);
+    await expect(failure).rejects.toThrow(
+      /MCP server "srv" \(srv\) did not start \(after restarting the sandbox\): no MCP handshake within 0\.05s/,
+    );
+    expect(up.launches).toHaveLength(2);
+    expect(cleanups).toEqual([1, 1]);
+  });
+
+  it("propagates a connector that throws, without asking for the state", async () => {
+    let asked = 0;
+    docker.state = async () => (asked++, "stopped");
+    proxy = new McpProxy(cfg, docker, () => {
+      throw new Error("spawn failed");
+    });
+    await expect(proxy.listTools("c1", spec(), 0.05)).rejects.toThrow("spawn failed");
+    expect(asked).toBe(0);
+  });
+
+  it("kills without restarting a stopped sandbox", async () => {
+    await proxy.listTools("c1", spec());
+    await proxy.closeAll();
+    expect(docker.calls.filter((c) => c.argv[0] === "sh").map((c) => c.opts.restart)).toEqual([false]);
+  });
+});

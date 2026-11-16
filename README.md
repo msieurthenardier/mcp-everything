@@ -304,6 +304,7 @@ Environment variables, all optional:
 | `MCPE_MAX_TOOLS_PER_PROJECT` | `40` | Cap on tools published per project (the catalog is not capped). |
 | `MCPE_MCP_STARTUP_TIMEOUT` | `30` | Seconds a proxied MCP server may take to answer the handshake. |
 | `MCPE_MCP_IDLE_TIMEOUT` | `600` | Seconds of inactivity before a proxied MCP server is stopped. |
+| `MCPE_SANDBOX_IDLE_TIMEOUT` | `1800` | Seconds without activity before a project's sandbox container stops itself; `0` disables this. Applies to sandboxes created after it is set. Not `MCPE_MCP_IDLE_TIMEOUT`, which stops proxied MCP servers, not sandboxes. |
 | `MCPE_MAX_OUTPUT_BYTES` | `100000` | Cap on captured stdout and stderr, each. |
 | `MCPE_IMAGE`, `MCPE_IMAGE_<ECOSYSTEM>` | see table | Override sandbox images. Images need `sh`, `git` and coreutils `timeout`. |
 | `MCPE_NAME_PREFIX` | `mcpe-` | Prefix of container and volume names. |
@@ -330,16 +331,42 @@ Environment variables, all optional:
   to completion and return their output.
 - Files go in and out as text through `sandbox_write_file` and
   `sandbox_read_file`; there is no host file mount.
-- Each installed project keeps an idle container running. After a reboot
-  containers are restarted on first use.
+- A sandbox with no activity for `MCPE_SANDBOX_IDLE_TIMEOUT` seconds (30
+  minutes by default) stops itself; its volume and installed tools are kept
+  and it is restarted on first use, as it is after a reboot. Its network
+  setting is unchanged by this. Things to know:
+  - The timeout is fixed when the sandbox is created, so projects installed
+    before this setting existed need a reinstall (`install_project` with
+    `reinstall: true`) to get it.
+  - To check a sandbox, run `docker inspect --format
+    '{{index .Config.Labels "mcp-everything.idle-timeout"}}' <container>`.
+    The container is named `MCPE_NAME_PREFIX` (default `mcpe-`) plus the
+    project's slug; `docker ps -a --filter label=mcp-everything=1` lists them
+    all. A number is the idle seconds it stops after, `0` means it was
+    created with the timeout disabled, and empty output means it predates
+    the setting and needs the reinstall above.
+  - A running tool call, an install, a live proxied MCP server (until
+    `MCPE_MCP_IDLE_TIMEOUT` closes it) or a process a tool leaves running
+    keeps its sandbox up.
+  - A sandbox stops up to about half a minute after the timeout.
+  - A sandbox at its process limit (`MCPE_PIDS_LIMIT`) keeps running: the
+    watchdog retries its failed fork rather than exiting. While it is at the
+    limit it may use up to one CPU's worth of the sandbox's own CPU limit
+    retrying, until a process slot frees; idle stopping then resumes with the
+    same timeout and latency as above. It logs one line to the container's
+    stderr the first time this happens.
+  - Idle stopping has not been verified under gVisor (`runsc`).
 
 ## Development
 
 ```sh
 npm test              # unit and protocol tests, no Docker needed
 npm run test:docker   # end-to-end against real Docker and github.com
+npm run test:docker:pressure  # the slow fork-pressure cases only
 npm run typecheck
 ```
+
+`npm run test:docker` skips the fork-pressure cases; run them with `npm run test:docker:pressure` when the idle watchdog (the sandbox entrypoint script) or its tests change.
 
 Layout:
 

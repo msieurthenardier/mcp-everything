@@ -1,6 +1,6 @@
 {
   "name": "mcp-everything",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "An MCP server that turns any open source project on GitHub or GitLab into a sandboxed, dynamically generated toolset.",
   "type": "module",
   "license": "MIT",
@@ -24,7 +24,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/index.js",
     "test": "vitest run",
-    "test:docker": "MCPE_DOCKER_TESTS=1 vitest run test/integration"
+    "test:docker": "MCPE_DOCKER_TESTS=1 vitest run test/integration",
+    "test:docker:pressure": "MCPE_DOCKER_TESTS=1 MCPE_PRESSURE_TESTS=1 vitest run test/integration -t 'under fork pressure'"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
