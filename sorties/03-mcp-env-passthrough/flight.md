@@ -1,6 +1,6 @@
 # Sortie: MCP Env Passthrough
 
-**Status**: landed
+**Status**: completed
 
 ## Charter
 
@@ -11,10 +11,10 @@ An operator gives a sandboxed MCP server its environment by setting `{slug}__{NA
 MCP servers that need API keys can only get them through `connect_mcp_server(env: …)` today. That sends the secret through the model conversation and stores it in plain text in `registry.json`. Operators already configure mcp-everything through its environment in their MCP client configuration, which is where secrets for the servers it runs belong.
 
 ### Success Criteria
-- [ ] With `mcp_booking__API_KEY=x` in the environment of the mcp-everything process, an MCP server of the project with slug `mcp_booking` is started with `API_KEY=x` in its environment.
-- [ ] An MCP server that could not start when its project was installed, for lack of a variable, publishes its tools once the variable is present in the process environment and `refresh_mcp` is called for that project.
-- [ ] mcp-everything never writes a proxied value on its own account: not to `registry.json`, not in its own tool output, messages or errors, and not in its logs; `project_info` shows names only. Text that a proxied server itself prints or returns is outside this promise and is documented as a limit. *(Reworded by the operator on 2026-11-15 from "Proxied values never appear in `registry.json`, in the output of any tool, or in logs", after design review showed that a server which prints its own key puts it in all three. See DD7.)*
-- [ ] Variables prefixed for one slug never reach another project's sandbox, and a project with no matching variables behaves exactly as before.
+- [x] With `mcp_booking__API_KEY=x` in the environment of the mcp-everything process, an MCP server of the project with slug `mcp_booking` is started with `API_KEY=x` in its environment.
+- [x] An MCP server that could not start when its project was installed, for lack of a variable, publishes its tools once the variable is present in the process environment and `refresh_mcp` is called for that project.
+- [x] mcp-everything never writes a proxied value on its own account: not to `registry.json`, not in its own tool output, messages or errors, and not in its logs; `project_info` shows names only. Text that a proxied server itself prints or returns is outside this promise and is documented as a limit. *(Reworded by the operator on 2026-11-15 from "Proxied values never appear in `registry.json`, in the output of any tool, or in logs", after design review showed that a server which prints its own key puts it in all three. See DD7.)*
+- [x] Variables prefixed for one slug never reach another project's sandbox, and a project with no matching variables behaves exactly as before.
 
 ### Constraints
 - **Process environment only.** Variables are read from the environment of the running mcp-everything process. A variable added to the client configuration reaches that process when the client restarts or reconnects it; `refresh_mcp` does not read any other source. *(Agreed at the charter gate, 2026-11-15.)*
@@ -188,7 +188,7 @@ The split is by what can be finished and checked by itself, not by kind of task:
 
 ### Completion Checklist
 - [x] All legs completed
-- [ ] Code merged
+- [x] Code merged
 - [x] Tests passing
 - [x] Documentation updated
 
