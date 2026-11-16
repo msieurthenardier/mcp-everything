@@ -142,7 +142,7 @@ export class McpProxy {
   ): Promise<{ ok: true; client: Client; launch: Launch; conn: Connection } | { ok: false; message: (afterRestart?: boolean) => string }> {
     const launch: Launch = { container, server, pidFile: `/tmp/mcpe-mcp-${randomBytes(6).toString("hex")}.pid` };
     const conn = this.connector(launch);
-    const client = new Client({ name: "mcp-everything", version: "0.1.0" }, { capabilities: {} });
+    const client = new Client({ name: "mcp-everything", version: "0.2.0" }, { capabilities: {} });
     try {
       await client.connect(conn.transport, { timeout: startupSec * 1000 });
       return { ok: true, client, launch, conn };
