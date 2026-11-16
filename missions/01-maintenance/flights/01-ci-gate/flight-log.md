@@ -3,7 +3,7 @@
 **Flight**: [CI Gate](flight.md)
 
 ## Summary
-Landed on 2026-11-16. One leg, `tier-a-check`, completed with no deviation. The check ran green on this flight's pull request (#7) in 19 seconds and red on a throwaway pull request with a type error. Waiting on the operator for the ruleset on `main`; the check's name is `check`.
+Completed on 2026-11-16 (landed and debriefed the same day). One leg, `tier-a-check`, completed with no deviation. The check ran green on this flight's pull request (#7) in 19 seconds and red on a throwaway pull request with a type error. Waiting on the operator for the ruleset on `main`; the check's name is `check`.
 
 ### Flight Director Notes
 - 2026-11-16: The operator said to start the mission after pull request #6 (the squawk turnaround, with squawk 0014) merged. Mission set to `active`, flight to `in-flight`, branch `flight/01-ci-gate` cut from `main` at that merge. The mission's artifacts were untracked until now and are committed with this flight. The maintenance report (`maintenance/2026-11-15.md`) is not: it describes the open design gaps of findings 1b, 2 and 3 in more detail than anything in the public repository, the operator was asked whether to publish it and has not answered, so it stays out of this commit until they do. Links to it from the mission, the flights and squawks 0014 to 0025 do not resolve until then.
@@ -74,3 +74,13 @@ None from the leg.
 - Documentation: the README's requirement line and Development section were updated in the leg. `CLAUDE.md` describes Flight Control only and needs nothing.
 - Flight set to `landed`; flight 1 checked off in the mission. The mission's first success criterion stays open until this merges and a push to `main` has run the check, and until the ruleset exists.
 - Asked of the operator: a ruleset on `main` requiring a pull request and the status check named `check`, with force-push blocked.
+
+### 2026-11-16 — debrief (Flight Director)
+- Debriefed on the flight branch, before merge, so the debrief joins pull request #7: [flight-debrief.md](flight-debrief.md). Developer and Architect interviews on Sonnet; no human interview, the log had no gap to ask about.
+- The Developer re-ran both suites: unit 396 passed, 17 skipped, 1.63 s; Docker 15 passed, 2 skipped, 151.6 s.
+- From the debrief: the Verification sections of flights 02 and 03 now say the hosted check does not run the Docker suite and that the count floor is raised with new tests. Both flights were still `ready`.
+- The operator confirmed the three squawk candidates and the status change: squawks 0026, 0027 and 0028 logged as `open`, `routine`; flight set to `completed`.
+
+### 2026-11-16 — after the merge (Flight Director)
+- The operator merged pull request #7 (`ddedf48`) before the debrief was committed. The debrief, squawks 0026 to 0028, the `completed` status and the notes added to flights 02 and 03 are committed on `flight/01-debrief` and opened as a separate pull request.
+- The check ran on the push to `main` (run 43918240155, success). Mission criterion 1 and this flight's "Code merged" are checked off. The ruleset on `main` does not exist yet.

@@ -1,10 +1,10 @@
 # Flight: CI Gate
 
-**Status**: landed
+**Status**: completed
 **Mission**: [Maintenance](../../mission.md)
 
 ## Contributing to Criteria
-- [ ] Every pull request and every push to `main` runs install, typecheck, unit tests and build on a hosted runner, and `engines`, the README and a Node version file state the same Node floor (finding 7).
+- [x] Every pull request and every push to `main` runs install, typecheck, unit tests and build on a hosted runner, and `engines`, the README and a Node version file state the same Node floor (finding 7).
 
 ---
 
@@ -85,7 +85,7 @@ One finding, one leg.
 
 ### Completion Checklist
 - [x] All legs completed
-- [ ] Code merged
+- [x] Code merged
 - [x] Tests passing
 - [x] Documentation updated
 

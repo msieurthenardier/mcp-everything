@@ -16,7 +16,7 @@ This mission takes the bounded Action Required findings: 7, 4, 5, 6a, and the Ad
 - **The structure of `installer.ts` and `server.ts`.** The Architect advised against refactoring before the design sortie changes the launch path. Flight 02 touches `disconnectMcp` only as far as its finding requires.
 
 ## Success Criteria
-- [ ] Every pull request and every push to `main` runs install, typecheck, unit tests and build on a hosted runner, and `engines`, the README and a Node version file state the same Node floor (finding 7).
+- [x] Every pull request and every push to `main` runs install, typecheck, unit tests and build on a hosted runner, and `engines`, the README and a Node version file state the same Node floor (finding 7).
 - [ ] After an install fails or is interrupted, the project's sandbox is off the network, its record says so, and the record does not stay `installing`; shutdown cannot hang; `disconnectMcp` does not store an emptied record when the sandbox is gone; the install failure branches have unit tests (finding 4).
 - [ ] A test fails if a variable's value appears in the command line of a proxied launch or if the env file is not private, and env files left by a crash are removed at startup (finding 5).
 - [ ] A registry file written by a newer version is refused with a clear message and never rewritten (finding 6a).
