@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { ProjectRecord } from "./types.js";
@@ -22,6 +23,8 @@ interface RegistryFile {
   version: typeof REGISTRY_VERSION;
   projects: Record<string, ProjectRecord>;
 }
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
  * JSON-file registry of installed projects. Several server processes (one per
@@ -56,10 +59,17 @@ export class Registry {
     let version: unknown;
     try {
       parsed = JSON.parse(fs.readFileSync(this.file, "utf8")) as RegistryFile;
-      version = (parsed as { version?: unknown }).version;
     } catch (e) {
       throw new Error(`Registry file ${this.file} is unreadable: ${(e as Error).message}`);
     }
+    // Valid JSON of the wrong shape would otherwise load as an empty registry and be overwritten by the next write.
+    if (!isPlainObject(parsed)) {
+      throw new Error(`Registry file ${this.file} is unreadable: not a registry: expected an object`);
+    }
+    if (parsed.projects !== undefined && !isPlainObject(parsed.projects)) {
+      throw new Error(`Registry file ${this.file} is unreadable: not a registry: expected "projects" to be an object`);
+    }
+    version = (parsed as { version?: unknown }).version;
     // Checked before anything is assigned, and every write refreshes first, so a
     // file from a newer build is neither loaded nor rewritten by this one.
     if (version !== undefined && version !== REGISTRY_VERSION) {
@@ -79,14 +89,32 @@ export class Registry {
     return true;
   }
 
-  /** Cross-process mutex: an exclusively created lock file, stolen if stale. */
+  /**
+   * Cross-process mutex: an exclusively created lock file, stolen if stale. The
+   * file holds a token and the release removes it only if the token is still
+   * there. Limits, not fixed here: a lock can be taken from a live writer after
+   * 5 seconds, so holding it is not proof of exclusion; and between the
+   * release's read and its removal another holder could appear.
+   */
   private lock(): () => void {
     const lockFile = `${this.file}.lock`;
     const deadline = Date.now() + 5000;
     for (;;) {
       try {
-        fs.closeSync(fs.openSync(lockFile, "wx", 0o600));
-        return () => fs.rmSync(lockFile, { force: true });
+        const fd = fs.openSync(lockFile, "wx", 0o600);
+        const token = `${process.pid}:${crypto.randomBytes(16).toString("hex")}`;
+        try {
+          fs.writeSync(fd, token);
+        } finally {
+          fs.closeSync(fd);
+        }
+        return () => {
+          try {
+            if (fs.readFileSync(lockFile, "utf8") === token) fs.rmSync(lockFile, { force: true });
+          } catch {
+            // gone already: nothing of ours to remove
+          }
+        };
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
       }
