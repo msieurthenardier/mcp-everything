@@ -177,7 +177,7 @@ One leg, no HAT leg: the change is a few lines of shell and the behavior is full
 
 ### Completion Checklist
 - [x] All legs completed
-- [ ] Code merged
+- [x] Code merged
 - [x] Tests passing
 - [x] Documentation updated
 

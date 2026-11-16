@@ -198,7 +198,7 @@ One implementation leg by design: the retry is harmless alone but only needed on
 
 ### Completion Checklist
 - [x] All legs completed
-- [ ] Code merged
+- [x] Code merged
 - [x] Tests passing
 - [x] Documentation updated
 
