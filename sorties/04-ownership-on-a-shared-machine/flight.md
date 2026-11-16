@@ -55,6 +55,15 @@ Collected at logging, for the planning conversation. None is settled.
 - [ ] **Containers with no record**, and records with no container: who cleans them up, and on what evidence?
 - [ ] **Structure.** The sortie 03 debrief said the next feature touching launch environment should give it its own collaborator outside `Installer`. Is this that feature?
 
+**Carried from the flight 03 debrief of mission 01** (inputs for the planning conversation, not decisions; see that [debrief](../../missions/01-maintenance/flights/03-local-state-and-secret-handoff-tests/flight-debrief.md))
+- **The registry lock is not a guard as it stands.** A waiter takes it from a live writer after 5 seconds, and a writer's release removes whatever lock file is there, including a later holder's. Anything that checks the registry and then acts (which is what ownership is) rests on it. Fix it or state its limit before designing on it; a migration must not run under it as it is.
+- **The version check defends only builds that have it.** A build from before mission 01's flight 03 loads a newer file as version 1 and rewrites it, dropping what it does not know. So a new field must come with a version bump, and the build that has the check must be everywhere before the build that writes the new format ships.
+- **A process on the old format fails every tool call the moment a new build writes**, silently apart from its log (the watcher swallows the error). With several agentic systems updating at different times, that is the normal case, not the rare one. Reconsider a read-only mode, and consider separating "format version" from "oldest build that may read this".
+- **An install in flight at that moment cannot record its own failure**: its next registry write is refused, and so is the write its cleanup needs. The sandbox stays in Docker, possibly online, with a stale record. The failure path must be able to stop a sandbox without the registry.
+- **The check provides no migration.** Decide who migrates, when, atomically, with what backup, and that it happens once.
+- **Startup work is in four places** (`App`, the proxy module, `Registry`, `Installer`). Ownership will reshape the reconciliation; that is the moment to give startup one owner, as a first leg.
+- **Squawk 0034** (a registry file that is not an object loads as empty) should be completed before this work starts.
+
 ### Design Decisions
 None yet.
 

@@ -3,7 +3,7 @@
 **Flight**: [Local State Hygiene and Secret Hand-Off Tests](flight.md)
 
 ## Summary
-Landed on 2026-11-16. Two legs completed the same day: leftover env files and registry temp files are removed at startup, and a registry written by a newer version is refused and left untouched. The hand-off of values to Docker turned out to be tested already; two small gaps were closed. Unit suite 500 passed (447 before); Docker suite 16 passed.
+Completed on 2026-11-16 (landed and debriefed the same day). Two legs completed the same day: leftover env files and registry temp files are removed at startup, and a registry written by a newer version is refused and left untouched. The hand-off of values to Docker turned out to be tested already; two small gaps were closed. Unit suite 500 passed (447 before); Docker suite 16 passed.
 
 ### Flight Director Notes
 - 2026-11-16: The operator said to start flight 3 on merging pull request #10 (flight 02 and its debrief). Flight set to `in-flight`; branch `flight/03-local-state-and-secret-handoff-tests` cut from `main` at `661db3e`. Committed with this flight, from that merge: mission criterion 2 and flight 02's "Code merged" checked off, and sortie 04 (the design work this mission set aside, logged at the operator's request).
@@ -93,6 +93,30 @@ The assertion `toThrow(expect.not.stringMatching(/unreadable/))` was vacuous: vi
 
 ## Deviations
 
+Filled in at the debrief. During the flight these were recorded only in the Flight Director Notes.
+
+### Finding 5 read against the code, not the spec
+**Planned**: unit tests of the real connector's arguments and file, possibly through a new seam; the "vacuous" assertion replaced or deleted.
+**Actual**: four small additions to tests that already existed; the assertion kept, with a comment.
+**Reason**: the tests the spec said were missing have been in `test/proxy.test.ts` since `7efc782`, and the assertion covers what its test is about.
+**Impact**: a smaller leg. The flight's second checkpoint is met by "stays", which its wording did not foresee.
+
+### Two legs, not three
+**Planned**: env-file sweep with the connector tests; the version check; the registry temp sweep.
+**Actual**: both sweeps and the test gaps in one leg; the version check in the other.
+**Reason**: the two sweeps are one decision made twice, and separate legs would have had the third rework the first's startup wiring.
+
+### The registry sweep takes no lock
+**Planned**: the previous debrief's input, carried into the spec, suggested sweeping while holding the registry lock.
+**Actual**: no lock; age (one hour) is the protection.
+**Reason**: the lock can be taken from a live writer after 5 seconds, so holding it proves nothing, and waiting for it blocks the event loop before the server answers `initialize`.
+
+### A stricter reading of `version`
+**Planned**: refuse a `version` greater than the one this build writes; treat a missing one as 1.
+**Actual**: also refuse, as unreadable, a `version` that is present but is neither 1 nor a larger integer.
+**Reason**: nothing released wrote such a value, and loading a file this build does not understand is the hazard the finding is about.
+**Impact**: a file with `"version": "1"` (a string) loaded before and does not now.
+
 ---
 
 ## Anomalies
@@ -113,3 +137,9 @@ The assertion `toThrow(expect.not.stringMatching(/unreadable/))` was vacuous: vi
   - Squawks 0033 (a connector that throws after writing its env file) and 0034 (a registry file that is not an object loads as empty) are open, with 0026 to 0032.
   - A second `App.start()` leaves the first watcher interval running. Reached by no caller. Noted, not logged as a squawk.
 
+### 2026-11-16 — debrief (Flight Director)
+- Debriefed on the flight branch, before merge, so the debrief joins pull request #13: [flight-debrief.md](flight-debrief.md). Developer and Architect interviews on Sonnet. No human interview: the log had no gap that only the operator could fill.
+- The Developer re-ran both suites at `6438db1`: unit 500 passed, 18 skipped, 1.65 s; Docker 16 passed, 2 skipped, 154.2 s, every case within 0.3 s of flight 02's time.
+- The Developer read every test line the flight added and found three cases that pass for the wrong reason, after two review cycles had not. Put to the operator as a squawk candidate.
+- From the debrief: the Deviations section above was filled in; sortie 04 gained what this flight learned about the registry's lock and its version check.
+- The operator's decisions at the debrief: squawks 0035 (three weak tests) and 0036 (the lock's release) logged as `open`, `routine`; squawk 0034 raised to `grounding` for further work on `src/registry.ts`; the Reviewer prompt in the crew file gains a paragraph asking which source change makes each new test fail; flight set to `completed`; all of it committed to this branch so it is part of pull request #13.
