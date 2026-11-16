@@ -6,7 +6,7 @@ import type { Config } from "./config.js";
 import { parseRepoRef, validateGitRef } from "./forge/repo-ref.js";
 import { searchProjects } from "./forge/search.js";
 import { Installer } from "./install/installer.js";
-import { McpProxy, validateEnv } from "./proxy/mcp-proxy.js";
+import { McpProxy, sweepEnvFiles, validateEnv } from "./proxy/mcp-proxy.js";
 import { Registry } from "./registry.js";
 import { VERSION } from "./version.js";
 import { Docker, REPO_DIR, WORK_DIR, type ExecResult } from "./sandbox/docker.js";
@@ -353,8 +353,8 @@ export class App {
   private readonly log: (line: string) => void;
   private readonly jobs = new Map<string, Job>();
   private watcher?: NodeJS.Timeout;
-  /** The startup reconciliation of stale installs; never rejects. */
-  reconciling?: Promise<void>;
+  /** Resolves when all startup work is finished (sweeps, then reconciliation of stale installs); never rejects. */
+  startup?: Promise<void>;
 
   constructor(opts: AppOptions) {
     this.cfg = opts.cfg;
@@ -396,13 +396,21 @@ export class App {
     } catch (e) {
       this.log(`registry: ${(e as Error).message}`);
     }
-    // Not awaited and not waited for at shutdown: it may take a minute when
-    // Docker is slow. Only startup reconciles; a record another process is
-    // still installing is not stale.
-    this.reconciling ??= this.installer
-      .reconcileStale(Date.now(), this.log)
-      .then(() => {})
-      .catch((e) => this.log(`reconcile: ${(e as Error).message}`));
+    // Once per App. The sweeps are a few synchronous file operations with no
+    // lock and no Docker call, so they finish before start() returns; the
+    // reconciliation is not awaited and not waited for at shutdown: it may take
+    // a minute when Docker is slow. Only startup reconciles; a record another
+    // process is still installing is not stale.
+    if (!this.startup) {
+      this.sweep("env file", () => sweepEnvFiles(this.cfg, Date.now(), this.log));
+      this.sweep("registry temp file", () => this.registry.sweepTemps(Date.now(), this.log));
+      this.startup = this.installer
+        .reconcileStale(Date.now(), this.log)
+        .then(() => {})
+        .catch((e) => {
+          this.log(`reconcile: ${(e as Error).message}`);
+        });
+    }
     this.watcher = setInterval(() => {
       try {
         if (this.registry.refresh()) void this.server.sendToolListChanged().catch(() => {});
@@ -411,6 +419,15 @@ export class App {
       }
     }, 5000);
     this.watcher.unref();
+  }
+
+  private sweep(kind: string, run: () => number): void {
+    try {
+      const n = run();
+      if (n > 0) this.log(`startup: removed ${n} leftover ${kind}${n === 1 ? "" : "s"}`);
+    } catch (e) {
+      this.log(`startup: ${kind} sweep failed: ${(e as Error).message}`);
+    }
   }
 
   stop(): void {

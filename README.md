@@ -361,7 +361,9 @@ What it does not do:
   the registry file (`registry.json`, readable only by you) so the server can
   be restarted. `disconnect_mcp_server` or `uninstall_project` removes them.
   Values from `<slug>__<NAME>` variables are never stored. Both kinds are
-  handed to Docker through a private temporary file, not the command line, and
+  handed to Docker through a private temporary file, not the command line (a
+  file left there by a crash is removed at a later start, once it is more than
+  an hour old), and
   mcp-everything itself never writes a value into a tool result, an error
   message or its diagnostics log; `project_info` shows names only. That
   promise covers what mcp-everything writes, not what a server prints (see the
@@ -413,7 +415,7 @@ Environment variables, all optional:
 | `GITHUB_TOKEN` / `GH_TOKEN` | none | GitHub API token (search rate limit: 10/min anonymous). |
 | `GITLAB_TOKEN` | none | GitLab API token. |
 | `MCPE_EXTRA_HOSTS` | none | More forges to allow, e.g. `gitlab.gnome.org=gitlab,git.example.com=gitlab`. |
-| `MCPE_DATA_DIR` | `$XDG_DATA_HOME/mcp-everything`, else `~/.local/share/mcp-everything` | Where the project registry is stored. The default follows `XDG_DATA_HOME` when it is set. |
+| `MCPE_DATA_DIR` | `$XDG_DATA_HOME/mcp-everything`, else `~/.local/share/mcp-everything` | Where the project registry is stored. The default follows `XDG_DATA_HOME` when it is set. A registry written by a newer version of mcp-everything is refused and left untouched; upgrade, or move `registry.json` aside to start with an empty registry (the sandboxes of the projects in it stay in Docker). |
 | `MCPE_DOCKER_BIN` | `docker` | The Docker client command, run on the host. |
 | `MCPE_MEMORY` / `MCPE_CPUS` / `MCPE_PIDS_LIMIT` | `4g` / `2` / `1024` | Per-sandbox limits; a zero memory or CPU value (which Docker reads as unlimited) falls back to the default. |
 | `MCPE_DOCKER_RUNTIME` | Docker's default | Container runtime, e.g. `runsc`. |

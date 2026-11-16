@@ -1,6 +1,6 @@
 # Flight: Local State Hygiene and Secret Hand-Off Tests
 
-**Status**: ready
+**Status**: in-flight
 **Mission**: [Maintenance](../../mission.md)
 
 ## Contributing to Criteria
@@ -39,7 +39,7 @@ N/A — maintenance flight. The one small design call is stated under Design Dec
 - Raise the hosted check's test floor in the last leg (it is 430 against 447).
 
 ### Prerequisites
-- [ ] Flight 01 landed, so this work is checked on its pull request (preferred, not required).
+- [x] Flight 01 landed, so this work is checked on its pull request (preferred, not required).
 
 ### Pre-Flight Checklist
 - N/A — maintenance flights skip Pre-Flight.
@@ -68,10 +68,10 @@ One finding maps to one leg. Evidence is from the maintenance report (Categories
 Out of scope here: emptying the registry on a stat error (squawk 0017), quarantining a corrupt registry (finding 6c, carried), fsync, and the lock's steal timing.
 
 ### Checkpoints
-- [ ] A unit test fails when a value is put into the connector's argv, and passes as the code stands.
-- [ ] The vacuous assertion is gone or made real, and the flight log says which.
-- [ ] A registry file marked with a later version is refused and is byte-identical afterwards.
-- [ ] Old env and registry temp files are removed at startup; fresh ones are left.
+- [x] A unit test fails when a value is put into the connector's argv, and passes as the code stands.
+- [x] The vacuous assertion is gone or made real, and the flight log says which.
+- [x] A registry file marked with a later version is refused and is byte-identical afterwards.
+- [x] Old env and registry temp files are removed at startup; fresh ones are left.
 
 ### Adaptation Criteria
 
@@ -89,19 +89,18 @@ Out of scope here: emptying the registry on a stat error (squawk 0017), quaranti
 
 > **Note:** These are tentative suggestions, not commitments. Legs are planned and created one at a time as the flight progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] `connector-secret-tests-and-sweep` - Unit tests of the real connector's argv and file; the vacuous assertion dealt with; startup sweep of leftover env files (finding 5)
-- [ ] `registry-version-check` - Refuse a registry from a newer version (finding 6a)
-- [ ] `registry-temp-sweep` - Remove stale registry temp files at startup (finding 6d)
+- [x] `handoff-tests-and-startup-sweeps` - The gaps in the connector's tests closed; leftover env files and registry temp files removed at startup; one awaitable for startup work (findings 5 and 6d)
+- [x] `registry-version-check` - Refuse a registry from a newer version; the hosted check's test floor raised (finding 6a)
 
 ---
 
 ## Post-Flight
 
 ### Completion Checklist
-- [ ] All legs completed
+- [x] All legs completed
 - [ ] Code merged
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Tests passing
+- [x] Documentation updated
 
 ### Verification
 `npm test` and `npm run typecheck` pass with the new cases. To show the connector test is not vacuous in its turn: temporarily put a value into the connector's argument list, watch the new test fail, and revert; record that in the flight log. A registry file hand-edited to a later `version` makes `list_projects` report the refusal and leaves the file unchanged. `npm run test:docker` passes; its secret-gated case is unaffected. The README's data-directory section gains a sentence only if the refusal or the sweep is something an operator would meet. The hosted check added by flight 01 does not run the Docker suite and will be green without it: run `npm run test:docker` locally before the pull request is marked ready, and record the result in the flight log. In the leg that adds tests, raise the minimum passed-test count in `.github/workflows/ci.yml` to stay close under the new total.
