@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # This runs `prepare`, so it is also the clean-clone build that an
+      # `npx` install from GitHub performs.
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest.json"
+
+      # 396 tests pass as of 2026-11-16. Vitest already fails when no test file
+      # matches, so this catches a suite that was mostly skipped or excluded.
+      # Raise the floor as the suite grows.
+      - name: Minimum passed tests
+        run: |
+          node -e '
+            const fs = require("fs");
+            const floor = 350;
+            let n;
+            try {
+              n = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/vitest.json", "utf8")).numPassedTests;
+            } catch (e) {
+              console.error("cannot read vitest JSON report: " + e.message);
+              process.exit(1);
+            }
+            if (!(n >= floor)) {
+              console.error("only " + n + " tests passed, floor is " + floor);
+              process.exit(1);
+            }
+            console.log(n + " tests passed (floor " + floor + ")");
+          '
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack check
+        run: |
+          npm pack --dry-run --ignore-scripts --json > "$RUNNER_TEMP/pack.json"
+          node -e '
+            const fs = require("fs");
+            const pack = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"));
+            if (!pack[0].files.some((f) => f.path === "dist/index.js")) {
+              console.error("dist/index.js is not in the packed files");
+              process.exit(1);
+            }
+            console.log("dist/index.js is packed");
+          '
