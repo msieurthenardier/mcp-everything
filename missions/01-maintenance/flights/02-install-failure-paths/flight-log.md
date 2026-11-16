@@ -3,7 +3,7 @@
 **Flight**: [Install Failure and Interruption Paths](flight.md)
 
 ## Summary
-In flight since 2026-11-16. Four legs completed the same day, with no deviation that changed a leg: failed installs end off the network, stale `installing` records are reconciled at startup, shutdown is bounded, and `disconnectMcp` refuses when the sandbox is gone. Unit suite 447 passed (396 before); Docker suite 16 passed.
+Landed on 2026-11-16. Four legs completed the same day, with no deviation that changed a leg: failed installs end off the network, stale `installing` records are reconciled at startup, shutdown is bounded, and `disconnectMcp` refuses when the sandbox is gone. Unit suite 447 passed (396 before); Docker suite 16 passed.
 
 ### Flight Director Notes
 - 2026-11-16: The operator said to start flight 2 after pull request #9 (the flight 01 debrief) merged. Flight set to `in-flight`; branch `flight/02-install-failure-paths` cut from `main` at `7257c17`.
@@ -130,3 +130,17 @@ In flight since 2026-11-16. Four legs completed the same day, with no deviation 
 ---
 
 ## Session Notes
+
+### 2026-11-16 — commit, hosted runs and landing (Flight Director)
+- Commit `c0828bf` (`flight/02: failed and interrupted installs end offline; bounded shutdown`), made by a Developer from an exact file list after the review confirmed, together with the two wording fixes noted above. Branch pushed; draft pull request #10 opened.
+- **Green**: run 43923117497 on pull request #10, every step passed. From its log: 18 test files passed, 1 skipped; "447 tests passed (floor 430)"; "dist/index.js is packed". The hosted check does not run the Docker suite; that ran locally in the review (16 passed).
+- **The two steps of the check never seen red on the runner** (flight 01 debrief, recommendation 2), shown with throwaway pull requests against this flight's branch, each closed without merging, branches deleted locally and on the remote:
+  - Typecheck: pull request #11, run 43923322308, failed in about 11 s. Install passed, Typecheck failed (`test/ci-red-typecheck.test.ts(2,7): error TS2322`), every later step skipped. A type error in a test file is caught by Typecheck and by nothing before it.
+  - Unit tests: pull request #12, run 43923448811, failed in about 16 s. Install and Typecheck passed, Unit tests failed (`FAIL test/ci-red-unit.test.ts > fails on purpose`), the count step and later steps skipped.
+  - Still shown only locally: the Minimum passed tests step failing on a suite that mostly skips.
+- Documentation: the README gained one sentence on the network after a failed install and one bullet on the startup reconciliation; the `install_project` description and its `network` property say the same. `CLAUDE.md` describes Flight Control only and needs nothing.
+- Flight set to `landed`; flight 2 checked off in the mission. The mission's second success criterion and this flight's "Code merged" stay open until pull request #10 merges.
+- For the operator, from this flight:
+  - **A registry record carries no owner.** The startup reconciliation therefore goes by age (seven hours by default) and waits for the next start when Docker is not reachable. A process id and host in the record would let a start reconcile an interrupted install at once; it is a registry schema change, which the flight reserved for the operator. Not proposed as work here, only recorded.
+  - Three existing behaviors seen in leg 1 and left alone, none logged as a squawk yet: a first-attempt `createContainer` that fails after Docker created the container can leave a container with no record; on a second attempt a removed container followed by a failed create leaves a kept record whose advice says "The sandbox was kept"; a throw from discovery leaves proxied sessions open until the next reinstall or uninstall.
+
