@@ -1,6 +1,6 @@
 {
   "name": "mcp-everything",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "An MCP server that turns any open source project on GitHub or GitLab into a sandboxed, dynamically generated toolset.",
   "type": "module",
   "license": "MIT",
