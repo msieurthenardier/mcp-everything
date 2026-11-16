@@ -44,7 +44,7 @@ export interface Connection {
 /** Creates the transport to an upstream server. Replaceable for tests. */
 export type Connector = (launch: Launch) => Connection;
 
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,100}$/;
+export const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,100}$/;
 
 /** Validate a server environment: names are identifiers, values single-line. */
 export function validateEnv(env: Record<string, unknown>): Record<string, string> {
@@ -142,7 +142,7 @@ export class McpProxy {
   ): Promise<{ ok: true; client: Client; launch: Launch; conn: Connection } | { ok: false; message: (afterRestart?: boolean) => string }> {
     const launch: Launch = { container, server, pidFile: `/tmp/mcpe-mcp-${randomBytes(6).toString("hex")}.pid` };
     const conn = this.connector(launch);
-    const client = new Client({ name: "mcp-everything", version: "0.2.0" }, { capabilities: {} });
+    const client = new Client({ name: "mcp-everything", version: "0.3.0" }, { capabilities: {} });
     try {
       await client.connect(conn.transport, { timeout: startupSec * 1000 });
       return { ok: true, client, launch, conn };

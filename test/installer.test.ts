@@ -1,12 +1,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadConfig, type Config } from "../src/config.js";
 import { parseRepoRef } from "../src/forge/repo-ref.js";
 import { Installer } from "../src/install/installer.js";
 import { McpProxy } from "../src/proxy/mcp-proxy.js";
+import type { Connector, Launch } from "../src/proxy/mcp-proxy.js";
 import { Registry } from "../src/registry.js";
+import { App } from "../src/server.js";
 import type { ExecOptions, ExecResult, ProbeData } from "../src/sandbox/docker.js";
 import { FakeDocker, fakeUpstream, type FakeUpstream } from "./helpers.js";
 
@@ -301,5 +304,191 @@ describe("publication at install time", () => {
     const again = await install({ reinstall: true });
     expect(again.selection).toEqual({ include: ["add", "whoami"], exclude: [] });
     expect(again.published).toEqual(["widget__add", "widget__whoami"]);
+  });
+});
+
+describe("host environment variables", () => {
+  const VALUE = "hv-7Qz3kLx9Vb2NmR8tYw4Pa6Ud1Fs0Jc5";
+  const withEnv = (env: Record<string, string | undefined>): void => {
+    installer = new Installer(cfg, docker, registry, new McpProxy(cfg, docker, up.connector), undefined, env);
+  };
+
+  it("candidates: every launch of an install with detection carries the variable, and the record stores none", async () => {
+    docker.repoFiles = { "package.json": pkg({}) };
+    docker.sdkBins = ["tool"];
+    up.answer = true;
+    up.answerIf = (launch) => launch.server.argv.join(" ") === "tool";
+    withEnv({ widget__API_KEY: VALUE, other__API_KEY: "nope" });
+    const record = await install();
+    expect(up.launches.length).toBeGreaterThan(0);
+    for (const l of up.launches) expect(l.server.env).toEqual({ API_KEY: VALUE });
+    expect(record.mcpServers).toEqual([{ name: "tool", argv: ["tool"], cwd: "/workspace/repo", env: {}, origin: "detected" }]);
+    expect(fs.readFileSync(path.join(dir, "registry.json"), "utf8")).not.toContain(VALUE);
+  });
+
+  it("candidates: an unusable value fails the candidate with the message and the install still finishes ready", async () => {
+    docker.repoFiles = { "package.json": pkg({}) };
+    docker.sdkBins = ["tool"];
+    up.answer = true;
+    withEnv({ widget__API_KEY: "a\nb-SECRET-3" });
+    const record = await install();
+    expect(record.status).toBe("ready");
+    expect(up.launches).toEqual([]);
+    const warning = record.warnings.find((w) => w.startsWith("MCP:"))!;
+    expect(warning).toContain("Environment variable widget__API_KEY contains a line break");
+    expect(warning).not.toContain("SECRET-3");
+  });
+
+  describe("launchSpec", () => {
+    const stored = { name: "s", argv: ["s"], cwd: "/workspace/repo", env: { A: "1", B: "stored" }, origin: "registered" as const };
+    const project = (slug: string) => ({ ...record(slug), mcpServers: [stored] });
+    function record(slug: string) {
+      return {
+        slug,
+        repo: { forge: "github" as const, host: "github.com", path: `o/${slug}`, cloneUrl: "", id: `github:o/${slug}`, name: slug },
+        image: "", container: `mcpe-${slug}`, volume: `mcpe-${slug}`, ecosystems: [], primary: "generic" as const, network: false,
+        status: "ready" as const, warnings: [], commands: [], tools: [],
+        meta: { npmScripts: [], makeTargets: [], pythonModules: [], nodePackages: [], hasPythonEnv: false, hasNode: false },
+        installedAt: "2026-01-01T00:00:00.000Z",
+      };
+    }
+
+    it("overlays the project's variables on the stored environment, the host winning, and mutates nothing", () => {
+      withEnv({ p__B: "host", p__C: "3" });
+      const spec = installer.launchSpec(project("p"), stored);
+      expect(spec).toEqual({ ...stored, env: { A: "1", B: "host", C: "3" } });
+      expect(spec).not.toBe(stored);
+      expect(stored.env).toEqual({ A: "1", B: "stored" });
+    });
+
+    it("returns the stored environment unchanged when no variable matches", () => {
+      withEnv({ q__B: "host" });
+      expect(installer.launchSpec(project("p"), stored).env).toEqual({ A: "1", B: "stored" });
+    });
+
+    it("gives a project that is not in the registry its variables", () => {
+      withEnv({ p__C: "3" });
+      expect(registry.get("p")).toBeUndefined();
+      expect(installer.launchSpec(project("p"), stored).env).toEqual({ A: "1", B: "stored", C: "3" });
+    });
+
+    it("decides ownership against every record in the registry, whatever its status, in either order", () => {
+      registry.put({ ...record("a"), status: "failed" });
+      registry.put({ ...record("a__b"), status: "installing" });
+      withEnv({ a__b__KEY: VALUE });
+      expect(installer.launchSpec(project("a__b"), stored).env).toEqual({ A: "1", B: "stored", KEY: VALUE });
+      expect(installer.launchSpec(project("a"), stored).env).toEqual({ A: "1", B: "stored" });
+      expect(installer.hostVariableNames(project("a"))).toEqual([]);
+      expect(installer.hostVariableNames(project("a__b"))).toEqual(["KEY"]);
+    });
+
+    it("throws a plain Error without the value for an unusable value", () => {
+      withEnv({ p__B: "x\ry-SECRET-4" });
+      expect(() => installer.launchSpec(project("p"), stored)).toThrow(/^Environment variable p__B contains a line break/);
+      expect(() => installer.launchSpec(project("p"), stored)).not.toThrow(/SECRET-4/);
+      expect(installer.hostVariableNames(project("p"))).toEqual(["B"]);
+    });
+  });
+});
+
+describe("refresh_mcp on a scripted sandbox", () => {
+  const VALUE = "hv-4Mk8Rt2Qz7Wn1Xb6Yc3Ld9Pa5Hs0Ve2";
+  const apps: App[] = [];
+  const lines: string[] = [];
+  /** A launch that fails at once, as a server that exits at start-up does. */
+  const dead = (): ReturnType<Connector> => {
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    void serverSide.close();
+    return { transport: clientSide, stderr: () => "" };
+  };
+  /** Launches the predicate accepts reach the fake upstream; the others fail at once. */
+  const gated = (answers: (launch: Launch) => boolean): Connector => (launch) => {
+    if (answers(launch)) return up.connector(launch);
+    up.launches.push(launch);
+    return dead();
+  };
+  const hasKey = (launch: Launch) => launch.server.env.API_KEY === VALUE;
+  /** An App on the shared data directory: another one with other `env` stands in for a reconnect. */
+  const appWith = (env: Record<string, string | undefined>, connector: Connector): App => {
+    const a = new App({ cfg, docker, proxy: new McpProxy(cfg, docker, connector), env, log: (l) => lines.push(l) });
+    apps.push(a);
+    return a;
+  };
+  const installWith = (a: App) => a.installer.install({ repo: parseRepoRef("acme/widget", cfg.hosts) });
+  const text = (res: Awaited<ReturnType<App["callTool"]>>) => (res.content[0] as { text: string }).text;
+
+  beforeEach(() => {
+    lines.length = 0;
+    docker.repoFiles = { "package.json": pkg({}) };
+    up.answer = true;
+  });
+  afterEach(async () => {
+    for (const a of apps.splice(0)) await a.shutdown();
+  });
+
+  it("a candidate that answers only with a variable: found by a refresh once the variable is there", async () => {
+    docker.sdkBins = ["tool"];
+    const without = appWith({}, gated(hasKey));
+    const installed = await installWith(without);
+    expect(installed.status).toBe("ready");
+    expect(installed.mcpServers).toEqual([]);
+    expect(installed.tools.filter((t) => t.kind === "mcp")).toEqual([]);
+    const warning = installed.warnings.find((w) => w.startsWith("MCP:"))!;
+    expect(warning).toContain("none of these completed an MCP handshake: `tool`");
+    expect(warning).toContain("set widget__NAME in the environment of mcp-everything, reconnect it, and call refresh_mcp");
+    expect(warning).toContain("connect_mcp_server");
+
+    up.launches.length = 0;
+    const withKey = appWith({ widget__API_KEY: VALUE }, gated(hasKey));
+    const res = await withKey.callTool("refresh_mcp", { project: "widget" });
+    expect(res.isError).toBe(false);
+    expect(up.launches.length).toBeGreaterThan(0);
+    for (const l of up.launches) expect(l.server.env.API_KEY).toBe(VALUE);
+    const p = withKey.registry.get("widget")!;
+    expect(p.mcpServers).toEqual([{ name: "tool", argv: ["tool"], cwd: "/workspace/repo", env: {}, origin: "detected" }]);
+    expect(p.tools.filter((t) => t.kind === "mcp").length).toBeGreaterThan(0);
+    expect(withKey.listTools().map((t) => t.name)).toContain("widget__add");
+    expect(text(res)).toContain("API_KEY");
+    expect(text(res)).not.toContain(VALUE);
+    expect(fs.readFileSync(path.join(dir, "registry.json"), "utf8")).not.toContain(VALUE);
+    for (const l of lines) expect(l).not.toContain(VALUE);
+  });
+
+  it("the reverse: a server that needs the variable is gone after a refresh without it, and that is an error", async () => {
+    docker.sdkBins = ["tool", "multi"];
+    const answers = (l: Launch) => l.server.argv[0] === "multi" || hasKey(l);
+    const withKey = appWith({ widget__API_KEY: VALUE }, gated(answers));
+    const installed = await installWith(withKey);
+    expect(installed.mcpServers!.map((s) => s.name).sort()).toEqual(["multi", "tool"]);
+
+    const without = appWith({}, gated(answers));
+    const res = await without.callTool("refresh_mcp", { project: "widget" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toContain('Recorded before and gone now: "tool".');
+    expect(text(res)).not.toContain("Did not start");
+    expect(without.registry.get("widget")!.mcpServers!.map((s) => s.name)).toEqual(["multi"]);
+    expect(text(res).split("\n")[0]).toMatch(/^Refreshed widget: 1 MCP server\(s\) recorded, 0 with no tool in the catalog, [1-9]\d* proxied tool\(s\) in the catalog\.$/);
+  });
+
+  it("a candidate that did not answer is listed and is not an error while another server publishes tools", async () => {
+    docker.sdkBins = ["tool", "multi"];
+    const a = appWith({}, gated((l) => l.server.argv[0] === "multi"));
+    const installed = await installWith(a);
+    expect(installed.mcpServers!.map((s) => s.name)).toEqual(["multi"]);
+    const res = await a.callTool("refresh_mcp", { project: "widget" });
+    expect(res.isError).toBe(false);
+    expect(text(res)).toContain("Candidates that did not answer: `tool`");
+    expect(text(res)).not.toContain("Did not start");
+    expect(text(res)).not.toContain("gone");
+  });
+
+  it("the candidates' warning gets no route hint when the reason is an unusable value", async () => {
+    docker.sdkBins = ["tool"];
+    const a = appWith({ widget__API_KEY: "a\nb-SECRET-5" }, gated(() => true));
+    const installed = await installWith(a);
+    const warning = installed.warnings.find((w) => w.startsWith("MCP:"))!;
+    expect(warning).toContain("Environment variable widget__API_KEY contains a line break");
+    expect(warning).not.toContain("refresh_mcp");
+    expect(warning).not.toContain("SECRET-5");
   });
 });

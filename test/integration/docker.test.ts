@@ -44,6 +44,30 @@ while IFS= read -r line; do
 done
 `;
 
+/**
+ * A shell MCP server that starts only when MCPE_IT_GATE_Q7X2 is set (to
+ * anything, an empty value included), and reports the value. It exits at once
+ * when given an argument, so that help probing costs nothing, and at once
+ * without the variable. Its own constant: the shell server above is shared by
+ * other cases.
+ */
+const GATED_MCP_SERVER = String.raw`#!/bin/sh
+[ "$#" -eq 0 ] || exit 2
+printenv MCPE_IT_GATE_Q7X2 >/dev/null || exit 1
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      ver=$(printf '%s' "$line" | sed -n 's/.*"protocolVersion":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"gated","version":"1"}}}\n' "$id" "$ver";;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"reveal","description":"Report the gate variable","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id";;
+    *'"name":"reveal"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"gate=%s"}]}}\n' "$id" "$MCPE_IT_GATE_Q7X2";;
+  esac
+done
+`;
+
 describe.skipIf(!enabled)("docker integration", () => {
   let dir: string;
   let app: App;
@@ -136,6 +160,89 @@ describe.skipIf(!enabled)("docker integration", () => {
     await app.callTool("disconnect_mcp_server", { project: "gron", name: "shmcp" });
     expect((await ps()).stdout.trim()).toBe("");
     expect(app.registry.get("gron")!.tools.map((t) => t.name)).toEqual(["gron__gron"]);
+  }, 120_000);
+
+  it("gives a proxied MCP server the host environment's value, which is never stored or run elsewhere", async () => {
+    // Neither value is a substring of the other.
+    const HOST_VALUE = "from-the-host-Qz3kLx9Vb2N";
+    const STORED_VALUE = "stored-in-registry-Pa6Ud1Fs0";
+    const second = new App({
+      cfg: loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: prefix, MCPE_TOOL_TIMEOUT: "5" }),
+      env: { gron__GREETING: HOST_VALUE },
+    });
+    try {
+      // Written again here; this case does not rely on the previous one having left it.
+      await second.callTool("sandbox_write_file", { project: "gron", path: "sh-mcp.sh", content: SH_MCP_SERVER });
+      const connected = await second.callTool("connect_mcp_server", {
+        project: "gron",
+        name: "shenv",
+        command: ["sh", "/workspace/work/sh-mcp.sh", "argtwo"],
+        env: { GREETING: STORED_VALUE },
+        cwd: "/workspace/work",
+      });
+      expect(connected.isError).toBe(false);
+      expect(text(connected)).not.toContain(HOST_VALUE);
+
+      const where = await second.callTool("gron__whereami", {});
+      expect(text(where)).toBe(`host=sandbox cwd=/workspace/work greeting=${HOST_VALUE} arg=argtwo`);
+
+      const registryFile = fs.readFileSync(path.join(dir, "registry.json"), "utf8");
+      expect(registryFile).not.toContain(HOST_VALUE);
+      expect(registryFile).toContain(STORED_VALUE); // presence: what was stored is still there
+      expect(fs.readdirSync(path.join(dir, "tmp"))).toEqual([]);
+
+      const printed = await second.callTool("sandbox_exec", { project: "gron", command: "env" });
+      expect(text(printed)).toContain("PATH="); // presence: the environment was printed
+      expect(text(printed)).not.toContain(HOST_VALUE);
+    } finally {
+      await second.callTool("disconnect_mcp_server", { project: "gron", name: "shenv" }).catch(() => {});
+      await second.shutdown();
+    }
+  }, 120_000);
+
+  it("refresh_mcp finds a server that needs a variable once the variable is set, and the script's command line tool goes", async () => {
+    const GATE_VALUE = "gate-value-Wk2Tn6Bx1Lr4Gd8";
+    const GATE_FILE = "/opt/mcpe/bin/gated";
+    const MANIFEST = "/workspace/repo/.mcp.json";
+    const names = (a: App) => a.registry.get("gron")!.tools.map((t) => t.name).sort();
+    const second = new App({
+      cfg: loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: prefix, MCPE_TOOL_TIMEOUT: "5" }),
+      env: { gron__MCPE_IT_GATE_Q7X2: GATE_VALUE },
+    });
+    let failed = true;
+    try {
+      await app.callTool("sandbox_write_file", { project: "gron", path: GATE_FILE, content: GATED_MCP_SERVER });
+      await app.callTool("sandbox_write_file", { project: "gron", path: MANIFEST, content: JSON.stringify({ mcpServers: { gated: { command: "gated" } } }) });
+      const placed = await app.callTool("sandbox_exec", { project: "gron", command: `chmod +x ${GATE_FILE}` });
+      expect(placed.isError).toBe(false);
+
+      // Without the variable: no MCP server, a warning that names the route, and a command line tool for the script.
+      const before = await app.callTool("discover_tools", { project: "gron" });
+      expect(before.isError).toBe(false);
+      const gron = app.registry.get("gron")!;
+      expect(gron.mcpServers).toEqual([]);
+      expect(gron.warnings.find((w) => w.startsWith("MCP:"))).toContain("set gron__NAME in the environment of mcp-everything, reconnect it, and call refresh_mcp");
+      expect(names(app)).toEqual(["gron__gated", "gron__gron"]);
+
+      // Through an App that has the variable.
+      const started = Date.now();
+      const refreshed = await second.callTool("refresh_mcp", { project: "gron" });
+      console.log(`refresh_mcp (gron, one detected shell server): ${Date.now() - started} ms`);
+      expect(refreshed.isError).toBe(false);
+      expect(text(refreshed)).toContain("Variables applied (names only): MCPE_IT_GATE_Q7X2.");
+      expect(text(refreshed)).not.toContain(GATE_VALUE);
+      expect(names(second)).toEqual(["gron__gron", "gron__reveal"]);
+      expect(second.registry.get("gron")!.mcpServers!.map((s) => [s.name, s.origin, s.env])).toEqual([["gated", "detected", {}]]);
+      expect(text(await second.callTool("gron__reveal", {}))).toBe(`gate=${GATE_VALUE}`);
+      expect(fs.readFileSync(path.join(dir, "registry.json"), "utf8")).not.toContain(GATE_VALUE);
+      failed = false;
+    } finally {
+      // Its server session ends before its files go; then the catalog is rebuilt without them.
+      await second.shutdown();
+      await app.callTool("sandbox_exec", { project: "gron", command: `rm -f ${GATE_FILE} ${MANIFEST}` }).catch(() => {});
+      await app.callTool("discover_tools", { project: "gron" }).catch(() => {});
+      if (!failed) expect(names(app)).toEqual(["gron__gron"]);
+    }
   }, 120_000);
 
   it("uninstall removes the container and the volume", async () => {

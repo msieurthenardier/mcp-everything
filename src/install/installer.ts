@@ -1,4 +1,5 @@
 import type { Config } from "../config.js";
+import { hostVariableNames, isUnusableValueError, launchVariables } from "../proxy/host-env.js";
 import type { McpProxy, UpstreamTool } from "../proxy/mcp-proxy.js";
 import type { Registry } from "../registry.js";
 import { BIN_DIR, Docker, REPO_DIR, VENV_DIR, WORK_DIR, WORKSPACE, type ExecResult } from "../sandbox/docker.js";
@@ -81,6 +82,30 @@ interface McpDiscovery {
   lists: Array<{ server: string; tools: UpstreamTool[] }>;
   /** Commands that are MCP servers when run without arguments: no CLI to crawl. */
   bare: Set<string>;
+  /** Registered servers whose tool listing failed, with the first line of the error. */
+  failed: Array<{ server: string; reason: string }>;
+  /** Candidate launches that did not answer, and the first reason given. */
+  unanswered: string[];
+  reason: string;
+}
+
+/** What `Installer.refreshMcp` hands back beside the record. */
+export interface RefreshOutcome {
+  record: ProjectRecord;
+  /** Registered servers that did not start, each with the first line of the reason. */
+  failed: Array<{ server: string; reason: string }>;
+  /** Candidate launches that did not answer. */
+  unanswered: string[];
+  /** The reason the first of them gave. */
+  reason: string;
+  /** MCP server names recorded before the call and after it. */
+  before: string[];
+  after: string[];
+}
+
+/** Said where a server did not start and the cause may be a missing variable. */
+function routeHint(slug: string): string {
+  return `If it needs environment variables, set ${slug}__NAME in the environment of mcp-everything, reconnect it, and call refresh_mcp.`;
 }
 
 export class Installer {
@@ -91,7 +116,31 @@ export class Installer {
     private readonly proxy: McpProxy,
     /** Replaceable for tests. */
     private readonly choose: typeof chooseToolchain = chooseToolchain,
+    /** Read at every launch, never copied: `{slug}__{NAME}` variables reach the project's MCP servers as `NAME`. */
+    private readonly env: Record<string, string | undefined> = process.env,
   ) {}
+
+  private slugsWith(project: ProjectRecord): string[] {
+    return [...this.registry.list().map((p) => p.slug), project.slug];
+  }
+
+  /**
+   * The names of the host variables a project receives, for display. Never
+   * throws, whatever the values are.
+   */
+  hostVariableNames(project: ProjectRecord): string[] {
+    return hostVariableNames(project.slug, this.slugsWith(project), this.env);
+  }
+
+  /**
+   * The one place a stored server spec becomes the spec to launch: a copy whose
+   * environment is the stored one overlaid with the project's host variables
+   * (the host wins). The result is passed to the proxy and never stored. Throws
+   * when a value cannot be passed.
+   */
+  launchSpec(project: ProjectRecord, server: McpServerSpec): McpServerSpec {
+    return { ...server, env: { ...server.env, ...launchVariables(project.slug, this.slugsWith(project), this.env) } };
+  }
 
   /** An exec function bound to one project's sandbox. */
   execFor(project: ProjectRecord): SandboxExec {
@@ -276,14 +325,41 @@ export class Installer {
   }
 
   /**
+   * Stop the project's MCP servers and rerun the whole of discovery, so that
+   * servers started with the environment as it is now are the ones listed.
+   * Reports what did not start and what disappeared. Nothing is stopped when a
+   * variable's value is unusable.
+   */
+  async refreshMcp(project: ProjectRecord): Promise<RefreshOutcome> {
+    // Before anything is stopped: an unusable value fails the call and changes nothing.
+    launchVariables(project.slug, this.slugsWith(project), this.env);
+    await this.requireSandbox(project);
+    await this.proxy.closeProject(project.container);
+    const record: ProjectRecord = { ...project, warnings: [...project.warnings] };
+    const before = (project.mcpServers ?? []).map((s) => s.name);
+    const mcp = await this.discover(record, []);
+    this.finish(record);
+    return {
+      record,
+      failed: mcp.failed,
+      unanswered: mcp.unanswered,
+      reason: mcp.reason,
+      before,
+      after: (record.mcpServers ?? []).map((s) => s.name),
+    };
+  }
+
+  /**
    * Register (or replace) an MCP server that runs inside the project's sandbox
    * and publish its tools. Fails with the server's own error if it does not
    * start, leaving the project unchanged.
    */
   async connectMcp(project: ProjectRecord, spec: McpServerSpec): Promise<ProjectRecord> {
     await this.requireSandbox(project);
+    // Before anything is stopped: an unusable value fails the call and changes nothing.
+    const launch = this.launchSpec(project, spec);
     await this.proxy.closeProject(project.container);
-    await this.proxy.listTools(project.container, spec);
+    await this.proxy.listTools(project.container, launch);
     const others = (project.mcpServers ?? []).filter((s) => s.name !== spec.name);
     const record: ProjectRecord = { ...project, mcpServers: [...others, spec], warnings: [...project.warnings] };
     await this.discover(record, []);
@@ -327,7 +403,7 @@ export class Installer {
     record.warnings.push(...notes.map((n) => `${TOOLS_WARNING}${n}`));
   }
 
-  private async discover(record: ProjectRecord, extraCommands: string[]): Promise<void> {
+  private async discover(record: ProjectRecord, extraCommands: string[]): Promise<McpDiscovery> {
     const exec = this.execFor(record);
     const quick = { timeoutSec: 60, cwd: REPO_DIR };
     const commands = new Map<string, CommandSpec>();
@@ -450,6 +526,7 @@ export class Installer {
     this.publish(record);
     // Scratch dir may have been removed by the project; tools default to it.
     await exec(["mkdir", "-p", WORK_DIR], quick).catch(() => null);
+    return mcp;
   }
 
   /**
@@ -517,6 +594,7 @@ export class Installer {
     const servers: McpServerSpec[] = [];
     const lists: McpDiscovery["lists"] = [];
     const bare = new Set<string>();
+    const startFailures: McpDiscovery["failed"] = [];
     // Commands that need no further probing: registered, or already answered.
     const claimed = new Set<string>();
     const brief = (e: unknown) => cleanTerminalText(e instanceof Error ? e.message : String(e)).split("\n")[0]!.slice(0, 240);
@@ -527,9 +605,12 @@ export class Installer {
       claimed.add(ctx.aliasOf.get(server.argv[0]!) ?? server.argv[0]!);
       if (server.argv.length === 1) bare.add(server.argv[0]!);
       try {
-        lists.push({ server: server.name, tools: await this.proxy.listTools(record.container, server) });
+        lists.push({ server: server.name, tools: await this.proxy.listTools(record.container, this.launchSpec(record, server)) });
       } catch (e) {
-        record.warnings.push(`${MCP_WARNING}${brief(e)}`);
+        const text = brief(e);
+        startFailures.push({ server: server.name, reason: text });
+        // The hint goes after the cut; an unusable value already says what to fix.
+        record.warnings.push(`${MCP_WARNING}${text}${isUnusableValueError(e) ? "" : ` ${routeHint(record.slug)}`}`);
       }
     }
 
@@ -557,6 +638,7 @@ export class Installer {
     const tried = new Set<string>();
     const failed: string[] = [];
     let reason = "";
+    let reasonUnusable = false;
     let probes = 0;
     for (const candidate of candidates) {
       const command = candidate.argv[0]!;
@@ -568,24 +650,31 @@ export class Installer {
       if (servers.some((s) => s.name === name)) name = `${name}-${probes}`;
       const spec: McpServerSpec = { name, argv: candidate.argv, cwd: REPO_DIR, env: {}, origin: "detected" };
       try {
-        const tools = await this.proxy.listTools(record.container, spec, MCP_PROBE_SEC);
+        const tools = await this.proxy.listTools(record.container, this.launchSpec(record, spec), MCP_PROBE_SEC);
         servers.push(spec);
         lists.push({ server: spec.name, tools });
         claimed.add(command);
         if (candidate.argv.length === 1) bare.add(command);
       } catch (e) {
         failed.push(candidate.argv.join(" "));
-        reason ||= brief(e);
+        if (!reason) {
+          reason = brief(e);
+          reasonUnusable = isUnusableValueError(e);
+        }
       }
     }
     // Launches that failed for a command which then answered another way are not news.
     const unanswered = failed.filter((f) => !claimed.has(f.split(" ")[0]!));
     if (unanswered.length > 0) {
       record.warnings.push(
-        `${MCP_WARNING}this project looks like an MCP server, but none of these completed an MCP handshake: ${unanswered.map((u) => `\`${u}\``).join(", ")} (${reason}). If it needs other arguments, environment variables or network access, register it with connect_mcp_server.`,
+        `${MCP_WARNING}this project looks like an MCP server, but none of these completed an MCP handshake: ${unanswered.map((u) => `\`${u}\``).join(", ")} (${reason}). ${
+          reasonUnusable
+            ? "If it needs other arguments, environment variables or network access, register it with connect_mcp_server."
+            : `${routeHint(record.slug)} If it needs other arguments or network access, register it with connect_mcp_server.`
+        }`,
       );
     }
-    return { servers, lists, bare };
+    return { servers, lists, bare, failed: startFailures, unanswered, reason };
   }
 
   async uninstall(project: ProjectRecord): Promise<void> {
