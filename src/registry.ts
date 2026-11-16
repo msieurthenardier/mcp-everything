@@ -76,14 +76,18 @@ export class Registry {
       this.mtimeMs = -2; // force a re-read: we must build on the latest state
       this.refresh();
       change(this.projects);
-      const body: RegistryFile = { version: 1, projects: Object.fromEntries(this.projects) };
-      const tmp = `${this.file}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600 });
-      fs.renameSync(tmp, this.file);
-      this.mtimeMs = fs.statSync(this.file).mtimeMs;
+      this.persist();
     } finally {
       unlock();
     }
+  }
+
+  private persist(): void {
+    const body: RegistryFile = { version: 1, projects: Object.fromEntries(this.projects) };
+    const tmp = `${this.file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(tmp, this.file);
+    this.mtimeMs = fs.statSync(this.file).mtimeMs;
   }
 
   list(): ProjectRecord[] {
@@ -114,5 +118,27 @@ export class Registry {
 
   delete(slug: string): void {
     this.mutate((projects) => projects.delete(slug));
+  }
+
+  /**
+   * Change one record from what the file holds under the lock. `fn` gets the
+   * current record (a registry-owned object: copy it, do not mutate it) and
+   * returns the record to store, or undefined to change nothing, in which
+   * case the file is not rewritten. Returns whether it wrote.
+   */
+  update(slug: string, fn: (current: ProjectRecord | undefined) => ProjectRecord | undefined): boolean {
+    fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    const unlock = this.lock();
+    try {
+      this.mtimeMs = -2; // force a re-read: the decision must rest on the latest state
+      this.refresh();
+      const next = fn(this.projects.get(slug));
+      if (next === undefined) return false;
+      this.projects.set(slug, next);
+      this.persist();
+      return true;
+    } finally {
+      unlock();
+    }
   }
 }

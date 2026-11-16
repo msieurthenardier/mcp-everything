@@ -12,9 +12,12 @@ class ScriptedDocker extends Docker {
   ensureCalls = 0;
   ensureResult: boolean | Error = true;
   onEnsure?: () => void;
+  /** Replies by first argument (inspect, version, network), ahead of the defaults. */
+  replies: Record<string, Reply> = {};
 
   protected override async docker(args: string[]) {
     this.argvs.push(args);
+    if (args[0]! in this.replies) return reply(this.replies[args[0]!]!);
     if (args[0] === "image") return reply({ stdout: "[]" });
     if (args[0] === "exec") return reply(this.execReplies.shift() ?? {});
     return reply({});
@@ -188,5 +191,48 @@ describe("Docker.exec retry", () => {
     expect(res.code).toBe(1);
     expect(d.execs).toHaveLength(1);
     expect(d.ensureCalls).toBe(0);
+  });
+});
+
+describe("setNetwork(container, false)", () => {
+  const verbs = (d: ScriptedDocker) => d.argvs.map((a) => a.slice(0, 2).join(" "));
+
+  it("returns without detaching when the container is gone and the daemon answers", async () => {
+    const d = mk();
+    d.replies.inspect = { code: 1, stderr: "Error: No such object: gone" };
+    d.replies.version = { stdout: "27.0.0\n" };
+    await d.setNetwork("gone", false);
+    expect(verbs(d)).toContain("version --format");
+    expect(verbs(d)).not.toContain("network disconnect");
+  });
+
+  it("rejects when the networks cannot be read and the daemon does not answer", async () => {
+    const d = mk();
+    d.replies.inspect = { code: 1, stderr: "Cannot connect to the Docker daemon" };
+    d.replies.version = { code: 1, stderr: "Cannot connect to the Docker daemon" };
+    await expect(d.setNetwork("box", false)).rejects.toThrow(/Failed to disable network for box: Docker daemon is not reachable/);
+    expect(verbs(d)).not.toContain("network disconnect");
+  });
+
+  it("rejects when the inspect and the daemon probe both time out", async () => {
+    const d = mk();
+    d.replies.inspect = { code: null as unknown as number, timedOut: true };
+    d.replies.version = { code: null as unknown as number, timedOut: true };
+    await expect(d.setNetwork("box", false)).rejects.toThrow(/Failed to disable network for box/);
+  });
+
+  it("disconnects when the container has a network", async () => {
+    const d = mk();
+    d.replies.inspect = { stdout: "bridge \n" };
+    await d.setNetwork("box", false);
+    expect(d.argvs.find((a) => a[0] === "network")).toEqual(["network", "disconnect", "bridge", "box"]);
+  });
+
+  it("does nothing more when the inspect succeeded and listed no network", async () => {
+    const d = mk();
+    d.replies.inspect = { stdout: "\n" };
+    await d.setNetwork("box", false);
+    expect(verbs(d)).not.toContain("network disconnect");
+    expect(verbs(d)).not.toContain("version --format");
   });
 });

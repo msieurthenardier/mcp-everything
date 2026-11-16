@@ -373,16 +373,31 @@ export class Docker {
     return true;
   }
 
-  async hasNetwork(container: string): Promise<boolean> {
-    const res = await this.docker(
+  private inspectNetworks(container: string): Promise<RunResult> {
+    return this.docker(
       ["inspect", "--format", "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}", container],
       { timeoutMs: 30_000 },
     );
+  }
+
+  async hasNetwork(container: string): Promise<boolean> {
+    const res = await this.inspectNetworks(container);
     return res.code === 0 && res.stdout.trim().length > 0;
   }
 
   async setNetwork(container: string, enabled: boolean): Promise<void> {
-    const connected = await this.hasNetwork(container);
+    const inspected = await this.inspectNetworks(container);
+    const connected = inspected.code === 0 && inspected.stdout.trim().length > 0;
+    if (!enabled && inspected.code !== 0) {
+      // A failed inspect also means the daemon did not answer; only a
+      // reachable daemon makes it "the container is gone, nothing to detach".
+      try {
+        await this.assertAvailable();
+      } catch (e) {
+        throw new Error(`Failed to disable network for ${container}: ${(e as Error).message}`);
+      }
+      return;
+    }
     if (connected === enabled) return;
     const res = await this.docker(["network", enabled ? "connect" : "disconnect", "bridge", container], {
       timeoutMs: 60_000,

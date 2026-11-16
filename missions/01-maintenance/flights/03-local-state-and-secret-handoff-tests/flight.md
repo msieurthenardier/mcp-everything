@@ -29,6 +29,15 @@ N/A — maintenance flight. The one small design call is stated under Design Dec
 - Trade-off: a file left by a crash survives until the next start after the bound has passed. The directory is mode 0700 and the files 0600, so exposure meanwhile is local to the operator's own account.
 - Provenance: the sharing and the file lifetimes are read from `src/registry.ts` and `src/proxy/mcp-proxy.ts`, not tested by this inspection.
 
+**Carried from the flight 02 debrief, for leg design** (inputs, not decisions; flight 02 added startup work on the same shared directory and its design reviews had to add each of these)
+- Flight 02 left three things to build on: `Registry.update(slug, fn)` changes a record from what the file holds under the lock and writes nothing when `fn` returns `undefined`; `App.start()` keeps its startup reconciliation in `App.reconciling`, a promise that never rejects and that tests await instead of polling; and the rule it followed was to re-check immediately before acting and to do nothing when the answer is unknown.
+- **Registry temp files**: `registry.json.<pid>.tmp` exists for the length of one write and is renamed away. A leftover is not proof of a crash on its own; a live neighbor may be mid-write. Read `Registry.mutate`, `update` and `lock` first, and consider doing the sweep while holding the registry lock, when no write can be in flight. A process id in the name is reused and means nothing across hosts.
+- **Env files**: the name carries no owner. Before choosing the age bound, read in `src/proxy/mcp-proxy.ts` when the file is removed and whether `docker exec` has finished reading it by then, so that a launch another process started a moment ago cannot lose its file.
+- **Each removal**: stat and re-check right before the unlink, ignore a file that has already gone, never log a file's contents.
+- **The version check**: `mutate` and `update` both re-read and then rewrite the file, so the check belongs where the file is read and before any write, not only at startup. Say what a refused file blocks: the tools that need the registry, or the whole server.
+- **Three startup tasks will now exist in three classes** (`Installer`, `Registry`, the proxy). One awaitable "startup work finished" on `App` is better than a field per task.
+- Raise the hosted check's test floor in the last leg (it is 430 against 447).
+
 ### Prerequisites
 - [ ] Flight 01 landed, so this work is checked on its pull request (preferred, not required).
 

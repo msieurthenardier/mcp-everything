@@ -2,6 +2,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
 import { App, prepareDataDir } from "./server.js";
+import { SHUTDOWN_DEADLINE_MS, boundedShutdown } from "./shutdown.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -10,12 +11,15 @@ async function main(): Promise<void> {
   const app = new App({ cfg, log: (line) => process.stderr.write(`[mcp-everything] ${line}\n`) });
   app.start();
   await app.server.connect(new StdioServerTransport());
-  const shutdown = () => {
-    void app
-      .shutdown()
-      .then(() => app.server.close())
-      .finally(() => process.exit(0));
-  };
+  const shutdown = boundedShutdown({
+    close: async () => {
+      await app.shutdown();
+      await app.server.close();
+    },
+    exit: (code) => process.exit(code),
+    deadlineMs: SHUTDOWN_DEADLINE_MS,
+    log: (line) => process.stderr.write(`[mcp-everything] ${line}\n`),
+  });
   // The client hanging up (stdin closing) must also stop proxied servers.
   process.stdin.on("end", shutdown);
   process.on("SIGINT", shutdown);

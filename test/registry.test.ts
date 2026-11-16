@@ -90,4 +90,61 @@ describe("Registry", () => {
     fs.writeFileSync(path.join(dir, "registry.json"), "{ nope");
     expect(() => new Registry(dir).refresh()).toThrow(/unreadable/);
   });
+
+  describe("update", () => {
+    const mtime = () => fs.statSync(path.join(dir, "registry.json")).mtimeMs;
+
+    it("stores the record the updater returns, in the file and in memory", () => {
+      const reg = new Registry(dir);
+      reg.put(record("x"));
+      expect(reg.update("x", (cur) => ({ ...cur!, network: true }))).toBe(true);
+      expect(reg.get("x")?.network).toBe(true);
+      const fresh = new Registry(dir);
+      fresh.refresh();
+      expect(fresh.get("x")?.network).toBe(true);
+    });
+
+    it("hands the updater what the file holds now, not what this instance last read", () => {
+      const a = new Registry(dir);
+      const b = new Registry(dir);
+      a.put(record("x"));
+      b.put({ ...record("x"), network: true });
+      let seen: boolean | undefined;
+      a.update("x", (cur) => {
+        seen = cur?.network;
+        return undefined;
+      });
+      expect(seen).toBe(true);
+    });
+
+    it("does not rewrite the file when the updater returns undefined, and keeps the fresh state", () => {
+      const a = new Registry(dir);
+      const b = new Registry(dir);
+      a.put(record("x"));
+      b.put({ ...record("x"), network: true });
+      const before = mtime();
+      expect(a.update("x", () => undefined)).toBe(false);
+      expect(mtime()).toBe(before);
+      expect(a.get("x")).toEqual(b.get("x"));
+      expect(fs.existsSync(path.join(dir, "registry.json.lock"))).toBe(false);
+    });
+
+    it("passes undefined for a slug that is not there and can add it", () => {
+      const reg = new Registry(dir);
+      let seen: unknown = "unset";
+      expect(reg.update("x", (cur) => ((seen = cur), undefined))).toBe(false);
+      expect(seen).toBeUndefined();
+      expect(reg.update("x", () => record("x"))).toBe(true);
+      expect(reg.get("x")).toBeDefined();
+    });
+
+    it("leaves delete of a missing slug as it was: a write, no error", () => {
+      const reg = new Registry(dir);
+      reg.put(record("x"));
+      reg.delete("nope");
+      const fresh = new Registry(dir);
+      fresh.refresh();
+      expect(fresh.list().map((p) => p.slug)).toEqual(["x"]);
+    });
+  });
 });

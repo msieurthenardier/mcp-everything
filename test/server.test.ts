@@ -356,6 +356,48 @@ describe("proxied MCP servers", () => {
     expect(body(await app.callTool("disconnect_mcp_server", { project: "demo", name: "api" }))).toMatch(/no MCP server named "api"/);
   });
 
+  describe("disconnect_mcp_server when the sandbox is gone", () => {
+    /** A ready project with a registered server, an open session, a registered command and a tool of its own. */
+    async function seedRegistered(): Promise<ProjectRecord> {
+      await connect({ name: "api" });
+      await app.callTool("demo__add", { a: 1, b: 1 });
+      const seeded = app.registry.get("demo")!;
+      app.registry.put({ ...seeded, commands: [...seeded.commands, { name: "demo", origin: "registered" }], tools: [...seeded.tools, tool] });
+      return structuredClone(app.registry.get("demo")!);
+    }
+    const sandboxGone = () => {
+      docker.exists = false;
+      docker.next = { code: 1 };
+    };
+
+    it("refuses, closes nothing and stores nothing", async () => {
+      const before = await seedRegistered();
+      expect(before.mcpServers).toHaveLength(1);
+      expect(before.commands.some((c) => c.origin === "registered")).toBe(true);
+      expect(before.tools.length).toBeGreaterThan(0);
+      expect(app.proxy.size).toBe(1);
+      sandboxGone();
+      const res = await app.callTool("disconnect_mcp_server", { project: "demo", name: "api" });
+      expect(res.isError).toBe(true);
+      expect(body(res)).toBe("Error: Sandbox for demo no longer exists; reinstall it with install_project(reinstall: true).");
+      expect(app.registry.get("demo")).toEqual(before);
+      expect(app.proxy.size).toBe(1);
+    });
+
+    it("refuses an unknown name and a detected server first, with no Docker call", async () => {
+      await seedRegistered();
+      const stored = app.registry.get("demo")!;
+      app.registry.put({ ...stored, mcpServers: [...stored.mcpServers!, { name: "auto", argv: ["auto"], cwd: "/workspace/repo", env: {}, origin: "detected" }] });
+      sandboxGone();
+      docker.calls = [];
+      docker.ensureCalls = [];
+      expect(body(await app.callTool("disconnect_mcp_server", { project: "demo", name: "nope" }))).toMatch(/no MCP server named "nope"/);
+      expect(body(await app.callTool("disconnect_mcp_server", { project: "demo", name: "auto" }))).toMatch(/was detected automatically/);
+      expect(docker.calls).toEqual([]);
+      expect(docker.ensureCalls).toEqual([]);
+    });
+  });
+
   it("uninstall_project stops the project's servers", async () => {
     await connect();
     await app.callTool("demo__add", { a: 1, b: 1 });
@@ -1062,5 +1104,51 @@ describe("host environment variables for proxied MCP servers", () => {
       expect(envDescription).toContain("<slug>__<NAME>");
       expect(envDescription).toContain("outside the conversation");
     });
+  });
+});
+
+describe("reconciling stale installs at startup", () => {
+  class Reachable extends FakeDocker {
+    override async assertAvailable(): Promise<void> {}
+  }
+  let local: App;
+  let fake: Reachable;
+  beforeEach(() => {
+    const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir });
+    fake = new Reachable(cfg);
+    local = new App({ cfg, docker: fake, proxy: new McpProxy(cfg, fake, up.connector) });
+  });
+  afterEach(async () => {
+    await local.reconciling;
+    await local.shutdown();
+  });
+  const mtime = () => fs.statSync(path.join(dir, "registry.json")).mtimeMs;
+
+  it("marks a stale installing record failed", async () => {
+    local.registry.put({ ...record("old"), status: "installing", network: true });
+    local.start();
+    await local.reconciling;
+    expect(local.registry.get("old")).toMatchObject({ status: "failed", network: false });
+    expect(fake.network).toEqual([["mcpe-old", false]]);
+  });
+
+  it("leaves a fresh installing record and the file alone", async () => {
+    const fresh = { ...record("new"), status: "installing" as const, network: true, installedAt: new Date().toISOString() };
+    local.registry.put(fresh);
+    const before = mtime();
+    local.start();
+    await local.reconciling;
+    expect(local.registry.get("new")).toEqual(fresh);
+    expect(mtime()).toBe(before);
+    expect(fake.network).toEqual([]);
+  });
+
+  it("never rejects, and a second start does not begin a second reconciliation", async () => {
+    local.registry.put({ ...record("old"), status: "installing", network: true });
+    local.start();
+    const first = local.reconciling;
+    local.start();
+    expect(local.reconciling).toBe(first);
+    await expect(first).resolves.toBeUndefined();
   });
 });
