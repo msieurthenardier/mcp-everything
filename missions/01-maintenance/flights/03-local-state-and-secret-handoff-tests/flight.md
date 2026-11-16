@@ -1,6 +1,6 @@
 # Flight: Local State Hygiene and Secret Hand-Off Tests
 
-**Status**: in-flight
+**Status**: landed
 **Mission**: [Maintenance](../../mission.md)
 
 ## Contributing to Criteria

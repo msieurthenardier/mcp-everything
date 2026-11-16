@@ -3,7 +3,7 @@
 **Flight**: [Local State Hygiene and Secret Hand-Off Tests](flight.md)
 
 ## Summary
-In flight since 2026-11-16. Two legs completed the same day: leftover env files and registry temp files are removed at startup, and a registry written by a newer version is refused and left untouched. The hand-off of values to Docker turned out to be tested already; two small gaps were closed. Unit suite 500 passed (447 before); Docker suite 16 passed.
+Landed on 2026-11-16. Two legs completed the same day: leftover env files and registry temp files are removed at startup, and a registry written by a newer version is refused and left untouched. The hand-off of values to Docker turned out to be tested already; two small gaps were closed. Unit suite 500 passed (447 before); Docker suite 16 passed.
 
 ### Flight Director Notes
 - 2026-11-16: The operator said to start flight 3 on merging pull request #10 (flight 02 and its debrief). Flight set to `in-flight`; branch `flight/03-local-state-and-secret-handoff-tests` cut from `main` at `661db3e`. Committed with this flight, from that merge: mission criterion 2 and flight 02's "Code merged" checked off, and sortie 04 (the design work this mission set aside, logged at the operator's request).
@@ -100,3 +100,16 @@ The assertion `toThrow(expect.not.stringMatching(/unreadable/))` was vacuous: vi
 ---
 
 ## Session Notes
+
+### 2026-11-16 — commit, hosted run and landing (Flight Director)
+- Commit `678436f` (`flight/03: sweep crash leftovers at startup; refuse a newer registry`), made by a Developer from an exact file list after the second review cycle confirmed. It also carries, as artifacts only: sortie 04, squawks 0033 and 0034, and the checks made after flight 02 merged. Branch pushed; draft pull request #13 opened.
+- **Green**: run 43936617973 on pull request #13, every step passed, job 17 s. From its log: "500 tests passed (floor 480)"; "dist/index.js is packed". The hosted check does not run the Docker suite; that ran locally on the final tree in the second review cycle (16 passed, 0 failed).
+- No throwaway red runs this flight: the check's Install, Typecheck and Unit-test steps have each been seen red on the runner (flights 01 and 02), and the workflow changed only in its floor.
+- The flight's four checkpoints, as met: the existing connector test fails with a value in the argument list (shown by the argv experiment); the assertion the spec called vacuous is not, stays, and has a comment saying what it covers; a registry file marked with a later version is refused and byte-identical afterwards, through `Registry` and through the `App`; old env and registry temp files are removed at startup and fresh ones are left.
+- Documentation: the README gained a clause on leftover env files and a sentence on the refused registry. `CLAUDE.md` describes Flight Control only and needs nothing.
+- Flight set to `landed`; flight 3 checked off in the mission. The mission's last three success criteria and this flight's "Code merged" stay open until pull request #13 merges.
+- For the operator, from this flight:
+  - **The inspection's finding 5 was half wrong** (see the Flight Director Notes). Worth knowing when the maintenance report is read again: its "read, not run" evidence for that finding missed a test that had been there since the proxy was written.
+  - Squawks 0033 (a connector that throws after writing its env file) and 0034 (a registry file that is not an object loads as empty) are open, with 0026 to 0032.
+  - A second `App.start()` leaves the first watcher interval running. Reached by no caller. Noted, not logged as a squawk.
+
