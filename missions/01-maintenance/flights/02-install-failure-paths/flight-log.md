@@ -3,7 +3,7 @@
 **Flight**: [Install Failure and Interruption Paths](flight.md)
 
 ## Summary
-Landed on 2026-11-16. Four legs completed the same day, with no deviation that changed a leg: failed installs end off the network, stale `installing` records are reconciled at startup, shutdown is bounded, and `disconnectMcp` refuses when the sandbox is gone. Unit suite 447 passed (396 before); Docker suite 16 passed.
+Completed on 2026-11-16 (landed and debriefed the same day). Four legs completed the same day, with no deviation that changed a leg: failed installs end off the network, stale `installing` records are reconciled at startup, shutdown is bounded, and `disconnectMcp` refuses when the sandbox is gone. Unit suite 447 passed (396 before); Docker suite 16 passed.
 
 ### Flight Director Notes
 - 2026-11-16: The operator said to start flight 2 after pull request #9 (the flight 01 debrief) merged. Flight set to `in-flight`; branch `flight/02-install-failure-paths` cut from `main` at `7257c17`.
@@ -123,6 +123,29 @@ Landed on 2026-11-16. Four legs completed the same day, with no deviation that c
 
 ## Deviations
 
+Filled in at the debrief. During the flight these were recorded only in the Flight Director Notes, which is not where a reader looks for them.
+
+### A shared method's behavior changed: `Docker.setNetwork(container, false)`
+**Planned**: the flight spec has the `catch` of `install` turn the network off, best effort.
+**Actual**: `setNetwork(container, false)` itself now throws when the container's networks cannot be read and the daemon does not answer. It used to return as if the network were off.
+**Reason**: a record written `network: false` on an unanswered question is the fail-open the finding is about.
+**Impact**: `set_project_network(enabled: false)` and the install paths now report an error in that condition. No caller behaves differently when Docker answers.
+
+### A public method added to `Registry`: `update(slug, fn)`
+**Planned**: the flight spec expected reconciliation to need no new registry surface beyond, at most, a field (reserved for the operator).
+**Actual**: one method that changes a record from what the file holds under the lock, and skips the write when the updater returns nothing. No field added.
+**Reason**: the reconciliation's write must not replace a record another process changed.
+
+### Leg list restructured
+**Planned**: four legs, one of them tests only (4b).
+**Actual**: four legs, 4b folded into the first, and the first split in two.
+**Reason**: see the Flight Director Notes of 2026-11-16.
+
+### Staleness limit of seven hours
+**Planned**: "older than the longest install allowed (`timeout_seconds` is clamped to 7200)".
+**Actual**: `2 × max(7200, installTimeoutSec) + 10800` seconds.
+**Reason**: 7200 is one recipe run; an install can run two, plus clone, pulls and discovery.
+
 ---
 
 ## Anomalies
@@ -144,3 +167,8 @@ Landed on 2026-11-16. Four legs completed the same day, with no deviation that c
   - **A registry record carries no owner.** The startup reconciliation therefore goes by age (seven hours by default) and waits for the next start when Docker is not reachable. A process id and host in the record would let a start reconcile an interrupted install at once; it is a registry schema change, which the flight reserved for the operator. Not proposed as work here, only recorded.
   - Three existing behaviors seen in leg 1 and left alone, none logged as a squawk yet: a first-attempt `createContainer` that fails after Docker created the container can leave a container with no record; on a second attempt a removed container followed by a failed create leaves a kept record whose advice says "The sandbox was kept"; a throw from discovery leaves proxied sessions open until the next reinstall or uninstall.
 
+### 2026-11-16 — debrief (Flight Director)
+- Debriefed on the flight branch, before merge, so the debrief joins pull request #10: [flight-debrief.md](flight-debrief.md). Developer and Architect interviews on Sonnet. No human interview: the log had no gap that only the operator could fill.
+- The Developer re-ran both suites at `77dc425`: unit 447 passed, 18 skipped, 1.64 s; Docker 16 passed, 2 skipped, 154.5 s, with per-case times recorded for the first time.
+- From the debrief: the Deviations section above was filled in; flight 03 (still `ready`) gained a note on startup work with several processes on one data directory; four squawk candidates are put to the operator.
+- The operator confirmed the four squawk candidates, the status change and the commit: squawks 0029 to 0032 logged as `open`, `routine`; flight set to `completed`; the debrief committed to this branch so it is part of pull request #10.

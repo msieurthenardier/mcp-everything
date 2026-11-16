@@ -1,6 +1,6 @@
 # Flight: Install Failure and Interruption Paths
 
-**Status**: landed
+**Status**: completed
 **Mission**: [Maintenance](../../mission.md)
 
 ## Contributing to Criteria
