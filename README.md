@@ -260,7 +260,7 @@ its environment changed, so the client has to start it again) and call
 **Route 2: `connect_mcp_server(env: …)`.**
 
 ```
-connect_mcp_server(project: "some-api-server",
+connect_mcp_server(project: "some_api_server",
                    command: ["node", "build/index.js"],
                    env: { "API_KEY": "replace-with-your-key" })
 ```

@@ -1,6 +1,6 @@
 # Sortie: MCP Env Passthrough
 
-**Status**: in-flight
+**Status**: landed
 
 ## Charter
 
@@ -125,7 +125,7 @@ Statements of fact below are marked **measured** (observed by running something 
 - [x] `main` at `5a3fedb`, with pull request #3 merged, is the base. (Checked 2026-11-15.)
 - [x] Unit suite and typecheck pass on `main`: 270 passed, 14 skipped, 1.65 s; `tsc --noEmit` clean. (Run 2026-11-15, and again by the Architect.)
 - [x] Docker is available: client and server 29.8.2; `buildpack-deps:stable` is present locally. (Run 2026-11-15.)
-- [ ] For the optional HAT leg: the operator's MCP client runs the build from the sortie branch, and an installed project whose MCP server needs a variable is chosen. Settled when that leg is designed.
+- [x] For the optional HAT leg: the operator's MCP client runs the build from the sortie branch, and an installed project whose MCP server needs a variable is chosen. Settled when that leg is designed. *(Settled 2026-11-15: this checkout's build, and a stand-in server on the `gron` sandbox.)*
 
 ### Pre-Flight Checklist
 - [x] All open questions resolved
@@ -178,7 +178,7 @@ Out of scope: the version number (bumped by a servicing squawk at release, as fo
 
 - [x] `host-env-passthrough` - The matching module, the launch-time merge at all four sites, what `project_info` shows, the unit tests for criteria 1, 3 and 4 and both constraints with their controls, and the first Docker case. This is the part that handles secrets; it is complete and testable without the second leg.
 - [x] `refresh-mcp-and-docs` - The `refresh_mcp` tool with its guards and result, the discovery warnings, the server instructions and `connect_mcp_server` descriptions, the README, the unit tests for criterion 2, the extension of the first leg's registry-file test to `refresh_mcp`, the test that documents the limit of DD7, and the second Docker case. Depends on the first leg.
-- [ ] `hat-and-alignment` *(optional, requested by the operator)* - Guided session in the operator's own client: set a real `{slug}__NAME` variable, reconnect, call `refresh_mcp` against a real installed MCP server, and walk the checks, with fixes along the way.
+- [x] `hat-and-alignment` *(optional, requested by the operator)* - Guided session in the operator's own client: set a real `{slug}__NAME` variable, reconnect, call `refresh_mcp` against a real installed MCP server, and walk the checks, with fixes along the way.
 
 The split is by what can be finished and checked by itself, not by kind of task: each leg carries its own tests. Both are reviewed and committed together at the end of the flight.
 
@@ -187,10 +187,10 @@ The split is by what can be finished and checked by itself, not by kind of task:
 ## Post-Flight
 
 ### Completion Checklist
-- [ ] All legs completed
+- [x] All legs completed
 - [ ] Code merged
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Tests passing
+- [x] Documentation updated
 
 ### Verification
 Each charter criterion and constraint, and what shows it. No behavior test is authored: the mechanism is observable through `App.callTool` and the registry file in a deterministic test, and the one thing only a real client shows, the reconnect, is what the HAT leg is for.

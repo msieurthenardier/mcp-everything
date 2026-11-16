@@ -3,7 +3,7 @@
 **Flight**: [MCP Env Passthrough](flight.md)
 
 ## Summary
-In flight since 2026-11-15 on `sortie/03-mcp-env-passthrough`. Charter agreed with the operator on 2026-11-15; flight spec reviewed in two Architect cycles and approved by the operator the same day. Both implementation legs, `host-env-passthrough` and `refresh-mcp-and-docs`, are completed: reviewed and confirmed in one cycle and committed. The optional HAT leg the operator asked for remains.
+Landed 2026-11-15 on `sortie/03-mcp-env-passthrough`, pull request #4. Charter agreed with the operator on 2026-11-15; flight spec reviewed in two Architect cycles and approved by the operator the same day. Three legs, all completed. `host-env-passthrough` and `refresh-mcp-and-docs` were reviewed together and confirmed in one cycle (commit `3d52778`). `hat-and-alignment` was walked with the operator in their own client: a variable set in the client configuration reached a stand-in MCP server after a real reconnect, `refresh_mcp` published its tool, the value was not stored, and removing the variable was reported as an error; one README wording fix came out of it. Not yet debriefed; the debrief assesses the charter's criteria.
 
 ---
 
@@ -113,6 +113,39 @@ Each: one edit to `src/server.ts`, the two test files run, the edit re-applied b
 
 ---
 
+### Leg 03: hat-and-alignment
+- **Status**: completed
+- **Started**: 2026-11-15
+- **Completed**: 2026-11-15
+
+#### Steps
+Each step is performed by the operator in their own client and reported back.
+
+1. **Reconnect; `refresh_mcp` is listed.** Reported as passed by the operator ("reconnected, refresh_mcp shows up"), after asking how to connect a client to the branch's version. **Not confirmed for the session the HAT is being run from**, and open until it is: see the anomaly "The HAT session's server was still the old build". The Flight Director first recorded this step as passed on the assumption that the operator had reconnected this session; that assumption was not checked and turned out wrong.
+2. **Choose the project.** The operator chose a stand-in on the existing `gron` sandbox. The Flight Director placed it through the session's own mcp-everything tools: an executable shell script at `/opt/mcpe/bin/hatgate` that speaks MCP only when `HAT_KEY` is set (one tool, `reveal`, which reports the value, so a dummy value is to be used), and `/workspace/repo/.mcp.json` declaring it as `{"command":"hatgate"}`. A `discover_tools` then recorded commands `gron` and `hatgate`, tools `gron__gron` and `gron__hatgate`, no MCP server, and the "none of these completed an MCP handshake" warning, in the old wording (see the anomaly). To be removed at the end of the HAT.
+3. **The variable is in the client's configuration.** The operator decided to run the HAT in this session and asked the Flight Director to update this project's configuration. The local-scope entry for mcp-everything, which had no environment, was re-registered with the same command and `gron__HAT_KEY` set to a dummy value that is not a secret. Awaiting the operator's reconnect of this session, after which step 1 is checked here.
+
+The operator reconnected this session with `/mcp` at about 21:27. What follows was run by the Flight Director through the session's tools, with the operator reading the results. All **measured**, one run each.
+
+1. **(again) `refresh_mcp` is listed.** Passed, confirmed here. A new server process had started at 21:27:42 and the one from 15:44 exited within seconds; the session's tools now include `refresh_mcp` with the description from leg 02.
+4. **`project_info` shows the name, not the value.** Passed. Before any refresh, with no MCP server recorded: "environment from gron__… variables of the mcp-everything process, passed to every MCP server of this project: HAT_KEY". No value. The stored warning still had the old wording, having been written by the old build's discovery.
+5. **`refresh_mcp` publishes the server's tools.** Passed. First lines: "Refreshed gron: 1 MCP server(s) recorded, 0 with no tool in the catalog, 1 proxied tool(s) in the catalog." / "Variables applied (names only): HAT_KEY." / "The sandbox is offline; enable set_project_network if a server needs the network." Not flagged as an error. Server `hatgate` recorded as detected; tool `gron__reveal` published; the command line tool `gron__hatgate` gone from the catalog and from the client's tool list; the old warning gone.
+6. **A proxied tool behaves as with the variable.** Passed. `gron__reveal` returned `gate=` followed by the dummy value.
+7. **The value is not in the registry file.** Passed. A search of `registry.json` for the dummy value found 0 occurrences; the server's stored `env` has no keys; the env-file directory was empty. The name `HAT_KEY` occurs once, in the tool description the stand-in itself supplies. The Flight Director ran the search, not the operator as the leg planned, because the value is a dummy that the stand-in's tool had already printed into the conversation.
+8. **Without the variable, the refresh says so.** Passed. The Flight Director removed `gron__HAT_KEY` from the project's configuration, which put the entry back as it was before the HAT; the operator reconnected. `refresh_mcp` was then flagged as an error and read: "Refreshed gron: 0 MCP server(s) recorded, 0 with no tool in the catalog, 0 proxied tool(s) in the catalog." / "No gron__<NAME> variable is set for this project." / "Recorded before and gone now: "hatgate"." / "Candidates that did not answer: `hatgate` (… did not start: MCP error -32000: Connection closed)." The stored warning now has the new wording, naming `gron__NAME`, the reconnect and `refresh_mcp`. The command line tool `gron__hatgate` was back.
+
+**Cleanup**, measured: the two stand-in files were removed from the `gron` sandbox (its checkout is clean again and `/opt/mcpe/bin` holds only `gron`), and a `discover_tools` left the project as it was before the HAT: one command, one tool `gron__gron`, no MCP server, no warning. The client configuration has no environment again.
+
+9. **The wording reads right.** The operator was shown the `refresh_mcp` results, the `project_info` line and the README's statement on passing values in a tool call, and said the rest looks good, with one fix asked for. The Flight Director had pointed out that the README's two examples named the project differently: `some_api_server` under route 1 and `some-api-server`, which is not a valid slug, under route 2. Classified out loud as a wording fix on one surface, not a feature: made by a Developer as a one-line change to `README.md`, checked by the Flight Director against the diff, and committed with this leg.
+
+#### Changes Made
+- `README.md`: the route 2 example's project is `some_api_server`, as in route 1. One line.
+- No source or test change. The operator's client configuration and the `gron` sandbox are as they were before the leg.
+
+#### Notes
+- The leg's eight criteria are met. Two were met differently from how the leg described them; see Deviations.
+- Not exercised by this HAT: a real third-party MCP server, a real secret, a sandbox with its network on, and the operator's other client.
+
 ### Flight Director Notes
 
 - 2026-11-15: execution started with `/mission-control:agentic-workflow sortie 03`. Crew file `.flightops/agent-crews/leg-execution.md` loaded and well-formed (Crew, Interaction Protocol, Prompts present). Developer and Reviewer run on Sonnet, as it assigns.
@@ -131,6 +164,10 @@ Each: one edit to `src/server.ts`, the two test files run, the edit re-applied b
 - Flight review started: one Reviewer (Sonnet) over all uncommitted changes of both legs, given the changes and the legs' criteria and none of either Developer's reasoning.
 - Flight review, cycle 1: `[HANDOFF:confirmed]`, no blocking issue, no fix cycle. The Reviewer went through both legs' criteria, found all met, and ran the suites itself: `npm test` 340 passed and 16 skipped in 1.56 s; typecheck clean; `npm run test:docker` once, 14 passed and 2 skipped in 152.55 s (leg 01's case 2169 ms, leg 02's case 4104 ms with a printed refresh of 1234 ms); no test container left; pressure cases not run, as the watchdog, its tests and the images are unchanged. It found no path by which mcp-everything writes a value itself, exactly four launch sites all going through `Installer.launchSpec`, and no existing test line removed or changed. Its one remark was bookkeeping: the flight's checkpoints were still unticked.
 - After the review: both legs set to `completed` with their criteria ticked, the two implementation legs and the checkpoints ticked in the flight spec, the log's leg entries set to `completed`. The flight stays `in-flight`: the optional HAT leg the operator asked for is still to come, and it is interactive. Squawk 0008 is committed separately from the flight, as earlier squawk logs were.
+- Committed by a Developer (Sonnet), which first confirmed the working tree held exactly the expected files and re-ran the unit suite (340 passed, 16 skipped) and the typecheck: `0d108f9` "squawks: log 0008" and `3d52778` "sortie/03: pass {slug}__{NAME} variables to proxied MCP servers; add refresh_mcp". Branch pushed; draft pull request #4 opened with both implementation legs ticked and the HAT leg open.
+- HAT leg `hat-and-alignment` designed as a light, interactive leg; no risk tier or design review, since it implements nothing. Two facts checked for it: the operator's client starts mcp-everything from this checkout's `dist/` (so the Flight Director ran `npm run build` on the branch; it succeeded and the build contains `refresh_mcp`), and the operator's registry holds `gron` and `rea`, neither with a server known to need a variable, so the first step is choosing the project. The leg file and this note are uncommitted until the HAT ends.
+- HAT leg run 2026-11-15; steps and results are in its Leg Progress entry, and what did not go as planned in Deviations and Anomalies. One fix-versus-feature call: the operator's only change request, making the README's two examples name the same project, is a wording fix on one surface, so it went inline through a Developer (Sonnet) with no design review; the Flight Director checked the one-line diff.
+- Flight completion, 2026-11-15: all three legs read `completed` and each has a log entry. Documentation checked: the README carries the new tool, the variable, both routes and the limits; the project's `CLAUDE.md` holds only Flight Control instructions and needs no change. Flight set to `landed`. The HAT's artifacts and the README fix are committed as one commit after the implementation commit, the branch pushed, the pull request's checklist completed and the pull request marked ready. The charter's success criteria are left unticked for the debrief, which is where a sortie's criteria are assessed.
 
 ---
 
@@ -192,13 +229,34 @@ Each: one edit to `src/server.ts`, the two test files run, the edit re-applied b
 
 ## Deviations
 
-*(none yet)*
+### HAT: the Flight Director ran the tool calls and edited the client configuration
+**Planned**: The operator performs each step in their own client and reports; they edit the client configuration themselves.
+**Actual**: The operator performed the reconnects and judged the results. At their request ("lets update the config for this project and reconnect here") the Flight Director re-registered the project's mcp-everything entry with the dummy variable, and later removed it again; the Flight Director also made the tool calls in the session, with the results in front of the operator.
+**Reason**: In this client the operator calls the server's tools through the session anyway, and they asked for the configuration change. The part only a human client action can show, the reconnect, was theirs both times.
+
+### HAT: the registry search was run by the Flight Director
+**Planned**: The operator searches the registry file for the value, so that the value stays out of the conversation.
+**Actual**: The Flight Director ran the search.
+**Reason**: The stand-in was used with a dummy value that its own tool prints back, so there was nothing to keep out of the conversation.
+
+### HAT: step 1 was first recorded as passed without being checked
+**Planned**: A step is recorded when it has been seen to pass.
+**Actual**: The Flight Director recorded the reconnect step as passed on the operator's report, assuming the reconnect had been made in this session. It had been made in another client. The record was corrected the same hour and the step was confirmed here after a reconnect of this session.
+**Reason**: An unchecked assumption about which client was meant. Found because the next tool call returned the old build's wording.
 
 ---
 
 ## Anomalies
 
-*(none yet)*
+### The HAT session's server was still the old build
+**Observed**: During HAT step 2, on 2026-11-15, the `discover_tools` the Flight Director ran through the session's mcp-everything tools wrote the candidates warning with the wording from before this flight ("If it needs other arguments, environment variables or network access, register it with connect_mcp_server."), and a search of the session's tools found no `refresh_mcp`. **Measured**: the only mcp-everything server process on the machine had been started at 15:44, hours before the branch was built (about 21:05); the build in `dist/` does contain the new wording and `refresh_mcp`. So the session's server had not been restarted since the build, although the operator had reported reconnecting and seeing `refresh_mcp`. **Inferred**, not yet confirmed with the operator: the reconnect was made in another client or session, possibly one set up with the branch argument the operator had just asked about.
+**Severity**: degraded. No product defect is indicated; the HAT cannot proceed in this session until its server runs the branch's build, and step 1 is not confirmed here.
+**Resolution**: resolved. The operator confirmed they had reconnected a different client, which uses the same Docker; they were not sure about its data directory. They chose to run the HAT in this session, reconnected it, and the step was confirmed here: a new server process, `refresh_mcp` listed, the new wording in use.
+
+### Two registries share one Docker and one name prefix
+**Observed**: Looking into the above, on 2026-11-15. **Measured**: this machine's default registry holds two projects, `gron` (installed 18:27 UTC) and `rea` (installed 18:30 UTC). The Docker daemon holds four sandbox containers with the default `mcpe-` prefix: `mcpe-gron` (created 18:27 UTC, matching this registry), `mcpe-cowsay` and `mcpe-rea` (created 13 s apart at 01:23 UTC on the 16th), and `mcpe-ha_googlehome` (02:41 UTC). `cowsay` and `ha_googlehome` are in no registry on this machine. The three later containers carry the idle-timeout label and lack the label Docker Desktop puts on containers created from this WSL distribution, which `mcpe-gron` has. **Inferred**: the operator's other client keeps its own registry in a different data directory, runs outside this WSL distribution, and uses the same container name prefix. It installed `rea` at 01:23 UTC, which replaced the container and volume this machine's registry still records for `rea`, since install destroys the container of that name first.
+**Severity**: degraded, for the operator's environment and for the HAT: the stand-in placed in `mcpe-gron` is visible only to this machine's registry, and an install of `gron` from the other client would replace that sandbox. Not caused by this flight; the name prefix exists so that separate registries can coexist (`MCPE_NAME_PREFIX`).
+**Resolution**: reported to the operator. Whether install should refuse to replace a container another registry created is a design question, so not a squawk; raised as a possible later sortie.
 
 ---
 
@@ -254,3 +312,4 @@ One run, against the `dist` build, which predates the merge of pull request #3; 
 
 - 2026-11-15: sortie qualified and chartered. Planning started from `main` after pull request #3 merged.
 - 2026-11-15: spec approved by the operator and set to `ready`. Planning artifacts and squawk 0008 are uncommitted in the working tree on `main` at this point.
+- 2026-11-15: executed in the same session. Leg 01 and leg 02 designed, design-reviewed, implemented and landed; flight review confirmed; committed and pushed; draft pull request #4 opened; HAT run with the operator; flight landed.
