@@ -30,8 +30,8 @@ export interface ToolchainChoice {
  * These lists age: extend them when new release lines appear. A pin never
  * consults them, so pinned projects keep working regardless.
  */
-export const NODE_LINES = [26, 24, 22, 20, 18];
-export const PYTHON_LINES = ["3.13", "3.14", "3.12", "3.11", "3.10", "3.9", "3.15", "3.8"];
+const NODE_LINES = [26, 24, 22, 20, 18];
+const PYTHON_LINES = ["3.13", "3.14", "3.12", "3.11", "3.10", "3.9", "3.15", "3.8"];
 
 const NODE_CODENAMES: Record<string, number> = { hydrogen: 18, iron: 20, jod: 22, krypton: 24 };
 

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadConfig, type Config } from "../src/config.js";
 import { dockerConnector, McpProxy, validateEnv } from "../src/proxy/mcp-proxy.js";
 import type { McpServerSpec } from "../src/types.js";
-import { FakeDocker, fakeUpstream, type FakeUpstream } from "./helpers.js";
+import { FakeDocker, fakeUpstream, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
 
 const spec = (over: Partial<McpServerSpec> = {}): McpServerSpec => ({
   name: "srv",
@@ -285,16 +285,15 @@ describe("host variables and the real docker connector", () => {
     const { Installer } = await import("../src/install/installer.js");
     const { Registry } = await import("../src/registry.js");
     const { record } = await import("./helpers.js");
-    const VALUE = "hv-7Qz3kLx9Vb2NmR8tYw4Pa6Ud1Fs0Jc5";
     const registry = new Registry(dir);
     const project = record("demo");
-    const installer = new Installer(cfg, docker, registry, proxy, undefined, { demo__API_KEY: VALUE });
+    const installer = new Installer(cfg, docker, registry, proxy, undefined, { demo__API_KEY: SECRET_VALUE });
     const launch = installer.launchSpec(project, spec({ argv: ["node", "server.js"] }));
     const conn = dockerConnector(cfg)({ container: "mcpe-demo", server: launch, pidFile: "/tmp/p.pid" });
     const params = (conn.transport as unknown as { _serverParams: { args: string[] } })._serverParams;
-    expect(params.args.join(" ")).not.toContain(VALUE);
+    expect(params.args.join(" ")).not.toContain(SECRET_VALUE);
     const envFile = params.args[params.args.indexOf("--env-file") + 1]!;
-    expect(fs.readFileSync(envFile, "utf8")).toBe(`API_KEY=${VALUE}\n`);
+    expect(fs.readFileSync(envFile, "utf8")).toBe(`API_KEY=${SECRET_VALUE}\n`);
     conn.cleanup?.();
     expect(fs.existsSync(envFile)).toBe(false);
   });

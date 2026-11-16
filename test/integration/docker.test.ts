@@ -245,6 +245,32 @@ describe.skipIf(!enabled)("docker integration", () => {
     }
   }, 120_000);
 
+  it("gives a proxied MCP server a variable whose value is empty as set and empty", async () => {
+    const GATE_FILE = "/opt/mcpe/bin/gated";
+    const MANIFEST = "/workspace/repo/.mcp.json";
+    const names = (a: App) => a.registry.get("gron")!.tools.map((t) => t.name).sort();
+    const second = new App({
+      cfg: loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: prefix, MCPE_TOOL_TIMEOUT: "5" }),
+      env: { gron__MCPE_IT_GATE_Q7X2: "" },
+    });
+    try {
+      await app.callTool("sandbox_write_file", { project: "gron", path: GATE_FILE, content: GATED_MCP_SERVER });
+      await app.callTool("sandbox_write_file", { project: "gron", path: MANIFEST, content: JSON.stringify({ mcpServers: { gated: { command: "gated" } } }) });
+      const placed = await app.callTool("sandbox_exec", { project: "gron", command: `chmod +x ${GATE_FILE}` });
+      expect(placed.isError).toBe(false);
+
+      // The script exits unless the variable is set, so a started server means "set"; the reply shows it is empty.
+      const refreshed = await second.callTool("refresh_mcp", { project: "gron" });
+      expect(refreshed.isError).toBe(false);
+      expect(names(second)).toContain("gron__reveal");
+      expect(text(await second.callTool("gron__reveal", {}))).toBe("gate=");
+    } finally {
+      await second.shutdown();
+      await app.callTool("sandbox_exec", { project: "gron", command: `rm -f ${GATE_FILE} ${MANIFEST}` }).catch(() => {});
+      await app.callTool("discover_tools", { project: "gron" }).catch(() => {});
+    }
+  }, 120_000);
+
   it("uninstall removes the container and the volume", async () => {
     await app.callTool("uninstall_project", { project: "gron" });
     const c = await run("docker", ["inspect", `${prefix}gron`]);

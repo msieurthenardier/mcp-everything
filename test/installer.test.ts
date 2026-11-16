@@ -11,7 +11,7 @@ import type { Connector, Launch } from "../src/proxy/mcp-proxy.js";
 import { Registry } from "../src/registry.js";
 import { App } from "../src/server.js";
 import type { ExecOptions, ExecResult, ProbeData } from "../src/sandbox/docker.js";
-import { FakeDocker, fakeUpstream, type FakeUpstream } from "./helpers.js";
+import { FakeDocker, fakeUpstream, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
 
 const TOOL_HELP = `Tool does things.
 
@@ -129,6 +129,17 @@ describe("runtime selection during install", () => {
     const record = await install();
     expect(docker.images).toEqual(["node:24"]);
     expect(record).toMatchObject({ status: "ready", image: "node:24", imageReason: "Node 24, pinned by .nvmrc (24.22.1)" });
+  });
+
+  it("keeps the first 20 build warnings and says how many more were dropped", async () => {
+    docker.repoFiles = { "package.json": pkg({}) };
+    docker.recipe = () => ({ stdout: Array.from({ length: 100 }, (_, n) => `MCPE_WARN warning ${n + 1}\n`).join("") });
+    const record = await install();
+    const build = record.warnings.filter((w) => /^warning \d+$|more build warnings/.test(w));
+    expect(build).toHaveLength(21);
+    expect(build[0]).toBe("warning 1");
+    expect(build[19]).toBe("warning 20");
+    expect(build[20]).toBe("80 more build warnings were dropped.");
   });
 
   it("rebuilds once on the next allowed version when the build fails softly", async () => {
@@ -308,7 +319,6 @@ describe("publication at install time", () => {
 });
 
 describe("host environment variables", () => {
-  const VALUE = "hv-7Qz3kLx9Vb2NmR8tYw4Pa6Ud1Fs0Jc5";
   const withEnv = (env: Record<string, string | undefined>): void => {
     installer = new Installer(cfg, docker, registry, new McpProxy(cfg, docker, up.connector), undefined, env);
   };
@@ -318,12 +328,12 @@ describe("host environment variables", () => {
     docker.sdkBins = ["tool"];
     up.answer = true;
     up.answerIf = (launch) => launch.server.argv.join(" ") === "tool";
-    withEnv({ widget__API_KEY: VALUE, other__API_KEY: "nope" });
+    withEnv({ widget__API_KEY: SECRET_VALUE, other__API_KEY: "nope" });
     const record = await install();
     expect(up.launches.length).toBeGreaterThan(0);
-    for (const l of up.launches) expect(l.server.env).toEqual({ API_KEY: VALUE });
+    for (const l of up.launches) expect(l.server.env).toEqual({ API_KEY: SECRET_VALUE });
     expect(record.mcpServers).toEqual([{ name: "tool", argv: ["tool"], cwd: "/workspace/repo", env: {}, origin: "detected" }]);
-    expect(fs.readFileSync(path.join(dir, "registry.json"), "utf8")).not.toContain(VALUE);
+    expect(fs.readFileSync(path.join(dir, "registry.json"), "utf8")).not.toContain(SECRET_VALUE);
   });
 
   it("candidates: an unusable value fails the candidate with the message and the install still finishes ready", async () => {
@@ -375,8 +385,8 @@ describe("host environment variables", () => {
     it("decides ownership against every record in the registry, whatever its status, in either order", () => {
       registry.put({ ...record("a"), status: "failed" });
       registry.put({ ...record("a__b"), status: "installing" });
-      withEnv({ a__b__KEY: VALUE });
-      expect(installer.launchSpec(project("a__b"), stored).env).toEqual({ A: "1", B: "stored", KEY: VALUE });
+      withEnv({ a__b__KEY: SECRET_VALUE });
+      expect(installer.launchSpec(project("a__b"), stored).env).toEqual({ A: "1", B: "stored", KEY: SECRET_VALUE });
       expect(installer.launchSpec(project("a"), stored).env).toEqual({ A: "1", B: "stored" });
       expect(installer.hostVariableNames(project("a"))).toEqual([]);
       expect(installer.hostVariableNames(project("a__b"))).toEqual(["KEY"]);
@@ -392,7 +402,6 @@ describe("host environment variables", () => {
 });
 
 describe("refresh_mcp on a scripted sandbox", () => {
-  const VALUE = "hv-4Mk8Rt2Qz7Wn1Xb6Yc3Ld9Pa5Hs0Ve2";
   const apps: App[] = [];
   const lines: string[] = [];
   /** A launch that fails at once, as a server that exits at start-up does. */
@@ -407,7 +416,7 @@ describe("refresh_mcp on a scripted sandbox", () => {
     up.launches.push(launch);
     return dead();
   };
-  const hasKey = (launch: Launch) => launch.server.env.API_KEY === VALUE;
+  const hasKey = (launch: Launch) => launch.server.env.API_KEY === SECRET_VALUE;
   /** An App on the shared data directory: another one with other `env` stands in for a reconnect. */
   const appWith = (env: Record<string, string | undefined>, connector: Connector): App => {
     const a = new App({ cfg, docker, proxy: new McpProxy(cfg, docker, connector), env, log: (l) => lines.push(l) });
@@ -439,25 +448,25 @@ describe("refresh_mcp on a scripted sandbox", () => {
     expect(warning).toContain("connect_mcp_server");
 
     up.launches.length = 0;
-    const withKey = appWith({ widget__API_KEY: VALUE }, gated(hasKey));
+    const withKey = appWith({ widget__API_KEY: SECRET_VALUE }, gated(hasKey));
     const res = await withKey.callTool("refresh_mcp", { project: "widget" });
     expect(res.isError).toBe(false);
     expect(up.launches.length).toBeGreaterThan(0);
-    for (const l of up.launches) expect(l.server.env.API_KEY).toBe(VALUE);
+    for (const l of up.launches) expect(l.server.env.API_KEY).toBe(SECRET_VALUE);
     const p = withKey.registry.get("widget")!;
     expect(p.mcpServers).toEqual([{ name: "tool", argv: ["tool"], cwd: "/workspace/repo", env: {}, origin: "detected" }]);
     expect(p.tools.filter((t) => t.kind === "mcp").length).toBeGreaterThan(0);
     expect(withKey.listTools().map((t) => t.name)).toContain("widget__add");
     expect(text(res)).toContain("API_KEY");
-    expect(text(res)).not.toContain(VALUE);
-    expect(fs.readFileSync(path.join(dir, "registry.json"), "utf8")).not.toContain(VALUE);
-    for (const l of lines) expect(l).not.toContain(VALUE);
+    expect(text(res)).not.toContain(SECRET_VALUE);
+    expect(fs.readFileSync(path.join(dir, "registry.json"), "utf8")).not.toContain(SECRET_VALUE);
+    for (const l of lines) expect(l).not.toContain(SECRET_VALUE);
   });
 
   it("the reverse: a server that needs the variable is gone after a refresh without it, and that is an error", async () => {
     docker.sdkBins = ["tool", "multi"];
     const answers = (l: Launch) => l.server.argv[0] === "multi" || hasKey(l);
-    const withKey = appWith({ widget__API_KEY: VALUE }, gated(answers));
+    const withKey = appWith({ widget__API_KEY: SECRET_VALUE }, gated(answers));
     const installed = await installWith(withKey);
     expect(installed.mcpServers!.map((s) => s.name).sort()).toEqual(["multi", "tool"]);
 

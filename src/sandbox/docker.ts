@@ -25,7 +25,6 @@ export interface ExecOptions {
   stdin?: string;
   timeoutSec: number;
   maxBytes?: number;
-  env?: Record<string, string>;
   onOutput?: (chunk: string) => void;
   /**
    * Start the sandbox and run the command once more when the first attempt
@@ -341,7 +340,6 @@ export class Docker {
     const secs = Math.max(1, Math.floor(opts.timeoutSec));
     const args = ["exec", "-i"];
     if (opts.cwd) args.push("-w", opts.cwd);
-    for (const [k, v] of Object.entries(opts.env ?? {})) args.push("-e", `${k}=${v}`);
     args.push(container, "timeout", "-k", "5", String(secs), ...argv);
     const started = Date.now();
     const res = await this.docker(args, {

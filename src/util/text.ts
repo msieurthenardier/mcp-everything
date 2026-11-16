@@ -22,16 +22,3 @@ export function oneLine(text: string, max: number): string {
   const flat = cleanTerminalText(text).replace(/\s+/g, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
 }
-
-export function truncateMiddle(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  const head = Math.floor(maxChars * 0.6);
-  const tail = maxChars - head;
-  const dropped = text.length - maxChars;
-  return `${text.slice(0, head)}\n… [${dropped} characters truncated] …\n${text.slice(text.length - tail)}`;
-}
-
-/** POSIX single-quote escaping for the rare places a shell string is unavoidable. */
-export function shq(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}

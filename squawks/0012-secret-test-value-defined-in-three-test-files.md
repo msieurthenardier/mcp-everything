@@ -1,10 +1,10 @@
 # Squawk 0012: The secret test value is defined separately in three test files
 
-**Status**: open
+**Status**: completed
 **Type**: servicing
 **Severity**: routine
 **Reported**: 2026-11-15
-**Completed**: —
+**Completed**: 2026-11-16
 
 ## Report
 The tests [sortie 03](../sorties/03-mcp-env-passthrough/flight.md) added for "the value never appears" use a long value that cannot occur by accident. The same literal is declared in three test files, and a second one in a fourth place. The fake upstream those tests use is shared in `test/helpers.ts`; the value is not. Test-code debt noted in the sortie 03 [debrief](../sorties/03-mcp-env-passthrough/flight-debrief.md) by the Developer.
@@ -18,10 +18,12 @@ Export one value from `test/helpers.ts` and use it where the copies are. Tests o
 - `test/installer.test.ts:395` — `const VALUE = "hv-4Mk8Rt2Qz7Wn1Xb6Yc3Ld9Pa5Hs0Ve2";`, a different one in a second block.
 
 ## Corrective Action
-*(written at completion)*
+Added one export, `SECRET_VALUE`, to `test/helpers.ts` and removed the local `VALUE` constants from `test/server.test.ts`, `test/installer.test.ts` (both blocks) and `test/proxy.test.ts`, which now import it. One export is enough: the installer's two blocks are separate `describe`s that never share an assertion or fake, so the second block's distinct literal bought nothing. No assertion changed; no change to `src/`.
 
 ## Verification
-Expected: one definition; `npm test` passes with the same counts as before (340 passed, 16 skipped at the time of logging). If the second block needs a value distinct from the first, keep two named exports and say why.
+Ran `npx vitest run --testTimeout 20000`: 342 passed, 17 skipped (other squawks in this batch added tests since the 340/16 logged). `npm run typecheck` clean. A search of `test/` finds the literal once, in `test/helpers.ts`; the second literal no longer appears.
 
 ## Sign-Off
-*(written at completion)*
+**Reviewer**: independent Reviewer agent (Sonnet), batch review scoped to the diff
+**Verdict**: confirmed
+**Commit**: `squawk: turnaround 2026-11-16` (trailer `Squawks: 0008, 0009, 0010, 0011, 0012, 0014, 0015, 0016, 0017, 0018, 0019, 0020, 0021, 0022, 0023, 0024, 0025`) on branch `squawk/turnaround-2026-11-16`

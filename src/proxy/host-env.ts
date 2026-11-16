@@ -1,4 +1,4 @@
-import { ENV_NAME } from "./mcp-proxy.js";
+import { ENV_NAME, UNUSABLE_ENV_VALUE } from "./mcp-proxy.js";
 
 /**
  * Variables an operator sets on the mcp-everything process as `{slug}__{NAME}`
@@ -7,7 +7,6 @@ import { ENV_NAME } from "./mcp-proxy.js";
  */
 
 const SEPARATOR = "__";
-const BAD_VALUE = /[\r\n\u0000]/;
 
 export interface HostVariable {
   /** The name the server sees. */
@@ -60,7 +59,7 @@ export function isUnusableValueError(e: unknown): boolean {
 export function launchVariables(slug: string, slugs: Iterable<string>, env: Record<string, string | undefined>): Record<string, string> {
   const owned = ownedVariables(slug, slugs, env);
   for (const v of owned) {
-    if (BAD_VALUE.test(v.value)) {
+    if (UNUSABLE_ENV_VALUE.test(v.value)) {
       const error = new Error(`Environment variable ${v.full} contains a line break or NUL character and cannot be passed to the MCP server.`);
       unusable.add(error);
       throw error;

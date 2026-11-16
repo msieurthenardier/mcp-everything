@@ -49,6 +49,7 @@ const TOOLS_WARNING = "Tools: ";
 /** Handshake budget when merely probing whether a command is an MCP server. */
 const MCP_PROBE_SEC = 15;
 const MAX_MCP_PROBES = 6;
+const MAX_BUILD_WARNINGS = 20;
 
 // Returns the checkout to a pristine state before rebuilding on another image.
 const CLEAN_SCRIPT = `cd ${REPO_DIR} && git clean -xfdq && git checkout -q -- . ; rm -rf ${WORKSPACE}/target ${WORKSPACE}/build`;
@@ -249,6 +250,8 @@ export class Installer {
         });
         const text = `${res.stdout}\n${res.stderr}`;
         const warnings = [...text.matchAll(/^MCPE_WARN (.+)$/gm)].map((m) => cleanTerminalText(m[1]!).slice(0, 300));
+        const dropped = warnings.length - MAX_BUILD_WARNINGS;
+        if (dropped > 0) warnings.splice(MAX_BUILD_WARNINGS, dropped, `${dropped} more build warnings were dropped.`);
         const unhealthy = (res.code !== 0 && !res.timedOut) || /^MCPE_SOFT_FAIL$/m.test(text);
         const next = attempts[i + 1];
         if (unhealthy && next) {

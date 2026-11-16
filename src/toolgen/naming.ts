@@ -21,17 +21,22 @@ const GENERIC_NAMES = new Set([
   "api", "web", "www", "docs", "engine", "desktop", "mobile", "backend", "frontend", "monorepo", "platform",
 ]);
 
+/** Cut `value` to `n` characters without leaving a trailing `_`, so a following `_` never makes `__`. */
+function cut(value: string, n: number): string {
+  return value.slice(0, n).replace(/_+$/, "");
+}
+
 /** Stable short slug for a project, unique among `taken`. */
 export function makeSlug(repoName: string, owner: string, taken: (slug: string) => boolean): string {
   let name = sanitizeIdent(repoName) || "project";
   const ownerIdent = sanitizeIdent(owner);
-  if (GENERIC_NAMES.has(name) && ownerIdent && ownerIdent !== name) name = `${ownerIdent.slice(0, 12)}_${name}`;
-  const base = name.slice(0, 18).replace(/_+$/, "");
+  if (GENERIC_NAMES.has(name) && ownerIdent && ownerIdent !== name) name = `${cut(ownerIdent, 12)}_${name}`;
+  const base = cut(name, 18);
   if (!taken(base)) return base;
-  const withOwner = `${base.slice(0, 12)}_${sanitizeIdent(owner).slice(0, 5) || "x"}`;
+  const withOwner = `${cut(base, 12)}_${sanitizeIdent(owner).slice(0, 5) || "x"}`;
   if (!taken(withOwner)) return withOwner;
   for (let i = 2; ; i++) {
-    const candidate = `${base.slice(0, 14)}_${i}`;
+    const candidate = `${cut(base, 14)}_${i}`;
     if (!taken(candidate)) return candidate;
   }
 }

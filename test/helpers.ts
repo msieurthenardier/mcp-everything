@@ -135,3 +135,6 @@ export function fakeUpstream(): FakeUpstream {
   };
   return state;
 }
+
+/** A distinctive host-environment value; tests that assert it never leaks search for exactly this string. */
+export const SECRET_VALUE = "hv-7Qz3kLx9Vb2NmR8tYw4Pa6Ud1Fs0Jc5";
