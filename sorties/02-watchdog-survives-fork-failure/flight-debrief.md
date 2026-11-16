@@ -118,9 +118,9 @@ All observed with mission-control 1.2.3.
 5. **Decide at leg design where slow tests live**, with a stated time budget, instead of at review.
 
 ## Action Items
-- [ ] Squawk 0004 (logged, open): add to the `WATCHDOG_SCRIPT` comment that changes to the script or the sandbox images require `npm run test:docker:pressure`.
-- [ ] Squawk 0005 (logged, open): add the operator's rule to the Review prompt in `.flightops/agent-crews/leg-execution.md` (run the pressure cases when the watchdog script, its tests or the sandbox images are in the diff; otherwise not).
-- [ ] Squawk 0006 (logged, open): record in the README or beside the script the dash and busybox versions the guard was measured on.
+- [x] Squawk 0004 (completed 2026-11-15): add to the `WATCHDOG_SCRIPT` comment that changes to the script or the sandbox images require `npm run test:docker:pressure`.
+- [x] Squawk 0005 (completed 2026-11-15): add the operator's rule to the Review prompt in `.flightops/agent-crews/leg-execution.md` (run the pressure cases when the watchdog script, its tests or the sandbox images are in the diff; otherwise not).
+- [x] Squawk 0006 (completed 2026-11-15): record in the README or beside the script the dash and busybox versions the guard was measured on.
 - [ ] Needs a small design decision, so not a squawk: make `test:docker:pressure` fail when no case ran.
 - [ ] Later flight: a scheduled or pre-release run of the pressure cases, or CI; whether the redundant `starved` flag should stay; distinguishing fork-failure causes in the warning; shells other than dash and busybox; gVisor; behavior over long retry durations.
 - [x] Sortie 01's "never stopped mid-work" criterion re-assessed (above) and a follow-up note added to its debrief.
