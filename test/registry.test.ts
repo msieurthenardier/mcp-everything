@@ -103,6 +103,63 @@ describe("Registry", () => {
     expect(() => new Registry(dir).refresh()).toThrow(/unreadable/);
   });
 
+  describe("a registry file that is valid JSON but not a registry", () => {
+    const file = () => path.join(dir, "registry.json");
+    const UNREADABLE = /^Registry file \S+registry\.json is unreadable: /;
+    const leftovers = () => fs.readdirSync(dir).filter((n) => n.endsWith(".tmp") || n.endsWith(".lock"));
+
+    it.each(["[]", "7", '"x"', "null", "true"])("with %s at the top level is refused and lists nothing", (body) => {
+      fs.writeFileSync(file(), body);
+      const reg = new Registry(dir);
+      expect(thrown(() => reg.refresh())).toMatch(UNREADABLE);
+      expect(reg.list()).toEqual([]);
+    });
+
+    it("with [] at the top level is never rewritten by put, delete or update", () => {
+      fs.writeFileSync(file(), "[]");
+      const before = fs.readFileSync(file());
+      const reg = new Registry(dir);
+      const attempts = [() => reg.put(record("y")), () => reg.delete("x"), () => reg.update("x", (c) => c)];
+      for (const attempt of attempts) {
+        expect(thrown(attempt)).toMatch(UNREADABLE);
+        expect(fs.readFileSync(file()).equals(before)).toBe(true);
+        expect(leftovers()).toEqual([]);
+      }
+    });
+
+    it.each(['{"version":1,"projects":[]}', '{"version":1,"projects":"abc"}'])("with projects that is not an object, %s, is refused and left alone", (body) => {
+      fs.writeFileSync(file(), body);
+      const before = fs.readFileSync(file());
+      const reg = new Registry(dir);
+      expect(thrown(() => reg.refresh())).toMatch(/^Registry file \S+registry\.json is unreadable: .*projects/);
+      expect(thrown(() => reg.put(record("y")))).toMatch(UNREADABLE);
+      expect(reg.list()).toEqual([]);
+      expect(fs.readFileSync(file()).equals(before)).toBe(true);
+      expect(leftovers()).toEqual([]);
+    });
+
+    it.each(['{"version":1}', "{}"])("%s with no projects loads as an empty registry and accepts a put", (body) => {
+      fs.writeFileSync(file(), body);
+      const reg = new Registry(dir);
+      reg.refresh();
+      expect(reg.list()).toEqual([]);
+      reg.put(record("y"));
+      expect(JSON.parse(fs.readFileSync(file(), "utf8")).projects.y.slug).toBe("y");
+    });
+
+    it("keeps the records a running instance already holds when the file is replaced by []", () => {
+      const reg = new Registry(dir);
+      reg.put(record("held"));
+      const before = reg.list();
+      fs.writeFileSync(file(), "[]");
+      fs.utimesSync(file(), 1, 1);
+      expect(thrown(() => reg.refresh())).toMatch(UNREADABLE);
+      expect(reg.list()).toEqual(before);
+      expect(thrown(() => reg.refresh())).toMatch(UNREADABLE);
+      expect(reg.list()).toEqual(before);
+    });
+  });
+
   describe("a registry file with a version", () => {
     const file = () => path.join(dir, "registry.json");
     const NEWER = '{"version":2,"projects":{"x":{"slug":"x"}},"future":true}';
@@ -251,6 +308,58 @@ describe("Registry", () => {
       const fresh = new Registry(dir);
       fresh.refresh();
       expect(fresh.list().map((p) => p.slug)).toEqual(["x"]);
+    });
+  });
+
+  describe("releasing the lock", () => {
+    const lockFile = () => path.join(dir, "registry.json.lock");
+    // What a second holder does after taking the lock from a slow first one.
+    const takeOver = (content: string) => {
+      fs.rmSync(lockFile(), { force: true });
+      fs.writeFileSync(lockFile(), content, { mode: 0o600 });
+    };
+
+    it("removes the lock after put, delete and update", () => {
+      const reg = new Registry(dir);
+      reg.put(record("x"));
+      expect(fs.existsSync(lockFile())).toBe(false);
+      reg.update("x", (cur) => ({ ...cur!, network: true }));
+      expect(fs.existsSync(lockFile())).toBe(false);
+      reg.delete("x");
+      expect(fs.existsSync(lockFile())).toBe(false);
+    });
+
+    it("leaves a lock that another holder took over while this one was writing", () => {
+      const reg = new Registry(dir);
+      reg.put(record("x"));
+      reg.update("x", (cur) => {
+        takeOver("second holder");
+        return { ...cur!, network: true };
+      });
+      expect(fs.readFileSync(lockFile(), "utf8")).toBe("second holder");
+    });
+
+    it("does not throw or recreate a lock that someone else removed", () => {
+      const reg = new Registry(dir);
+      reg.put(record("x"));
+      expect(
+        reg.update("x", (cur) => {
+          fs.rmSync(lockFile());
+          return { ...cur!, network: true };
+        }),
+      ).toBe(true);
+      expect(fs.existsSync(lockFile())).toBe(false);
+    });
+
+    it("removes its own lock even when the file's mtime changed meanwhile", () => {
+      const reg = new Registry(dir);
+      reg.put(record("x"));
+      reg.update("x", (cur) => {
+        const old = new Date(Date.now() - 60_000);
+        fs.utimesSync(lockFile(), old, old);
+        return { ...cur!, network: true };
+      });
+      expect(fs.existsSync(lockFile())).toBe(false);
     });
   });
 });
