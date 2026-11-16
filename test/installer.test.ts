@@ -5,13 +5,14 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadConfig, type Config } from "../src/config.js";
 import { parseRepoRef } from "../src/forge/repo-ref.js";
-import { Installer } from "../src/install/installer.js";
+import { Installer, staleInstallLimitSec } from "../src/install/installer.js";
 import { McpProxy } from "../src/proxy/mcp-proxy.js";
 import type { Connector, Launch } from "../src/proxy/mcp-proxy.js";
 import { Registry } from "../src/registry.js";
 import { App } from "../src/server.js";
 import type { ExecOptions, ExecResult, ProbeData } from "../src/sandbox/docker.js";
-import { FakeDocker, fakeUpstream, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
+import { FakeDocker, fakeUpstream, record as seedRecord, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
+import type { ProjectRecord } from "../src/types.js";
 
 const TOOL_HELP = `Tool does things.
 
@@ -51,8 +52,44 @@ class ScriptedDocker extends FakeDocker {
     return this.images[this.images.length - 1] ?? "";
   }
 
-  override async assertAvailable(): Promise<void> {}
+  /** Make the clone step throw. */
+  probeError?: Error;
+  /** Throw from setNetwork on the given 1-based calls ("all" for every call). */
+  setNetworkFails: number[] | "all" = [];
+  removeContainerFails: number[] = [];
+  destroyFails: number[] | "all" = [];
+  private counts = { setNetwork: 0, removeContainer: 0, destroy: 0 };
+
+  private fail(which: keyof ScriptedDocker["counts"], when: number[] | "all"): void {
+    const n = ++this.counts[which];
+    if (when === "all" || when.includes(n)) throw new Error(`${which} failed (call ${n})`);
+  }
+  /** For the startup reconciliation: count, fail or hook the reachability check and the detach. */
+  availableCalls = 0;
+  unavailable = false;
+  onAvailable?: () => void;
+  onSetNetwork?: () => void;
+  override async setNetwork(container: string, enabled: boolean): Promise<void> {
+    this.onSetNetwork?.();
+    this.fail("setNetwork", this.setNetworkFails);
+    return super.setNetwork(container, enabled);
+  }
+  override async removeContainer(container: string): Promise<void> {
+    this.fail("removeContainer", this.removeContainerFails);
+    return super.removeContainer(container);
+  }
+  override async destroy(container: string): Promise<void> {
+    this.fail("destroy", this.destroyFails);
+    return super.destroy(container);
+  }
+
+  override async assertAvailable(): Promise<void> {
+    this.availableCalls++;
+    this.onAvailable?.();
+    if (this.unavailable) throw new Error("Docker CLI could not be run");
+  }
   override async probe(): Promise<ProbeData> {
+    if (this.probeError) throw this.probeError;
     return this.probeData;
   }
   override async ensureImage(image: string): Promise<void> {
@@ -499,5 +536,331 @@ describe("refresh_mcp on a scripted sandbox", () => {
     expect(warning).toContain("Environment variable widget__API_KEY contains a line break");
     expect(warning).not.toContain("refresh_mcp");
     expect(warning).not.toContain("SECRET-5");
+  });
+});
+
+describe("install failure paths", () => {
+  const lastNetwork = () => docker.network[docker.network.length - 1];
+  const destroys = () => docker.destroyed.filter((d) => d === "mcpe-widget");
+  const retryable = () => {
+    docker.repoFiles = { "package.json": pkg({ engines: { node: "^22.23.4 || ^24.22.1 || >=26.12.1" } }) };
+    docker.recipe = (image) => (image === "node:26" ? SOFT_FAIL : { stdout: "built\n" });
+  };
+
+  describe("no sandbox was created", () => {
+    it("leaves nothing when the clone fails", async () => {
+      docker.probeError = new Error("clone failed: not found");
+      const record = await install();
+      expect(record).toMatchObject({ status: "failed", error: "clone failed: not found" });
+      expect(registry.get("widget")).toBeUndefined();
+      // One destroy opens the install, a second is the rollback.
+      expect(destroys()).toHaveLength(2);
+      expect(docker.network).toEqual([]);
+    });
+
+    it("leaves nothing when the default image cannot be pulled", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      docker.missingImages.add("node:lts");
+      const record = await install();
+      expect(record).toMatchObject({ status: "failed", error: "Failed to pull image node:lts: not found" });
+      expect(registry.get("widget")).toBeUndefined();
+      expect(destroys()).toHaveLength(2);
+    });
+
+    it("drops the earlier record when a reinstall fails this way", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      expect((await install()).status).toBe("ready");
+      docker.probeError = new Error("clone failed: not found");
+      const record = await install({ reinstall: true });
+      expect(record.status).toBe("failed");
+      expect(registry.get("widget")).toBeUndefined();
+    });
+  });
+
+  describe("the sandbox is kept", () => {
+    it("takes it off the network when the recipe fails, also when network was requested", async () => {
+      docker.repoFiles = { ".nvmrc": "24", "package.json": pkg({}) };
+      docker.recipe = () => ({ code: 1, stderr: "boom\n" });
+      const record = await install({ network: true });
+      expect(record).toMatchObject({ status: "failed", network: false, error: "Install recipe for node exited with code 1." });
+      expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
+      expect(lastNetwork()).toEqual(["mcpe-widget", false]);
+    });
+
+    it("takes it off the network when the recipe times out, and names the limit", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      docker.recipe = () => ({ code: 124, timedOut: true });
+      const record = await install({ network: true, timeoutSec: 45 });
+      expect(record).toMatchObject({ status: "failed", network: false });
+      expect(record.error).toMatch(/^Install timed out after 45s/);
+      expect(registry.get("widget")?.network).toBe(false);
+      expect(lastNetwork()).toEqual(["mcpe-widget", false]);
+    });
+
+    it("takes it off the network when the second attempt's image cannot be pulled", async () => {
+      retryable();
+      docker.missingImages.add("node:24").add("node:lts");
+      const record = await install({ network: true });
+      expect(record).toMatchObject({ status: "failed", network: false, error: "Failed to pull image node:lts: not found" });
+      expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
+      expect(lastNetwork()).toEqual(["mcpe-widget", false]);
+    });
+
+    it("takes it off the network when removing the container for the second attempt fails", async () => {
+      retryable();
+      // The fake destroy does not remove, so call 1 is the second attempt's removal.
+      docker.removeContainerFails = [1];
+      const record = await install({ network: true });
+      expect(record).toMatchObject({ status: "failed", network: false, error: "removeContainer failed (call 1)" });
+      expect(lastNetwork()).toEqual(["mcpe-widget", false]);
+    });
+
+    it("takes it off the network when a step fails after the requested policy was applied", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      // Discovery swallows exec errors, so make the step itself throw.
+      (installer as unknown as { discover: () => Promise<void> }).discover = async () => {
+        throw new Error("discovery lost the daemon");
+      };
+      const record = await install({ network: true });
+      expect(record).toMatchObject({ status: "failed", network: false, error: "discovery lost the daemon" });
+      expect(docker.network).toEqual([
+        ["mcpe-widget", true],
+        ["mcpe-widget", false],
+      ]);
+      expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
+    });
+
+    it("keeps the thrown error when applying the policy fails, then records the sandbox off", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      docker.setNetworkFails = [1];
+      const record = await install({ network: true });
+      expect(record).toMatchObject({ status: "failed", network: false, error: "setNetwork failed (call 1)" });
+      expect(lastNetwork()).toEqual(["mcpe-widget", false]);
+    });
+
+    it("keeps the original error and records the network as on when it cannot be turned off", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      docker.recipe = () => ({ code: 1 });
+      docker.setNetworkFails = "all";
+      const record = await install({ network: true });
+      expect(record).toMatchObject({ status: "failed", network: true, error: "Install recipe for node exited with code 1." });
+      expect(record.warnings.filter((w) => w.includes("set_project_network"))).toHaveLength(1);
+      expect(record.warnings.join("\n")).toContain("could not be taken off the network");
+      expect(registry.get("widget")).toMatchObject({ status: "failed", network: true });
+    });
+
+    it("also keeps the original error when a throw is followed by a failed turn-off", async () => {
+      retryable();
+      docker.missingImages.add("node:24").add("node:lts");
+      docker.setNetworkFails = "all";
+      const record = await install();
+      expect(record).toMatchObject({ status: "failed", network: true, error: "Failed to pull image node:lts: not found" });
+      expect(record.warnings.join("\n")).toContain("set_project_network");
+    });
+  });
+
+  describe("success", () => {
+    it("leaves the sandbox attached and recorded on when network was requested", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      const record = await install({ network: true });
+      expect(record).toMatchObject({ status: "ready", network: true });
+      expect(docker.network).toEqual([["mcpe-widget", true]]);
+    });
+
+    it("leaves the sandbox detached and recorded off by default", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      const record = await install();
+      expect(record).toMatchObject({ status: "ready", network: false });
+      expect(docker.network).toEqual([["mcpe-widget", false]]);
+    });
+  });
+
+  describe("uninstall", () => {
+    it("rejects and keeps the entry when the sandbox cannot be destroyed", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      await install();
+      docker.destroyFails = "all";
+      await expect(installer.uninstall(registry.get("widget")!)).rejects.toThrow(/destroy failed/);
+      expect(registry.get("widget")).toBeDefined();
+    });
+  });
+});
+
+describe("stale installs at startup", () => {
+  const NOW = Date.parse("2026-11-16T12:00:00.000Z");
+  const limitMs = () => staleInstallLimitSec(cfg) * 1000;
+  const ago = (ms: number) => new Date(NOW - ms).toISOString();
+  const seed = (slug: string, over: Partial<ProjectRecord> = {}): ProjectRecord => {
+    const r = { ...seedRecord(slug), status: "installing" as const, network: true, installedAt: ago(limitMs() + 1000), ...over };
+    registry.put(r);
+    return r;
+  };
+  const file = () => path.join(dir, "registry.json");
+  const mtime = () => fs.statSync(file()).mtimeMs;
+  const other = () => new Registry(dir);
+
+  it("is seven hours by default and follows the install timeout", () => {
+    expect(staleInstallLimitSec(cfg)).toBe(7 * 3600);
+    expect(staleInstallLimitSec(loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_INSTALL_TIMEOUT: "3600" }))).toBe(7 * 3600);
+    expect(staleInstallLimitSec(loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_INSTALL_TIMEOUT: "10000" }))).toBe(2 * 10000 + 10800);
+  });
+
+  it("marks a stale record failed, takes its sandbox off the network and says why", async () => {
+    const r = seed("x", { errorLog: "old log" });
+    const log: string[] = [];
+    expect(await installer.reconcileStale(NOW, (l) => log.push(l))).toEqual(["x"]);
+    expect(docker.network).toEqual([["mcpe-x", false]]);
+    const stored = registry.get("x")!;
+    expect(stored).toMatchObject({ status: "failed", network: false });
+    expect(stored.error).toBe(
+      `Install was interrupted: it started at ${r.installedAt} and never finished. Reinstall with install_project(reinstall: true).`,
+    );
+    expect(stored.errorLog).toBeUndefined();
+    expect(log).toHaveLength(1);
+    expect(log[0]).toContain("x");
+  });
+
+  it("leaves a record one second under the limit, and one exactly at it, alone", async () => {
+    seed("under", { installedAt: ago(limitMs() - 1000) });
+    seed("at", { installedAt: ago(limitMs()) });
+    const before = mtime();
+    expect(await installer.reconcileStale(NOW)).toEqual([]);
+    expect(docker.network).toEqual([]);
+    expect(docker.availableCalls).toBe(0);
+    expect(mtime()).toBe(before);
+  });
+
+  it("leaves old ready and failed records, and unparsable or future times, alone", async () => {
+    seed("ready", { status: "ready" });
+    seed("failed", { status: "failed", error: "x" });
+    seed("junk", { installedAt: "not a date" });
+    seed("future", { installedAt: ago(-3600_000) });
+    const before = mtime();
+    expect(await installer.reconcileStale(NOW)).toEqual([]);
+    expect(docker.network).toEqual([]);
+    expect(docker.availableCalls).toBe(0);
+    expect(mtime()).toBe(before);
+  });
+
+  it("moves the limit with MCPE_INSTALL_TIMEOUT", async () => {
+    setup({ MCPE_INSTALL_TIMEOUT: "10000" });
+    seed("x", { installedAt: ago(limitMs() - 1000) });
+    expect(await installer.reconcileStale(NOW)).toEqual([]);
+    expect(docker.network).toEqual([]);
+  });
+
+  it("changes only the stale one of a stale and a fresh record", async () => {
+    seed("old");
+    const fresh = seed("new", { installedAt: ago(60_000) });
+    expect(await installer.reconcileStale(NOW)).toEqual(["old"]);
+    expect(docker.network).toEqual([["mcpe-old", false]]);
+    expect(registry.get("new")).toEqual(fresh);
+  });
+
+  it("changes nothing and logs once when Docker does not answer, and reconciles at a later start", async () => {
+    seed("a");
+    seed("b");
+    docker.unavailable = true;
+    const before = mtime();
+    const log: string[] = [];
+    expect(await installer.reconcileStale(NOW, (l) => log.push(l))).toEqual([]);
+    expect(log).toHaveLength(1);
+    expect(log[0]).toContain("2");
+    expect(docker.network).toEqual([]);
+    expect(mtime()).toBe(before);
+    expect(registry.get("a")?.status).toBe("installing");
+    docker.unavailable = false;
+    expect((await installer.reconcileStale(NOW)).sort()).toEqual(["a", "b"]);
+  });
+
+  it("records network: true with the warning when the detach fails, and still reconciles the others", async () => {
+    seed("a");
+    seed("b");
+    docker.setNetworkFails = [1];
+    expect((await installer.reconcileStale(NOW)).sort()).toEqual(["a", "b"]);
+    const failed = registry.list().filter((p) => p.network);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ status: "failed", network: true });
+    expect(failed[0]!.warnings.filter((w) => w.includes("set_project_network"))).toHaveLength(1);
+    const ok = registry.list().find((p) => !p.network)!;
+    expect(ok).toMatchObject({ status: "failed", network: false, warnings: [] });
+  });
+
+  it("skips a record that another process replaced while Docker was being asked", async () => {
+    seed("x");
+    const newer = { ...seedRecord("x"), status: "installing" as const, network: true, installedAt: ago(1000) };
+    docker.onAvailable = () => other().put(newer);
+    expect(await installer.reconcileStale(NOW)).toEqual([]);
+    expect(docker.network).toEqual([]);
+    expect(registry.get("x")).toEqual(newer);
+  });
+
+  it("skips a record another process finished or removed while Docker was being asked", async () => {
+    seed("done");
+    seed("gone");
+    docker.onAvailable = () => {
+      const o = other();
+      o.refresh();
+      o.put({ ...o.get("done")!, status: "ready" });
+      o.delete("gone");
+    };
+    expect(await installer.reconcileStale(NOW)).toEqual([]);
+    expect(docker.network).toEqual([]);
+    expect(registry.get("done")?.status).toBe("ready");
+    expect(registry.get("gone")).toBeUndefined();
+  });
+
+  it("keeps a field another process changed during the detach", async () => {
+    seed("x");
+    const selection = { mode: "all" } as unknown as ProjectRecord["selection"];
+    docker.onSetNetwork = () => {
+      const o = other();
+      o.refresh();
+      o.put({ ...o.get("x")!, selection });
+    };
+    expect(await installer.reconcileStale(NOW)).toEqual(["x"]);
+    expect(registry.get("x")).toMatchObject({ status: "failed", network: false, selection });
+  });
+
+  it("writes nothing when the record was replaced during the detach", async () => {
+    seed("x");
+    const newer = { ...seedRecord("x"), status: "installing" as const, network: true, installedAt: ago(1000) };
+    docker.onSetNetwork = () => other().put(newer);
+    const log: string[] = [];
+    expect(await installer.reconcileStale(NOW, (l) => log.push(l))).toEqual([]);
+    expect(registry.get("x")).toEqual(newer);
+    const written = mtime();
+    expect(other().refresh()).toBe(true);
+    expect(mtime()).toBe(written);
+  });
+
+  it("does not rewrite the file when the record changed during the detach", async () => {
+    seed("x");
+    let after = 0;
+    docker.onSetNetwork = () => {
+      const o = other();
+      o.refresh();
+      o.put({ ...o.get("x")!, status: "ready" });
+      after = mtime();
+    };
+    expect(await installer.reconcileStale(NOW)).toEqual([]);
+    expect(mtime()).toBe(after);
+    expect(registry.get("x")?.status).toBe("ready");
+  });
+
+  it("appends its warning to the warnings the record has now", async () => {
+    seed("x", { warnings: ["old"] });
+    docker.setNetworkFails = "all";
+    docker.onSetNetwork = () => {
+      const o = other();
+      o.refresh();
+      o.put({ ...o.get("x")!, warnings: ["old", "added by a neighbor"] });
+    };
+    expect(await installer.reconcileStale(NOW)).toEqual(["x"]);
+    const w = registry.get("x")!.warnings;
+    expect(w.slice(0, 2)).toEqual(["old", "added by a neighbor"]);
+    expect(w).toHaveLength(3);
+    expect(w[2]).toContain("set_project_network");
+    expect(registry.get("x")).toMatchObject({ status: "failed", network: true });
   });
 });

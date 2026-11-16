@@ -87,7 +87,8 @@ commit.
 3. **Build.** A long-lived sandbox container runs a fixed recipe for that
    build system, with network access so dependencies can be downloaded.
 4. **Go offline.** The sandbox is disconnected from the network unless you
-   passed `network: true`.
+   passed `network: true`. A failed install always leaves the sandbox
+   offline, whatever `network` was; use `set_project_network` to go online.
 5. **Discover.** Executables the build produced are collected: console
    scripts of the installed Python distribution, `bin` entries of
    `package.json` (including workspace packages), Cargo and Go binaries,
@@ -394,6 +395,11 @@ What it does not do:
     of servers that need it when it next runs discovery (including
     `discover_tools`, `connect_mcp_server` and `refresh_mcp`), until a process
     that has it refreshes again.
+  - At startup, an install left unfinished for more than seven hours (by
+    default) is marked failed and its sandbox is taken off the network. If
+    Docker is not reachable, this waits for the next start. Until it is marked
+    failed, `project_info` says the install was started by another session or
+    was interrupted.
 - **License is reported, not enforced.** The license found in the repository
   is shown at install time with a warning when none is found; the server does
   not verify that a repository is open source.

@@ -34,14 +34,14 @@ jobs:
       - name: Unit tests
         run: npm test -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest.json"
 
-      # 396 tests pass as of 2026-11-16. Vitest already fails when no test file
+      # 447 tests pass as of 2026-11-16. Vitest already fails when no test file
       # matches, so this catches a suite that was mostly skipped or excluded.
       # Raise the floor as the suite grows.
       - name: Minimum passed tests
         run: |
           node -e '
             const fs = require("fs");
-            const floor = 350;
+            const floor = 430;
             let n;
             try {
               n = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/vitest.json", "utf8")).numPassedTests;

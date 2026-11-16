@@ -36,6 +36,31 @@ export interface InstallParams {
 
 export type Logger = (line: string) => void;
 
+/**
+ * How long an `installing` record may say so before it is taken to belong to
+ * no live install: two build attempts at the longest recipe limit (a caller's
+ * timeout_seconds is clamped to 7200, the environment default is not), plus
+ * three hours for the clone, image pulls and discovery, which add up to well
+ * under one with default settings. Seven hours by default.
+ *
+ * Several processes share one registry, and a record carries no owner, so age
+ * is all that tells a dead install from a neighbor's live one. The rule does
+ * not cover an install in which every step runs to its limit, a neighbor
+ * process whose MCPE_INSTALL_TIMEOUT is larger than ours, or a wall clock that
+ * jumped forward. In those cases the live install's own final write restores
+ * its record.
+ */
+export function staleInstallLimitSec(cfg: Config): number {
+  return 2 * Math.max(7200, cfg.installTimeoutSec) + 10800;
+}
+
+function isStaleInstall(record: ProjectRecord, now: number, cfg: Config): boolean {
+  if (record.status !== "installing") return false;
+  const started = Date.parse(record.installedAt);
+  if (Number.isNaN(started) || started > now) return false;
+  return now - started > staleInstallLimitSec(cfg) * 1000;
+}
+
 const COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
 const COMMAND_PATH = /^\/[A-Za-z0-9._+/-]{1,200}$/;
 const MAX_COMMANDS = 12;
@@ -265,21 +290,22 @@ export class Installer {
         break;
       }
 
-      // From here on the project's code only runs with the network policy the
-      // caller asked for (off unless requested).
-      const wantNetwork = params.network === true;
-      await this.docker.setNetwork(container, wantNetwork);
-      record.network = wantNetwork;
-
       if (res.code !== 0) {
         record.status = "failed";
         record.error = res.timedOut
           ? `Install timed out after ${timeoutSec}s.`
           : `Install recipe for ${record.primary} exited with code ${res.code}.`;
         record.errorLog = tail.toString().slice(-2500);
+        await this.takeOffline(record);
         this.registry.put(record);
         return record;
       }
+
+      // From here on the project's code only runs with the network policy the
+      // caller asked for (off unless requested).
+      const wantNetwork = params.network === true;
+      await this.docker.setNetwork(container, wantNetwork);
+      record.network = wantNetwork;
 
       log("Discovering commands and generating tools…");
       await this.discover(record, []);
@@ -290,6 +316,7 @@ export class Installer {
       record.status = "failed";
       record.error = e instanceof Error ? e.message : String(e);
       if (sandboxCreated) {
+        await this.takeOffline(record);
         this.registry.put(record);
       } else {
         // Nothing usable exists (bad repository, clone or image failure):
@@ -298,6 +325,79 @@ export class Installer {
         this.registry.delete(slug);
       }
       return record;
+    }
+  }
+
+  /**
+   * Mark as failed every record that has said `installing` for longer than an
+   * install can run, and take its sandbox off the network. Returns the slugs
+   * it changed. Nothing is changed when Docker does not answer, so a later
+   * start tries again. Never destroys anything.
+   */
+  async reconcileStale(now: number = Date.now(), log: Logger = () => {}): Promise<string[]> {
+    this.registry.refresh();
+    const stale = this.registry.list().filter((r) => isStaleInstall(r, now, this.cfg));
+    if (stale.length === 0) return [];
+    try {
+      await this.docker.assertAvailable();
+    } catch (e) {
+      log(`${stale.length} interrupted install(s) not reconciled, Docker is not reachable: ${(e as Error).message.split("\n")[0]}`);
+      return [];
+    }
+    const changed: string[] = [];
+    for (const { slug, installedAt } of stale) {
+      try {
+        // The reachability check and earlier detaches take a while; another
+        // process may have finished, replaced or removed this install since.
+        this.registry.refresh();
+        const current = this.registry.get(slug);
+        if (!current || current.status !== "installing" || current.installedAt !== installedAt) continue;
+        // A reinstall started after this check could still have its new
+        // container detached; with no owner in the record that window (one
+        // Docker round trip) cannot be closed. Its own final write and
+        // setNetwork restore the record and the policy.
+        const copy: ProjectRecord = { ...current, warnings: [...current.warnings] };
+        await this.takeOffline(copy);
+        const added = copy.warnings.slice(current.warnings.length);
+        // A detach that already ran is not undone if this write is skipped:
+        // the record then still says installing and the sandbox is offline,
+        // which is harmless, and the next start tries again.
+        const wrote = this.registry.update(slug, (locked) => {
+          if (!locked || locked.status !== "installing" || locked.installedAt !== installedAt) return undefined;
+          return {
+            ...locked,
+            status: "failed",
+            error: `Install was interrupted: it started at ${installedAt} and never finished. Reinstall with install_project(reinstall: true).`,
+            errorLog: undefined,
+            network: copy.network,
+            warnings: [...locked.warnings, ...added],
+          };
+        });
+        if (wrote) {
+          changed.push(slug);
+          log(`${slug}: marked failed, its install was interrupted (started ${installedAt})`);
+        }
+      } catch (e) {
+        log(`${slug}: not reconciled: ${(e as Error).message.split("\n")[0]}`);
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * After a failed install the kept sandbox must not stay online, whatever the
+   * caller asked for. Never throws: the record says what is known.
+   */
+  private async takeOffline(record: ProjectRecord): Promise<void> {
+    try {
+      await this.docker.setNetwork(record.container, false);
+      record.network = false;
+    } catch (e) {
+      const reason = (e instanceof Error ? e.message : String(e)).split("\n")[0];
+      record.network = true;
+      record.warnings.push(
+        `The sandbox could not be taken off the network after the failed install (${reason}); it may still be online. Turn it off with set_project_network.`,
+      );
     }
   }
 
@@ -376,6 +476,7 @@ export class Installer {
     if (server.origin !== "registered") {
       throw new Error(`"${name}" was detected automatically and would be found again; uninstall the project to remove it.`);
     }
+    await this.requireSandbox(project);
     await this.proxy.closeProject(project.container);
     const record: ProjectRecord = {
       ...project,
@@ -383,8 +484,7 @@ export class Installer {
       warnings: [...project.warnings],
     };
     await this.discover(record, []);
-    this.registry.put(record);
-    return record;
+    return this.finish(record);
   }
 
   /**

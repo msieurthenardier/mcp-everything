@@ -1,6 +1,6 @@
 # Flight: Install Failure and Interruption Paths
 
-**Status**: ready
+**Status**: in-flight
 **Mission**: [Maintenance](../../mission.md)
 
 ## Contributing to Criteria
@@ -28,7 +28,7 @@ N/A — maintenance flight. Two points that leg design must settle are stated un
 - Provenance: the multi-process sharing is read from `src/registry.ts`, not tested by this inspection.
 
 ### Prerequisites
-- [ ] Flight 01 landed, so this work is checked on its pull request (preferred, not required).
+- [x] Flight 01 landed, so this work is checked on its pull request (preferred, not required).
 
 ### Pre-Flight Checklist
 - N/A — maintenance flights skip Pre-Flight.
@@ -61,10 +61,10 @@ N/A — maintenance flight. Two points that leg design must settle are stated un
 Out of scope here: extracting anything from `Installer`, the wording of the two "sandbox gone" messages, and how discovery treats exec errors. They are carried in the report (findings 13 and 14, and known debt).
 
 ### Checkpoints
-- [ ] A failed install is shown, by unit test and by one Docker assertion, to leave the sandbox off the network.
-- [ ] A stale `installing` record is reconciled at startup; a fresh one is left alone.
-- [ ] Shutdown exits within its deadline with a hung close, and a second signal is ignored.
-- [ ] `disconnectMcp` on a missing sandbox reports the sandbox as gone and leaves the record as it was.
+- [x] A failed install is shown, by unit test and by one Docker assertion, to leave the sandbox off the network.
+- [x] A stale `installing` record is reconciled at startup; a fresh one is left alone.
+- [x] Shutdown exits within its deadline with a hung close, and a second signal is ignored.
+- [x] `disconnectMcp` on a missing sandbox reports the sandbox as gone and leaves the record as it was.
 
 ### Adaptation Criteria
 
@@ -82,20 +82,20 @@ Out of scope here: extracting anything from `Installer`, the wording of the two 
 
 > **Note:** These are tentative suggestions, not commitments. Legs are planned and created one at a time as the flight progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] `network-off-on-failed-install` - Network off and recorded when an install fails; stale `installing` records reconciled at startup (4a)
-- [ ] `install-failure-tests` - Unit cases for the rollback, timeout and uninstall branches; one Docker assertion (4b)
-- [ ] `bounded-shutdown` - Shutdown deadline and re-entry guard (4c)
-- [ ] `disconnect-mcp-guard` - `requireSandbox` and `finish()` in `disconnectMcp`, with the reproduction first (4d)
+- [x] `network-off-on-failed-install` - A failed install ends off the network and recorded so; unit cases for every failure branch of `install` and for `uninstall`; one Docker assertion (4a, first half; 4b)
+- [x] `reconcile-stale-installs` - Stale `installing` records reconciled at startup (4a, second half)
+- [x] `bounded-shutdown` - Shutdown deadline and re-entry guard (4c)
+- [x] `disconnect-mcp-guard` - `requireSandbox` and `finish()` in `disconnectMcp`, with the reproduction first; the hosted check's test floor raised (4d)
 
 ---
 
 ## Post-Flight
 
 ### Completion Checklist
-- [ ] All legs completed
+- [x] All legs completed
 - [ ] Code merged
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Tests passing
+- [x] Documentation updated
 
 ### Verification
 `npm test` and `npm run typecheck` pass, with new cases for each of 4a to 4d. `npm run test:docker` passes, including the new assertion that a failed install leaves no attached network. By hand, once: start an install with a build that fails, then `docker inspect` the sandbox and confirm it has no network and `project_info` agrees. The README's statement about the network after installation needs no change if the behavior now matches it; if the failure advice text changes, the README's troubleshooting text follows. The hosted check added by flight 01 does not run the Docker suite and will be green without it: run `npm run test:docker` locally before the pull request is marked ready, and record the result in the flight log. In the leg that adds tests, raise the minimum passed-test count in `.github/workflows/ci.yml` to stay close under the new total.

@@ -61,7 +61,7 @@ const META_TOOLS: MetaTool[] = [
   {
     name: "install_project",
     description:
-      'Clone a GitHub/GitLab repository into a fresh Docker sandbox, build it, discover its executables and generate one MCP tool per command and subcommand (named "<slug>__<command>"). Building runs the project\'s own install scripts inside the sandbox with network access; afterwards the sandbox is offline unless network is true. Can take minutes; if it outlives wait_seconds, poll project_info.',
+      'Clone a GitHub/GitLab repository into a fresh Docker sandbox, build it, discover its executables and generate one MCP tool per command and subcommand (named "<slug>__<command>"). Building runs the project\'s own install scripts inside the sandbox with network access; afterwards the sandbox is offline unless network is true (a failed install always leaves it offline). Can take minutes; if it outlives wait_seconds, poll project_info.',
     inputSchema: {
       type: "object",
       properties: {
@@ -70,7 +70,7 @@ const META_TOOLS: MetaTool[] = [
           description: 'Repository: "owner/name" (GitHub), "github:owner/name", "gitlab:group/name", or an https URL.',
         },
         ref: { type: "string", description: "Branch, tag or commit to install (default: default branch)." },
-        network: { type: "boolean", description: "Keep outbound network enabled after install (default false)." },
+        network: { type: "boolean", description: "Keep outbound network enabled after a successful install (default false; a failed install is always left offline)." },
         ecosystem: { type: "string", enum: ECOSYSTEMS, description: "Override the detected build system." },
         image: { type: "string", description: "Override the Docker image used for the sandbox." },
         submodules: { type: "boolean", description: "Also clone git submodules (default false)." },
@@ -353,6 +353,8 @@ export class App {
   private readonly log: (line: string) => void;
   private readonly jobs = new Map<string, Job>();
   private watcher?: NodeJS.Timeout;
+  /** The startup reconciliation of stale installs; never rejects. */
+  reconciling?: Promise<void>;
 
   constructor(opts: AppOptions) {
     this.cfg = opts.cfg;
@@ -394,6 +396,13 @@ export class App {
     } catch (e) {
       this.log(`registry: ${(e as Error).message}`);
     }
+    // Not awaited and not waited for at shutdown: it may take a minute when
+    // Docker is slow. Only startup reconciles; a record another process is
+    // still installing is not stale.
+    this.reconciling ??= this.installer
+      .reconcileStale(Date.now(), this.log)
+      .then(() => {})
+      .catch((e) => this.log(`reconcile: ${(e as Error).message}`));
     this.watcher = setInterval(() => {
       try {
         if (this.registry.refresh()) void this.server.sendToolListChanged().catch(() => {});

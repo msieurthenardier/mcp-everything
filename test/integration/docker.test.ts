@@ -329,6 +329,43 @@ describe.skipIf(!enabled)("docker integration: rebuilding on another image", () 
   }, 600_000);
 });
 
+/** Real Docker, except that the build step records the network and then throws. */
+class ThrowsInBuild extends Docker {
+  attachedDuringBuild?: boolean;
+  override async exec(container: string, argv: string[], opts: ExecOptions): Promise<ExecResult> {
+    if (argv[0] === "sh" && argv[2]?.includes("soft_fail()")) {
+      this.attachedDuringBuild = await this.hasNetwork(container);
+      throw new Error("simulated failure in the build step");
+    }
+    return super.exec(container, argv, opts);
+  }
+}
+
+describe.skipIf(!enabled)("docker integration: a failed install", () => {
+  it("leaves the sandbox off the network even when network was requested", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-netoff-"));
+    const cfg = loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: `${prefix}netoff-` });
+    const docker = new ThrowsInBuild(cfg);
+    const registry = new Registry(dir);
+    const installer = new Installer(cfg, docker, registry, new McpProxy(cfg, docker));
+    try {
+      // The recipe never runs, so the image only has to start.
+      const record = await installer.install({
+        repo: parseRepoRef("tomnomnom/gron", cfg.hosts),
+        network: true,
+        image: cfg.docker.probeImage,
+      });
+      expect(docker.attachedDuringBuild).toBe(true);
+      expect(record).toMatchObject({ status: "failed", network: false, error: "simulated failure in the build step" });
+      expect(await docker.hasNetwork(record.container)).toBe(false);
+      expect(registry.get(record.slug)).toMatchObject({ status: "failed", network: false });
+    } finally {
+      for (const p of registry.list()) await installer.uninstall(p);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+});
+
 /**
  * Idle stopping with a 6 s timeout (poll 1 s): a sandbox stops between 6 and
  * about 9 s after its last activity. "Never stopped" means .State.StartedAt is
