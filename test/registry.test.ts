@@ -13,6 +13,18 @@ afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// The message of what fn throws, so assertions can anchor on the whole string.
+const thrown = (fn: () => unknown): string => {
+  try {
+    fn();
+  } catch (e) {
+    return (e as Error).message;
+  }
+  throw new Error("expected the call to throw");
+};
+// \S+ cannot span a space, so a message rewrapped as "... is unreadable: Registry file ..." does not match.
+const NEWER_VERSION = /^Registry file \S+registry\.json was written by a newer version of mcp-everything \(format 2; this build reads format 1\)\. /;
+
 describe("Registry", () => {
   it("starts empty and persists records with private permissions", () => {
     const reg = new Registry(path.join(dir, "nested"));
@@ -91,6 +103,100 @@ describe("Registry", () => {
     expect(() => new Registry(dir).refresh()).toThrow(/unreadable/);
   });
 
+  describe("a registry file with a version", () => {
+    const file = () => path.join(dir, "registry.json");
+    const NEWER = '{"version":2,"projects":{"x":{"slug":"x"}},"future":true}';
+    const leftovers = () => fs.readdirSync(dir).filter((n) => n.endsWith(".tmp") || n.endsWith(".lock"));
+
+    it("newer than this build is refused with a message that says what to do", () => {
+      fs.writeFileSync(file(), NEWER);
+      const reg = new Registry(dir);
+      const message = thrown(() => reg.refresh());
+      expect(message).toMatch(NEWER_VERSION);
+      expect(message).not.toMatch(/unreadable/);
+      expect(() => reg.refresh()).toThrow(/left untouched.*[Uu]pgrade mcp-everything.*[Mm]oving the file aside.*empty registry.*sandboxes.*stay in Docker/s);
+      expect(reg.list()).toEqual([]);
+    });
+
+    it("newer than this build is never rewritten by put, delete or update", () => {
+      fs.writeFileSync(file(), NEWER);
+      const before = fs.readFileSync(file());
+      const reg = new Registry(dir);
+      const attempts = [() => reg.put(record("y")), () => reg.delete("x"), () => reg.update("x", (c) => c)];
+      for (const attempt of attempts) {
+        const message = thrown(attempt);
+        expect(message).toMatch(NEWER_VERSION);
+        expect(message).not.toMatch(/unreadable/);
+        expect(fs.readFileSync(file()).equals(before)).toBe(true);
+        expect(leftovers()).toEqual([]);
+      }
+      expect(fs.readdirSync(dir)).toEqual(["registry.json"]);
+    });
+
+    it("is refused again on an unchanged file, and loaded once replaced by one this build reads", () => {
+      fs.writeFileSync(file(), NEWER);
+      const reg = new Registry(dir);
+      expect(thrown(() => reg.refresh())).toMatch(NEWER_VERSION);
+      expect(thrown(() => reg.refresh())).toMatch(NEWER_VERSION);
+      fs.writeFileSync(file(), JSON.stringify({ version: 1, projects: { x: record("x") } }));
+      fs.utimesSync(file(), 1, 1);
+      expect(reg.refresh()).toBe(true);
+      expect(reg.get("x")).toBeDefined();
+    });
+
+    it("newer keeps the records a running instance already holds", () => {
+      const reg = new Registry(dir);
+      reg.put(record("held"));
+      const before = reg.list();
+      fs.writeFileSync(file(), NEWER);
+      fs.utimesSync(file(), 1, 1);
+      expect(thrown(() => reg.refresh())).toMatch(NEWER_VERSION);
+      expect(reg.list()).toEqual(before);
+      expect(thrown(() => reg.refresh())).toMatch(NEWER_VERSION);
+      expect(reg.list()).toEqual(before);
+    });
+
+    it("missing loads as before", () => {
+      fs.writeFileSync(file(), JSON.stringify({ projects: { x: record("x") } }));
+      const reg = new Registry(dir);
+      expect(reg.refresh()).toBe(true);
+      expect(reg.get("x")).toBeDefined();
+    });
+
+    it("1 loads as before, including written as 1.0", () => {
+      fs.writeFileSync(file(), `{"version":1.0,"projects":${JSON.stringify({ x: record("x") })}}`);
+      const reg = new Registry(dir);
+      expect(reg.refresh()).toBe(true);
+      expect(reg.get("x")).toBeDefined();
+    });
+
+    it.each([
+      ["0", "0"],
+      ["-1", "-1"],
+      ["1.5", "1.5"],
+      ["2.5", "2.5"],
+      ['"1"', '"1"'],
+      ['"2"', '"2"'],
+      ["null", "null"],
+      ["true", "true"],
+      ['{"a":1}', '{"a":1}'],
+      ["[]", "[]"],
+      ["1e999", "Infinity"],
+    ])(
+      "%s is refused as unsupported and left untouched",
+      (value, shown) => {
+        const text = `{"version":${value},"projects":{}}`;
+        fs.writeFileSync(file(), text);
+        const reg = new Registry(dir);
+        expect(thrown(() => reg.refresh())).toBe(`Registry file ${file()} is unreadable: unsupported version ${shown}`);
+        expect(() => reg.put(record("y"))).toThrow(/unsupported version/);
+        expect(fs.readFileSync(file(), "utf8")).toBe(text);
+        expect(leftovers()).toEqual([]);
+        expect(reg.list()).toEqual([]);
+      },
+    );
+  });
+
   describe("update", () => {
     const mtime = () => fs.statSync(path.join(dir, "registry.json")).mtimeMs;
 
@@ -146,5 +252,136 @@ describe("Registry", () => {
       fresh.refresh();
       expect(fresh.list().map((p) => p.slug)).toEqual(["x"]);
     });
+  });
+});
+
+describe("Registry.sweepTemps", () => {
+  const NOW = 1_800_000_000_000;
+  const HOUR = 3600;
+  /** Writes a file in the data directory whose modification time is `ageSec` before NOW. */
+  const put = (name: string, ageSec: number, body = "{}") => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, body);
+    const t = NOW / 1000 - ageSec;
+    fs.utimesSync(file, t, t);
+    return file;
+  };
+  afterEach(() => vi.restoreAllMocks());
+
+  it("removes a matching temp file more than an hour old and counts it", () => {
+    const old = put("registry.json.4242.tmp", HOUR + 1);
+    const log: string[] = [];
+    expect(new Registry(dir).sweepTemps(NOW, (l) => log.push(l))).toBe(1);
+    expect(fs.existsSync(old)).toBe(false);
+    expect(log).toEqual([]);
+  });
+
+  it("leaves a matching file at or under the bound, and every other name", () => {
+    const keep = [
+      put("registry.json.4242.tmp", HOUR),
+      put("registry.json.77.tmp", 5),
+      put("registry.json", 10 * HOUR),
+      put("registry.json.lock", 10 * HOUR),
+      put("registry.json.tmp", 10 * HOUR),
+      put("registry.json..tmp", 10 * HOUR),
+      put("registry.json.12a.tmp", 10 * HOUR),
+      put("registry.json.12.tmp.bak", 10 * HOUR),
+      put("x.registry.json.12.tmp", 10 * HOUR),
+    ];
+    expect(new Registry(dir).sweepTemps(NOW)).toBe(0);
+    for (const f of keep) expect(fs.existsSync(f)).toBe(true);
+  });
+
+  it("leaves a directory and a symbolic link with a matching name, and the link's target", () => {
+    const old = NOW / 1000 - 10 * HOUR;
+    const sub = path.join(dir, "registry.json.1.tmp");
+    fs.mkdirSync(sub);
+    fs.utimesSync(sub, old, old);
+    const target = put("elsewhere", 10 * HOUR, "keep");
+    const link = path.join(dir, "registry.json.2.tmp");
+    fs.symlinkSync(target, link);
+    expect(new Registry(dir).sweepTemps(NOW)).toBe(0);
+    expect(fs.statSync(sub).isDirectory()).toBe(true);
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(target, "utf8")).toBe("keep");
+  });
+
+  it.each([["missing", undefined], ["corrupt", "{ nope"]])(
+    "does not read or write registry.json, which is %s",
+    (_state, content) => {
+      const file = path.join(dir, "registry.json");
+      if (content !== undefined) {
+        fs.writeFileSync(file, content);
+        fs.utimesSync(file, NOW / 1000 - 5 * HOUR, NOW / 1000 - 5 * HOUR);
+      }
+      const before = content === undefined ? undefined : { bytes: fs.readFileSync(file, "utf8"), mtimeMs: fs.statSync(file).mtimeMs };
+      put("registry.json.9.tmp", 2 * HOUR);
+      const reads = vi.spyOn(fs, "readFileSync");
+      expect(new Registry(dir).sweepTemps(NOW)).toBe(1);
+      expect(reads).not.toHaveBeenCalled();
+      if (before) expect({ bytes: fs.readFileSync(file, "utf8"), mtimeMs: fs.statSync(file).mtimeMs }).toEqual(before);
+      else expect(fs.existsSync(file)).toBe(false);
+    },
+  );
+
+  it("returns at once and leaves the lock file alone while another instance holds it", () => {
+    const lockFile = path.join(dir, "registry.json.lock");
+    fs.writeFileSync(lockFile, "");
+    const before = fs.statSync(lockFile).mtimeMs;
+    const old = put("registry.json.4242.tmp", 2 * HOUR);
+    const wait = vi.spyOn(Atomics, "wait");
+    expect(new Registry(dir).sweepTemps(NOW)).toBe(1);
+    expect(wait).not.toHaveBeenCalled();
+    expect(fs.existsSync(old)).toBe(false);
+    expect(fs.statSync(lockFile).mtimeMs).toBe(before);
+  });
+
+  it("does not create the data directory when it is missing, and does not throw", () => {
+    const missing = path.join(dir, "nested");
+    expect(new Registry(missing).sweepTemps(NOW)).toBe(0);
+    expect(fs.existsSync(missing)).toBe(false);
+  });
+
+  it("logs the directory and returns 0 when it cannot be listed", () => {
+    const asFile = path.join(dir, "a-file");
+    fs.writeFileSync(asFile, "x");
+    const log: string[] = [];
+    expect(new Registry(asFile).sweepTemps(NOW, (l) => log.push(l))).toBe(0);
+    expect(log).toHaveLength(1);
+    expect(log[0]).toContain(asFile);
+  });
+
+  it("logs a failure by file name, still examines the rest, and ignores a file that has gone", () => {
+    const first = put("registry.json.1.tmp", 2 * HOUR);
+    const gone = put("registry.json.2.tmp", 2 * HOUR);
+    const last = put("registry.json.3.tmp", 2 * HOUR);
+    const real = fs.unlinkSync;
+    vi.spyOn(fs, "unlinkSync").mockImplementation((p) => {
+      if (p === first) throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      if (p === gone) {
+        real(p);
+        throw Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" });
+      }
+      return real(p);
+    });
+    const log: string[] = [];
+    expect(new Registry(dir).sweepTemps(NOW, (l) => log.push(l))).toBe(1);
+    expect(fs.existsSync(first)).toBe(true);
+    expect(fs.existsSync(last)).toBe(false);
+    expect(log).toHaveLength(1);
+    expect(log[0]).toContain("registry.json.1.tmp");
+  });
+
+  it("leaves put, delete and update as they were", () => {
+    const reg = new Registry(dir);
+    reg.put(record("a"));
+    put("registry.json.5.tmp", 2 * HOUR);
+    reg.sweepTemps(NOW);
+    reg.put(record("b"));
+    expect(reg.update("a", (cur) => ({ ...cur!, network: true }))).toBe(true);
+    reg.delete("b");
+    const fresh = new Registry(dir);
+    fresh.refresh();
+    expect(fresh.list().map((p) => [p.slug, p.network])).toEqual([["a", true]]);
   });
 });

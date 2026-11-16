@@ -148,6 +148,13 @@ implemented in this flight. Evaluate against:
 4. Tests — coverage, meaningful assertions, no regressions
 5. Artifacts — flight log updated for every leg, leg statuses correct
 
+For each new or changed test, name the change to the source that would make it
+fail. Where that is not obvious from reading, try it: note `git diff --stat`,
+make the change, run the test, undo the change by editing (never with git: the
+flight's work is uncommitted), and check `git diff --stat` is what it was. Report
+every test you could not make fail. Reading alone has missed assertions that
+cannot fail in two flights running.
+
 `npm run test:docker` skips two slow fork-pressure cases; `npm run test:docker:pressure`
 runs them. Run it once, and only if the changes under review touch the sandbox
 watchdog script (`WATCHDOG_SCRIPT` in `src/sandbox/docker.ts`), the fork-pressure cases

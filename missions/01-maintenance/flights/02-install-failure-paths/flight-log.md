@@ -172,3 +172,8 @@ Filled in at the debrief. During the flight these were recorded only in the Flig
 - The Developer re-ran both suites at `77dc425`: unit 447 passed, 18 skipped, 1.64 s; Docker 16 passed, 2 skipped, 154.5 s, with per-case times recorded for the first time.
 - From the debrief: the Deviations section above was filled in; flight 03 (still `ready`) gained a note on startup work with several processes on one data directory; four squawk candidates are put to the operator.
 - The operator confirmed the four squawk candidates, the status change and the commit: squawks 0029 to 0032 logged as `open`, `routine`; flight set to `completed`; the debrief committed to this branch so it is part of pull request #10.
+
+### 2026-11-16 — after the merge (Flight Director)
+- The operator merged pull request #10 (`661db3e`) with the debrief on it. The check ran on the push to `main` (run 43931795421, success). Mission criterion 2 and this flight's "Code merged" are checked off; the two artifact edits are committed with flight 03.
+- The debrief's recommendation 3 (ownership of a registry record) is logged as [sortie 04](../../../../sorties/04-ownership-on-a-shared-machine/flight.md), at the operator's request, for after this mission.
+

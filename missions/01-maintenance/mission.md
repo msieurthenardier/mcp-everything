@@ -11,13 +11,13 @@ The first routine-maintenance inspection, run after sorties 01 to 03, assessed t
 This mission takes the bounded Action Required findings: 7, 4, 5, 6a, and the Advisory 6d that shares a flight with 6a. It does **not** take:
 
 - **Finding 1a** (the README says the agent never sees variable values). It is squawk [0014](../../squawks/0014-readme-says-the-agent-never-sees-variable-values.md), severity grounding, and should be completed before this mission starts.
-- **Findings 1b, 2 and 3** (who may read a project's variables, what a slug identifies, who owns a sandbox). They need design and go to one sortie after this mission, with squawk 0008. Flight 03's tests are the net that sortie will rely on.
+- **Findings 1b, 2 and 3** (who may read a project's variables, what a slug identifies, who owns a sandbox). They need design and go to one sortie after this mission, with squawk 0008. Logged on 2026-11-16 as [sortie 04](../../sorties/04-ownership-on-a-shared-machine/flight.md), with the operator's wider scope (several agentic systems on one machine). Flight 03's tests are the net that sortie will rely on.
 - **Eleven Advisory findings** logged as squawks 0015 to 0025, for a turnaround.
 - **The structure of `installer.ts` and `server.ts`.** The Architect advised against refactoring before the design sortie changes the launch path. Flight 02 touches `disconnectMcp` only as far as its finding requires.
 
 ## Success Criteria
 - [x] Every pull request and every push to `main` runs install, typecheck, unit tests and build on a hosted runner, and `engines`, the README and a Node version file state the same Node floor (finding 7).
-- [ ] After an install fails or is interrupted, the project's sandbox is off the network, its record says so, and the record does not stay `installing`; shutdown cannot hang; `disconnectMcp` does not store an emptied record when the sandbox is gone; the install failure branches have unit tests (finding 4).
+- [x] After an install fails or is interrupted, the project's sandbox is off the network, its record says so, and the record does not stay `installing`; shutdown cannot hang; `disconnectMcp` does not store an emptied record when the sandbox is gone; the install failure branches have unit tests (finding 4).
 - [ ] A test fails if a variable's value appears in the command line of a proxied launch or if the env file is not private, and env files left by a crash are removed at startup (finding 5).
 - [ ] A registry file written by a newer version is refused with a clear message and never rewritten (finding 6a).
 - [ ] Registry temp files left by a crash are removed at startup (finding 6d).
@@ -47,4 +47,4 @@ N/A
 
 - [x] Flight 1: [CI gate](flights/01-ci-gate/flight.md) — the Tier A check, the Node floor, Dependabot (finding 7). First, so the others land under it.
 - [x] Flight 2: [Install failure and interruption paths](flights/02-install-failure-paths/flight.md) — finding 4.
-- [ ] Flight 3: [Local state hygiene and secret hand-off tests](flights/03-local-state-and-secret-handoff-tests/flight.md) — findings 5, 6a, 6d.
+- [x] Flight 3: [Local state hygiene and secret hand-off tests](flights/03-local-state-and-secret-handoff-tests/flight.md) — findings 5, 6a, 6d.

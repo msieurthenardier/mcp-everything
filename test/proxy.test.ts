@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, type Config } from "../src/config.js";
-import { dockerConnector, McpProxy, validateEnv } from "../src/proxy/mcp-proxy.js";
+import { dockerConnector, McpProxy, sweepEnvFiles, validateEnv } from "../src/proxy/mcp-proxy.js";
 import type { McpServerSpec } from "../src/types.js";
 import { FakeDocker, fakeUpstream, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
 
@@ -171,11 +171,202 @@ describe("dockerConnector", () => {
     expect(fs.existsSync(envFile)).toBe(false);
   });
 
+  it("keeps the env file directory private and the value out of the docker client's own environment", () => {
+    const name = "MCPE_TEST_HANDOFF_VAR";
+    expect(process.env[name]).toBeUndefined();
+    const conn = dockerConnector(cfg)({
+      container: "mcpe-x",
+      server: spec({ env: { [name]: "handoff-value-1" } }),
+      pidFile: "/tmp/p.pid",
+    });
+    const params = (conn.transport as unknown as { _serverParams: { env: Record<string, string> } })._serverParams;
+    expect(fs.statSync(path.join(dir, "tmp")).mode & 0o777).toBe(0o700);
+    expect(Object.keys(params.env)).not.toContain(name);
+    expect(Object.values(params.env)).not.toContain("handoff-value-1");
+    conn.cleanup?.();
+  });
+
+  it("throws on a value the env file cannot carry and leaves no file behind", () => {
+    expect(() =>
+      dockerConnector(cfg)({ container: "mcpe-x", server: spec({ env: { A: "one\nB=injected" } }), pidFile: "/tmp/p.pid" }),
+    ).toThrow(/line breaks/);
+    expect(fs.readdirSync(path.join(dir, "tmp"))).toEqual([]);
+  });
+
   it("creates no env file when there is no environment", () => {
     const conn = dockerConnector(cfg)({ container: "mcpe-x", server: spec(), pidFile: "/tmp/p.pid" });
     const params = (conn.transport as unknown as { _serverParams: { args: string[] } })._serverParams;
     expect(params.args).not.toContain("--env-file");
     expect(fs.existsSync(path.join(dir, "tmp"))).toBe(false);
+  });
+});
+
+describe("a real env file taken through McpProxy", () => {
+  const tmpDir = () => path.join(dir, "tmp");
+  const withEnv = () => spec({ env: { API_KEY: "s3cret" } });
+  /** The real connector for the env file and its cleanup, the in-memory upstream for the conversation. */
+  const hybrid = (seen: Array<{ exists: boolean; mode: number }>, onFile?: (file: string) => void) => (launch: Parameters<typeof up.connector>[0]) => {
+    const real = dockerConnector(cfg)(launch);
+    const file = (real.transport as unknown as { _serverParams: { args: string[] } })._serverParams.args;
+    const envFile = file[file.indexOf("--env-file") + 1]!;
+    const fake = up.connector(launch);
+    const look = () => {
+      const exists = fs.existsSync(envFile);
+      seen.push({ exists, mode: exists ? fs.statSync(envFile).mode & 0o777 : 0 });
+    };
+    const upstream = up.servers[up.servers.length - 1];
+    if (upstream) upstream.oninitialized = look;
+    else look();
+    onFile?.(envFile);
+    return { transport: fake.transport, stderr: fake.stderr, cleanup: real.cleanup };
+  };
+
+  it("exists with mode 0600 while the handshake runs and is gone after a launch that succeeds", async () => {
+    const seen: Array<{ exists: boolean; mode: number }> = [];
+    proxy = new McpProxy(cfg, docker, hybrid(seen));
+    await proxy.listTools("c1", withEnv(), 5);
+    expect(seen).toEqual([{ exists: true, mode: 0o600 }]);
+    expect(fs.readdirSync(tmpDir())).toEqual([]);
+  });
+
+  it("exists with mode 0600 when the connector returns and is gone after a launch that fails", async () => {
+    const seen: Array<{ exists: boolean; mode: number }> = [];
+    up.answer = false;
+    docker.stateResult = "running";
+    proxy = new McpProxy(cfg, docker, hybrid(seen));
+    await expect(proxy.listTools("c1", withEnv(), 0.05)).rejects.toThrow(/did not start/);
+    expect(seen).toEqual([{ exists: true, mode: 0o600 }]);
+    expect(fs.readdirSync(tmpDir())).toEqual([]);
+  });
+});
+
+describe("sweepEnvFiles", () => {
+  const NOW = 1_800_000_000_000;
+  const HOUR = 3600;
+  const tmpDir = () => path.join(dir, "tmp");
+  const HEX = "0123456789abcdef";
+  /** Writes a file under tmp whose modification time is `ageSec` before NOW. */
+  const put = (name: string, ageSec: number, body = "API_KEY=s3cret\n") => {
+    fs.mkdirSync(tmpDir(), { recursive: true, mode: 0o700 });
+    const file = path.join(tmpDir(), name);
+    fs.writeFileSync(file, body);
+    const t = NOW / 1000 - ageSec;
+    fs.utimesSync(file, t, t);
+    return file;
+  };
+  afterEach(() => vi.restoreAllMocks());
+
+  it("removes a matching file older than the bound and counts it", () => {
+    const old = put(`env-${HEX}`, HOUR + 1);
+    const log: string[] = [];
+    expect(sweepEnvFiles(cfg, NOW, (l) => log.push(l))).toBe(1);
+    expect(fs.existsSync(old)).toBe(false);
+    expect(log).toEqual([]);
+  });
+
+  it("leaves a matching file at or under the bound", () => {
+    const atBound = put(`env-${HEX}`, HOUR);
+    const fresh = put("env-fedcba9876543210", 5);
+    expect(sweepEnvFiles(cfg, NOW)).toBe(0);
+    expect(fs.existsSync(atBound)).toBe(true);
+    expect(fs.existsSync(fresh)).toBe(true);
+  });
+
+  it("scales the bound with a long startup timeout", () => {
+    const slow = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_MCP_STARTUP_TIMEOUT: "3600" });
+    const young = put(`env-${HEX}`, 7200);
+    const old = put("env-fedcba9876543210", 7201);
+    expect(sweepEnvFiles(slow, NOW)).toBe(1);
+    expect(fs.existsSync(young)).toBe(true);
+    expect(fs.existsSync(old)).toBe(false);
+  });
+
+  it.each([
+    ["15 hex digits", "env-0123456789abcde"],
+    ["17 hex digits", "env-0123456789abcdef0"],
+    ["uppercase hex", "env-0123456789ABCDEF"],
+    ["a suffix", "env-0123456789abcdef.bak"],
+    ["a prefix", "x-env-0123456789abcdef"],
+    ["a non-hex digit", "env-0123456789abcdeg"],
+  ])("leaves a file whose name has %s", (_why, name) => {
+    const file = put(name, 10 * HOUR);
+    expect(sweepEnvFiles(cfg, NOW)).toBe(0);
+    expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it("leaves a directory and a symbolic link with a matching name, and the link's target", () => {
+    fs.mkdirSync(tmpDir(), { recursive: true, mode: 0o700 });
+    const old = NOW / 1000 - 10 * HOUR;
+    const sub = path.join(tmpDir(), `env-${HEX}`);
+    fs.mkdirSync(sub);
+    fs.utimesSync(sub, old, old);
+    const target = path.join(dir, "elsewhere");
+    fs.writeFileSync(target, "keep");
+    fs.utimesSync(target, old, old);
+    const link = path.join(tmpDir(), "env-fedcba9876543210");
+    fs.symlinkSync(target, link);
+    expect(sweepEnvFiles(cfg, NOW)).toBe(0);
+    expect(fs.statSync(sub).isDirectory()).toBe(true);
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(target, "utf8")).toBe("keep");
+  });
+
+  it("touches nothing outside tmp", () => {
+    const outside = path.join(dir, `env-${HEX}`);
+    fs.writeFileSync(outside, "x");
+    const old = NOW / 1000 - 10 * HOUR;
+    fs.utimesSync(outside, old, old);
+    put("unrelated", 10 * HOUR);
+    expect(sweepEnvFiles(cfg, NOW)).toBe(0);
+    expect(fs.existsSync(outside)).toBe(true);
+  });
+
+  it("does not create tmp when it is missing, and does not throw", () => {
+    expect(sweepEnvFiles(cfg, NOW)).toBe(0);
+    expect(fs.existsSync(tmpDir())).toBe(false);
+  });
+
+  it("logs the directory and returns 0 when it cannot be listed", () => {
+    fs.writeFileSync(tmpDir(), "not a directory");
+    const log: string[] = [];
+    expect(sweepEnvFiles(cfg, NOW, (l) => log.push(l))).toBe(0);
+    expect(log).toHaveLength(1);
+    expect(log[0]).toContain(tmpDir());
+  });
+
+  it("logs a failure by file name and still examines the rest", () => {
+    const first = put(`env-${HEX}`, 2 * HOUR);
+    const second = put("env-fedcba9876543210", 2 * HOUR);
+    const real = fs.unlinkSync;
+    vi.spyOn(fs, "unlinkSync").mockImplementation((p) => {
+      if (p === first) throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      return real(p);
+    });
+    const log: string[] = [];
+    expect(sweepEnvFiles(cfg, NOW, (l) => log.push(l))).toBe(1);
+    expect(fs.existsSync(first)).toBe(true);
+    expect(fs.existsSync(second)).toBe(false);
+    expect(log).toHaveLength(1);
+    expect(log[0]).toContain(path.basename(first));
+  });
+
+  it("ignores a file that has gone, and never reads or logs contents", () => {
+    const gone = put(`env-${HEX}`, 2 * HOUR, "API_KEY=do-not-log\n");
+    const other = put("env-fedcba9876543210", 2 * HOUR, "API_KEY=do-not-log\n");
+    const real = fs.unlinkSync;
+    vi.spyOn(fs, "unlinkSync").mockImplementation((p) => {
+      if (p === gone) {
+        real(p);
+        throw Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" });
+      }
+      return real(p);
+    });
+    const reads = vi.spyOn(fs, "readFileSync");
+    const log: string[] = [];
+    expect(sweepEnvFiles(cfg, NOW, (l) => log.push(l))).toBe(1);
+    expect(fs.existsSync(other)).toBe(false);
+    expect(reads).not.toHaveBeenCalled();
+    expect(log).toEqual([]);
   });
 });
 

@@ -4,7 +4,7 @@
 **Mission**: [Maintenance](../../mission.md)
 
 ## Contributing to Criteria
-- [ ] After an install fails or is interrupted, the project's sandbox is off the network, its record says so, and the record does not stay `installing`; shutdown cannot hang; `disconnectMcp` does not store an emptied record when the sandbox is gone; the install failure branches have unit tests (finding 4).
+- [x] After an install fails or is interrupted, the project's sandbox is off the network, its record says so, and the record does not stay `installing`; shutdown cannot hang; `disconnectMcp` does not store an emptied record when the sandbox is gone; the install failure branches have unit tests (finding 4).
 
 ---
 
@@ -93,7 +93,7 @@ Out of scope here: extracting anything from `Installer`, the wording of the two 
 
 ### Completion Checklist
 - [x] All legs completed
-- [ ] Code merged
+- [x] Code merged
 - [x] Tests passing
 - [x] Documentation updated
 

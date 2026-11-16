@@ -4,7 +4,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { parseProbeOutput } from "../src/sandbox/docker.js";
 import { App } from "../src/server.js";
@@ -833,6 +833,8 @@ describe("host environment variables for proxied MCP servers", () => {
     await a.callTool("demo__demo_build", {});
     await a.callTool("sandbox_exec", { project: "demo", command: "env" });
     expect(docker.calls.length).toBeGreaterThanOrEqual(2);
+    // Covers Docker.exec calls (command line tools and sandbox_exec); the arguments of a
+    // proxied launch are covered in test/proxy.test.ts.
     expect(JSON.stringify(docker.calls.map((c) => ({ argv: c.argv, opts: c.opts })))).not.toContain(SECRET_VALUE);
     // Presence: a proxied call for the same project launches with it.
     await a.callTool("demo__whoami", {});
@@ -1107,7 +1109,7 @@ describe("host environment variables for proxied MCP servers", () => {
   });
 });
 
-describe("reconciling stale installs at startup", () => {
+describe("startup work: sweeps and stale installs", () => {
   class Reachable extends FakeDocker {
     override async assertAvailable(): Promise<void> {}
   }
@@ -1119,7 +1121,7 @@ describe("reconciling stale installs at startup", () => {
     local = new App({ cfg, docker: fake, proxy: new McpProxy(cfg, fake, up.connector) });
   });
   afterEach(async () => {
-    await local.reconciling;
+    await local.startup;
     await local.shutdown();
   });
   const mtime = () => fs.statSync(path.join(dir, "registry.json")).mtimeMs;
@@ -1127,7 +1129,7 @@ describe("reconciling stale installs at startup", () => {
   it("marks a stale installing record failed", async () => {
     local.registry.put({ ...record("old"), status: "installing", network: true });
     local.start();
-    await local.reconciling;
+    await local.startup;
     expect(local.registry.get("old")).toMatchObject({ status: "failed", network: false });
     expect(fake.network).toEqual([["mcpe-old", false]]);
   });
@@ -1137,7 +1139,7 @@ describe("reconciling stale installs at startup", () => {
     local.registry.put(fresh);
     const before = mtime();
     local.start();
-    await local.reconciling;
+    await local.startup;
     expect(local.registry.get("new")).toEqual(fresh);
     expect(mtime()).toBe(before);
     expect(fake.network).toEqual([]);
@@ -1146,9 +1148,119 @@ describe("reconciling stale installs at startup", () => {
   it("never rejects, and a second start does not begin a second reconciliation", async () => {
     local.registry.put({ ...record("old"), status: "installing", network: true });
     local.start();
-    const first = local.reconciling;
+    const first = local.startup;
     local.start();
-    expect(local.reconciling).toBe(first);
+    expect(local.startup).toBe(first);
     await expect(first).resolves.toBeUndefined();
+  });
+
+  describe("sweeps", () => {
+    const NOW = Date.now();
+    const HEX = "0123456789abcdef";
+    /** An env file and a registry temp file, each aged `ageSec` seconds. */
+    const leftovers = (suffix: string, ageSec: number) => {
+      fs.mkdirSync(path.join(dir, "tmp"), { recursive: true, mode: 0o700 });
+      const envFile = path.join(dir, "tmp", `env-${suffix}`);
+      const regTmp = path.join(dir, `registry.json.${suffix.length}${ageSec}.tmp`);
+      const t = (NOW - ageSec * 1000) / 1000;
+      for (const f of [envFile, regTmp]) {
+        fs.writeFileSync(f, "x");
+        fs.utimesSync(f, t, t);
+      }
+      return { envFile, regTmp };
+    };
+    const logged = (log: string[]) => {
+      const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir });
+      fake = new Reachable(cfg);
+      local = new App({ cfg, docker: fake, proxy: new McpProxy(cfg, fake, up.connector), log: (l) => log.push(l) });
+    };
+    afterEach(() => vi.restoreAllMocks());
+
+    it("have removed old files and kept fresh ones when start returns; the reconciliation follows", async () => {
+      const log: string[] = [];
+      logged(log);
+      const old = leftovers(HEX, 2 * 3600);
+      const fresh = leftovers("fedcba9876543210", 10);
+      local.registry.put({ ...record("stale"), status: "installing", network: true });
+      local.start();
+      expect(fs.existsSync(old.envFile)).toBe(false);
+      expect(fs.existsSync(old.regTmp)).toBe(false);
+      expect(fs.existsSync(fresh.envFile)).toBe(true);
+      expect(fs.existsSync(fresh.regTmp)).toBe(true);
+      expect(log).toEqual(["startup: removed 1 leftover env file", "startup: removed 1 leftover registry temp file"]);
+      await local.startup;
+      expect(local.registry.get("stale")).toMatchObject({ status: "failed", network: false });
+    });
+
+    it("log nothing when nothing was removed", async () => {
+      const log: string[] = [];
+      logged(log);
+      leftovers(HEX, 10);
+      local.start();
+      await local.startup;
+      expect(log).toEqual([]);
+    });
+
+    it("run once per App: a second start sweeps nothing and the field holds the same promise", async () => {
+      local.start();
+      const first = local.startup;
+      const again = leftovers(HEX, 2 * 3600);
+      local.start();
+      expect(local.startup).toBe(first);
+      expect(fs.existsSync(again.envFile)).toBe(true);
+      expect(fs.existsSync(again.regTmp)).toBe(true);
+      await first;
+    });
+
+    it("do not stop each other: a throwing registry sweep is logged and the rest still run", async () => {
+      const log: string[] = [];
+      logged(log);
+      vi.spyOn(local.registry, "sweepTemps").mockImplementation(() => {
+        throw new Error("boom");
+      });
+      const old = leftovers(HEX, 2 * 3600);
+      local.registry.put({ ...record("stale"), status: "installing", network: true });
+      local.start();
+      await local.startup;
+      expect(fs.existsSync(old.envFile)).toBe(false);
+      expect(log).toContain("startup: registry temp file sweep failed: boom");
+      expect(local.registry.get("stale")).toMatchObject({ status: "failed" });
+    });
+
+    it("run when the registry file is corrupt", async () => {
+      const log: string[] = [];
+      logged(log);
+      fs.writeFileSync(path.join(dir, "registry.json"), "{ nope");
+      const old = leftovers(HEX, 2 * 3600);
+      local.start();
+      await expect(local.startup).resolves.toBeUndefined();
+      expect(fs.existsSync(old.envFile)).toBe(false);
+      expect(fs.existsSync(old.regTmp)).toBe(false);
+      expect(log.some((l) => l.startsWith("registry: "))).toBe(true);
+    });
+
+    it("run when the registry file is from a newer version, which every tool call then reports", async () => {
+      const log: string[] = [];
+      logged(log);
+      const text = '{"version":2,"projects":{}}';
+      fs.writeFileSync(path.join(dir, "registry.json"), text);
+      const old = leftovers(HEX, 2 * 3600);
+      local.start();
+      await expect(local.startup).resolves.toBeUndefined();
+      expect(fs.existsSync(old.envFile)).toBe(false);
+      expect(fs.existsSync(old.regTmp)).toBe(false);
+      expect(log.some((l) => /^registry: Registry file \S+ was written by a newer version/.test(l))).toBe(true);
+      expect(log.some((l) => /^reconcile: Registry file \S+ was written by a newer version/.test(l))).toBe(true);
+      const res = await local.callTool("list_projects", {});
+      expect(res.isError).toBe(true);
+      expect(body(res)).toMatch(/^Error: Registry file \S+ was written by a newer version/);
+      expect(log.some((l) => l.includes("newer version") && !l.startsWith("registry: ") && !l.startsWith("reconcile: "))).toBe(true);
+      expect(fs.readFileSync(path.join(dir, "registry.json"), "utf8")).toBe(text);
+    });
+
+    it("are not waited for by shutdown", async () => {
+      local.start();
+      await expect(local.shutdown()).resolves.toBeUndefined();
+    });
   });
 });

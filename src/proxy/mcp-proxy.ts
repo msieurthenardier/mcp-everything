@@ -68,6 +68,44 @@ const LAUNCH_SCRIPT = 'echo $$ > "$0" && exec "$@"';
 const KILL_SCRIPT =
   'p=$(cat "$1" 2>/dev/null) || exit 0; rm -f "$1"; pkill -TERM -P "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; exit 0';
 
+/** The one shape of an env file's name; the writer and the sweep both use it. */
+const ENV_FILE_NAME = /^env-[0-9a-f]{16}$/;
+const newEnvFileName = (): string => `env-${randomBytes(8).toString("hex")}`;
+
+/**
+ * Removes env files a crash left in `<dataDir>/tmp`. A live file lasts at most
+ * one startup timeout plus about 12 seconds, so a file older than the larger of
+ * an hour and twice that timeout cannot be in use. This does not cover a
+ * neighbor process started with a much larger timeout, or a clock that jumped
+ * forward; in both the cost is one failed launch. Only regular files with the
+ * exact name are touched; contents are never read. Returns how many it removed.
+ */
+export function sweepEnvFiles(cfg: Config, now = Date.now(), log: (line: string) => void = () => {}): number {
+  const dir = path.join(cfg.dataDir, "tmp");
+  const maxAgeMs = Math.max(3600, 2 * cfg.mcpStartupTimeoutSec) * 1000;
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") log(`env files: could not list ${dir}: ${describeError(e)}`);
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!ENV_FILE_NAME.test(name)) continue;
+    const file = path.join(dir, name);
+    try {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || now - stat.mtimeMs <= maxAgeMs) continue;
+      fs.unlinkSync(file);
+      removed++;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") log(`env files: could not remove ${name}: ${describeError(e)}`);
+    }
+  }
+  return removed;
+}
+
 /** The real connector: `docker exec -i <container> <server argv>` over stdio. */
 export function dockerConnector(cfg: Config): Connector {
   return ({ container, server, pidFile }) => {
@@ -80,7 +118,7 @@ export function dockerConnector(cfg: Config): Connector {
       // mcp-everything's whole environment, prefixed variables included (below).
       const dir = path.join(cfg.dataDir, "tmp");
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      envFile = path.join(dir, `env-${randomBytes(8).toString("hex")}`);
+      envFile = path.join(dir, newEnvFileName());
       const lines = Object.entries(validateEnv(server.env)).map(([k, v]) => `${k}=${v}\n`);
       fs.writeFileSync(envFile, lines.join(""), { mode: 0o600 });
       args.push("--env-file", envFile);

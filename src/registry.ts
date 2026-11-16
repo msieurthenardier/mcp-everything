@@ -2,8 +2,24 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ProjectRecord } from "./types.js";
 
+// A write takes milliseconds, so a temp file this old was left by a writer that
+// died between its write and its rename. The sweep does not take the registry
+// lock: the lock can be taken from a live writer anyway, and waiting for it
+// blocks the event loop. Not covered: a writer stopped for more than an hour
+// between its write and its rename, whose rename then fails.
+const TEMP_MAX_AGE_MS = 60 * 60 * 1000;
+const REGISTRY_FILE = "registry.json";
+const TEMP_PREFIX = `${REGISTRY_FILE}.`;
+const TEMP_SUFFIX = ".tmp";
+// One definition of the temp file's name, for the writer and for the sweep.
+const tempName = (pid: number) => `${TEMP_PREFIX}${pid}${TEMP_SUFFIX}`;
+const isTempName = (name: string) =>
+  name.startsWith(TEMP_PREFIX) && name.endsWith(TEMP_SUFFIX) && /^\d+$/.test(name.slice(TEMP_PREFIX.length, name.length - TEMP_SUFFIX.length));
+
+const REGISTRY_VERSION = 1;
+
 interface RegistryFile {
-  version: 1;
+  version: typeof REGISTRY_VERSION;
   projects: Record<string, ProjectRecord>;
 }
 
@@ -18,7 +34,7 @@ export class Registry {
   private mtimeMs = -1;
 
   constructor(private readonly dir: string) {
-    this.file = path.join(dir, "registry.json");
+    this.file = path.join(dir, REGISTRY_FILE);
   }
 
   /** Reload from disk if another process changed the file. Returns true if it did. */
@@ -36,12 +52,29 @@ export class Registry {
       return true;
     }
     if (stat.mtimeMs === this.mtimeMs) return false;
+    let parsed: RegistryFile;
+    let version: unknown;
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.file, "utf8")) as RegistryFile;
-      this.projects = new Map(Object.entries(parsed.projects ?? {}));
+      parsed = JSON.parse(fs.readFileSync(this.file, "utf8")) as RegistryFile;
+      version = (parsed as { version?: unknown }).version;
     } catch (e) {
       throw new Error(`Registry file ${this.file} is unreadable: ${(e as Error).message}`);
     }
+    // Checked before anything is assigned, and every write refreshes first, so a
+    // file from a newer build is neither loaded nor rewritten by this one.
+    if (version !== undefined && version !== REGISTRY_VERSION) {
+      if (typeof version === "number" && Number.isInteger(version) && version > REGISTRY_VERSION) {
+        throw new Error(
+          `Registry file ${this.file} was written by a newer version of mcp-everything (format ${version}; this build reads format ${REGISTRY_VERSION}). ` +
+            `The file is left untouched. Upgrade mcp-everything. Moving the file aside starts this build with an empty registry, ` +
+            `but the sandboxes of the projects in it stay in Docker and are no longer listed.`,
+        );
+      }
+      // JSON.stringify(Infinity) is "null", which would misreport what the file held.
+      const shown = typeof version === "number" && !Number.isFinite(version) ? String(version) : JSON.stringify(version);
+      throw new Error(`Registry file ${this.file} is unreadable: unsupported version ${shown}`);
+    }
+    this.projects = new Map(Object.entries(parsed.projects ?? {}));
     this.mtimeMs = stat.mtimeMs;
     return true;
   }
@@ -82,9 +115,37 @@ export class Registry {
     }
   }
 
+  /**
+   * Removes temp files a crashed writer left beside the registry. Touches no
+   * lock and neither reads nor writes registry.json. Returns how many it removed.
+   */
+  sweepTemps(now = Date.now(), log: (line: string) => void = () => {}): number {
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.dir);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") log(`registry temp files: could not list ${this.dir}: ${(e as Error).message}`);
+      return 0;
+    }
+    let removed = 0;
+    for (const name of names) {
+      if (!isTempName(name)) continue;
+      const file = path.join(this.dir, name);
+      try {
+        const stat = fs.lstatSync(file);
+        if (!stat.isFile() || now - stat.mtimeMs <= TEMP_MAX_AGE_MS) continue;
+        fs.unlinkSync(file);
+        removed++;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") log(`registry temp files: could not remove ${name}: ${(e as Error).message}`);
+      }
+    }
+    return removed;
+  }
+
   private persist(): void {
-    const body: RegistryFile = { version: 1, projects: Object.fromEntries(this.projects) };
-    const tmp = `${this.file}.${process.pid}.tmp`;
+    const body: RegistryFile = { version: REGISTRY_VERSION, projects: Object.fromEntries(this.projects) };
+    const tmp = path.join(this.dir, tempName(process.pid));
     fs.writeFileSync(tmp, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600 });
     fs.renameSync(tmp, this.file);
     this.mtimeMs = fs.statSync(this.file).mtimeMs;
