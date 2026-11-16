@@ -349,6 +349,12 @@ Environment variables, all optional:
     `MCPE_MCP_IDLE_TIMEOUT` closes it) or a process a tool leaves running
     keeps its sandbox up.
   - A sandbox stops up to about half a minute after the timeout.
+  - A sandbox at its process limit (`MCPE_PIDS_LIMIT`) keeps running: the
+    watchdog retries its failed fork rather than exiting. While it is at the
+    limit it may use up to one CPU's worth of the sandbox's own CPU limit
+    retrying, until a process slot frees; idle stopping then resumes with the
+    same timeout and latency as above. It logs one line to the container's
+    stderr the first time this happens.
   - Idle stopping has not been verified under gVisor (`runsc`).
 
 ## Development
@@ -356,8 +362,11 @@ Environment variables, all optional:
 ```sh
 npm test              # unit and protocol tests, no Docker needed
 npm run test:docker   # end-to-end against real Docker and github.com
+npm run test:docker:pressure  # the slow fork-pressure cases only
 npm run typecheck
 ```
+
+`npm run test:docker` skips the fork-pressure cases; run them with `npm run test:docker:pressure` when the idle watchdog (the sandbox entrypoint script) or its tests change.
 
 Layout:
 

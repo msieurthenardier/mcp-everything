@@ -104,14 +104,23 @@ done
 // and ended between polls). Time comes from /proc/uptime, and the loop uses
 // builtins only, so it never sees its own children as activity. PATH is fixed
 // because the container's own puts project-writable directories first.
+// The loop's only fork is its sleep, and that fork fails at the sandbox's
+// process limit. A failed fork exits a non-interactive dash or busybox shell,
+// which would stop the container, so it runs under `command eval` (an error
+// there does not abort the shell) and is retried at once. A poll that had to
+// retry counts as activity, and the first failure is announced once on stderr.
 const WATCHDOG_SCRIPT = `
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 idle="$1"; poll="$2"
 read up _ < /proc/uptime; last=\${up%%.*}
-prev=0
+prev=0; warned=0
 while :; do
-  sleep "$poll" & pid=$!
-  active=0
+  starved=0
+  until command eval 'sleep "$poll" & pid=$!' 2>/dev/null; do
+    starved=1
+    [ "$warned" = 1 ] || { warned=1; echo "watchdog: cannot fork (process limit reached); retrying" >&2; }
+  done
+  active=$starved
   [ "$pid" -eq $((prev + 1)) ] || active=1
   prev=$pid
   for d in /proc/[0-9]*; do

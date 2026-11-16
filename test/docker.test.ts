@@ -57,6 +57,8 @@ describe("createContainer", () => {
     expect(script).toContain("${up%%.*}");
     expect(script).toContain("${d#/proc/}");
     expect(script).not.toMatch(/sleep (60|300)/);
+    expect(script).toContain("until command eval");
+    expect(script).toContain("watchdog: cannot fork (process limit reached); retrying");
   });
 
   it("keeps sleep infinity when disabled", async () => {
