@@ -109,6 +109,13 @@ done
 // which would stop the container, so it runs under `command eval` (an error
 // there does not abort the shell) and is retried at once. A poll that had to
 // retry counts as activity, and the first failure is announced once on stderr.
+// Its behavior under a contested process limit is tested only by the fork-pressure
+// cases in test/integration/docker.test.ts, which `npm run test:docker` skips.
+// Run `npm run test:docker:pressure` after changing this script or the images.
+// The guard was measured on dash 0.5.12 (Debian 13, `buildpack-deps:stable`) and
+// BusyBox 1.37.0 `sh` (Alpine 3.24, `alpine/git:latest`) in November 2026. Both tags
+// float, so a newer shell behind either is untested until the pressure cases have
+// been run against it.
 const WATCHDOG_SCRIPT = `
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 idle="$1"; poll="$2"

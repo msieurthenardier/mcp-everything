@@ -1,10 +1,10 @@
 # Squawk 0006: The shell versions the fork guard was measured on are not recorded
 
-**Status**: open
+**Status**: completed
 **Type**: servicing
 **Severity**: routine
 **Reported**: 2026-11-15
-**Completed**: —
+**Completed**: 2026-11-15
 
 ## Report
 The watchdog's fork guard relies on one POSIX rule (`command eval` does not abort the shell on an error) as implemented by the two shells it was measured on. Both come from floating image tags, so "what was tested" will silently stop being true as those tags move, and nothing in the repository says which versions the measurements were taken on. Raised in the sortie 02 debrief (Recommendation 3).
@@ -19,13 +19,12 @@ Read from the local images on 2026-11-15, the same ones the sortie 02 measuremen
 - No occurrence of `0.5.12` or `1.37` in `src/`, `test/` or `README.md`
 
 ## Corrective Action
-*(written at completion)*
+Added four `//` lines at the end of the comment block above `WATCHDOG_SCRIPT` in `src/sandbox/docker.ts`, after squawk 0004's lines, recording that the guard was measured on dash 0.5.12 (Debian 13, `buildpack-deps:stable`) and BusyBox 1.37.0 `sh` (Alpine 3.24, `alpine/git:latest`) in November 2026, and that both tags float. Comments only; no script, config, test or README change.
 
 ## Verification
-*(written at completion)* Expected: the recorded versions match the evidence above; no source behavior changes.
+Diff of `src/sandbox/docker.ts` shows only added `//` lines above `const WATCHDOG_SCRIPT`; versions match the evidence; `npm test`: 270 passed, 14 skipped; `npm run typecheck`: clean. No Docker run. Expected: the recorded versions match the evidence above; no source behavior changes.
 
 ## Sign-Off
-*(written at completion)*
-**Reviewer**:
-**Verdict**:
-**Commit**:
+**Reviewer**: independent Reviewer agent (Sonnet), batch review scoped to the diff
+**Verdict**: confirmed against the recorded evidence; not re-measured
+**Commit**: `squawk: turnaround 2026-11-15` (trailer `Squawks: 0004, 0005, 0006`) on branch `squawk/turnaround-2026-11-15-2`

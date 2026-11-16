@@ -148,6 +148,14 @@ implemented in this flight. Evaluate against:
 4. Tests — coverage, meaningful assertions, no regressions
 5. Artifacts — flight log updated for every leg, leg statuses correct
 
+`npm run test:docker` skips two slow fork-pressure cases; `npm run test:docker:pressure`
+runs them. Run it once, and only if the changes under review touch the sandbox
+watchdog script (`WATCHDOG_SCRIPT` in `src/sandbox/docker.ts`), the fork-pressure cases
+in `test/integration/docker.test.ts`, or the default sandbox images in `src/config.ts`.
+A change only to the comments around the script does not count; any change to the
+script's own text (the contents of `WATCHDOG_SCRIPT`) does. Otherwise do not run them.
+Never repeat them (for example with `--repeats`) unless the Flight Director asks.
+
 Signal [HANDOFF:confirmed] if all changes are satisfactory.
 If issues found, list them with severity (blocking/non-blocking) and specific
 file:line references.
