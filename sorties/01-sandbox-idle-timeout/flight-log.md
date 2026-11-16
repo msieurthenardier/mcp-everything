@@ -3,14 +3,14 @@
 **Flight**: [Sandbox Idle Timeout](flight.md)
 
 ## Summary
-Landed 2026-11-15. One leg, `idle-watchdog`, implemented, independently reviewed and confirmed on the first review pass. Awaiting debrief.
+Landed 2026-11-15. One leg, `idle-watchdog`, implemented, independently reviewed and confirmed on the first review pass. Debriefed the same day; the debrief found one defect (watchdog exits when it cannot fork), recorded below and in `flight-debrief.md`.
 
 ---
 
 ## Leg Progress
 
 ### idle-watchdog
-**Status**: landed
+**Status**: completed
 **Started**: 2026-11-15
 **Completed**: 2026-11-15
 
@@ -171,3 +171,19 @@ Not adopted: a start-up warning for an unparsable `MCPE_IDLE_TIMEOUT` (no other 
 ### Flight completion — 2026-11-15
 
 **Status**: landed. One of one legs completed; no deviations and no anomalies. One runtime decision (relaunch error wording, see Decisions). New sandboxes stop themselves after `MCPE_SANDBOX_IDLE_TIMEOUT` seconds without activity (default 1800, `0` disables) and are restarted on the next call; sandboxes created before this change are unaffected until reinstalled.
+
+### 2026-11-15 — Debrief
+
+- Commit `b041bd0` on `sortie/01-sandbox-idle-timeout`; pull request #1 opened as a draft and marked ready after landing. Not merged at debrief time, so the debrief artifacts belong on this branch.
+- Debrief interviews: Developer and Architect (both Sonnet, read-only). The Developer re-ran both suites for metrics: unit 268 passed / 12 skipped in 1.46 s; Docker integration 12 passed in 140 s. Human interview skipped (no deviations or anomalies in the log to ask about).
+- The leg entry's status line above still read `landed` after the leg file was set to `completed`; corrected here.
+- **Post-flight finding: the watchdog exits when it cannot fork.** Both interviews flagged, by inference, that the watchdog would busy-spin at the sandbox's process limit, as DD2 states. Checked on throwaway containers (removed afterwards), using the script as shipped:
+
+| Setup | Result |
+|-------|--------|
+| `buildpack-deps:stable` (dash), `--pids-limit 12`, limit filled once by background sleeps and then left alone | Watchdog survived: it frees one slot when its `sleep` ends and takes it back |
+| Same on `alpine` (busybox) | Same |
+| `buildpack-deps:stable` (dash), `--pids-limit 16`, a process forking continuously for 12 s so every freed slot is contested | Container stopped with exit code 2 within 2 s; watchdog stderr `Cannot fork` |
+
+  Dash exits a non-interactive script on a failed fork, so the watchdog does not spin: it dies, and as the container's main process it takes the sandbox down with whatever was running. DD2's trade-off statement is wrong on this point. The contested case was not run on busybox (no forking tool to hand in that image). No source was changed; the fix is a follow-up, see the debrief.
+- Operator decisions at debrief: pull request #1 returned to draft with a comment describing the defect; three debrief follow-ups logged as squawks 0001, 0002 and 0003 (all `servicing`, `routine`, left open); the flight stays `landed` rather than `completed` until the watchdog defect is dealt with.
