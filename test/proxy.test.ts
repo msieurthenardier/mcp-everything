@@ -279,3 +279,23 @@ describe("McpProxy start-up after an idle stop", () => {
     expect(docker.calls.filter((c) => c.argv[0] === "sh").map((c) => c.opts.restart)).toEqual([false]);
   });
 });
+
+describe("host variables and the real docker connector", () => {
+  it("hands a variable of the launch spec to docker through the env file only, never on a command line", async () => {
+    const { Installer } = await import("../src/install/installer.js");
+    const { Registry } = await import("../src/registry.js");
+    const { record } = await import("./helpers.js");
+    const VALUE = "hv-7Qz3kLx9Vb2NmR8tYw4Pa6Ud1Fs0Jc5";
+    const registry = new Registry(dir);
+    const project = record("demo");
+    const installer = new Installer(cfg, docker, registry, proxy, undefined, { demo__API_KEY: VALUE });
+    const launch = installer.launchSpec(project, spec({ argv: ["node", "server.js"] }));
+    const conn = dockerConnector(cfg)({ container: "mcpe-demo", server: launch, pidFile: "/tmp/p.pid" });
+    const params = (conn.transport as unknown as { _serverParams: { args: string[] } })._serverParams;
+    expect(params.args.join(" ")).not.toContain(VALUE);
+    const envFile = params.args[params.args.indexOf("--env-file") + 1]!;
+    expect(fs.readFileSync(envFile, "utf8")).toBe(`API_KEY=${VALUE}\n`);
+    conn.cleanup?.();
+    expect(fs.existsSync(envFile)).toBe(false);
+  });
+});

@@ -44,7 +44,7 @@ export interface Connection {
 /** Creates the transport to an upstream server. Replaceable for tests. */
 export type Connector = (launch: Launch) => Connection;
 
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,100}$/;
+export const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,100}$/;
 
 /** Validate a server environment: names are identifiers, values single-line. */
 export function validateEnv(env: Record<string, unknown>): Record<string, string> {

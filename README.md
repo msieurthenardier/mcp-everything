@@ -71,6 +71,7 @@ claude mcp add mcp-everything -- node "$PWD/dist/index.js"
 | `set_project_network` | Turn a sandbox's outbound network on or off. |
 | `discover_tools` | Regenerate tools, optionally for executables you built by hand. |
 | `connect_mcp_server` / `disconnect_mcp_server` | Proxy an MCP server that runs inside a project's sandbox. |
+| `refresh_mcp` | Stop a project's MCP servers and run discovery again, e.g. after giving a server its environment variables. Reports what started and what did not. |
 | `uninstall_project` | Delete a project's container, volume and tools. |
 
 Repositories can be given as `owner/name` (GitHub), `github:owner/name`,
@@ -197,16 +198,79 @@ evidence, and a command is left alone once one of them answers:
 Launches that do not answer are reported in a warning. A command that is an
 MCP server only when given an argument keeps its command line tools too.
 
-Servers that need arguments, environment variables or a different entry point
-are registered by hand:
+Servers that need arguments or a different entry point are registered by hand:
 
 ```
 connect_mcp_server(project: "servers",
                    command: ["mcp-server-filesystem", "/workspace/work"])
+```
+
+#### Giving a server its environment
+
+A server that needs an API key or another variable to start can be given it
+in two ways. The first is the default; the second is generally unsafe.
+
+**Route 1 (the default): `<slug>__<NAME>` in mcp-everything's own
+configuration.** To give `NAME` to the MCP servers of the project with slug
+`some_api_server`, set `some_api_server__NAME` in the environment of the
+mcp-everything process, which in practice means the `env` of its entry in your
+client's configuration. The placeholder below is not a real key:
+
+```json
+{
+  "mcpServers": {
+    "mcp-everything": {
+      "command": "npx",
+      "args": ["-y", "github:msieurthenardier/mcp-everything"],
+      "env": { "some_api_server__API_KEY": "replace-with-your-key" }
+    }
+  }
+}
+```
+
+Then reconnect mcp-everything in your client (a running process cannot have
+its environment changed, so the client has to start it again) and call
+`refresh_mcp(project: "some_api_server")`.
+
+- The agent never sees the values, and nothing is stored: the variables are
+  read from mcp-everything's environment each time a server is started.
+- A server that is already published picks up a changed value the next time
+  it starts after the reconnect. `refresh_mcp` is needed when a server could
+  not start without the variable, or lists different tools once it has it.
+  It stops the project's MCP servers and runs the same discovery as
+  `discover_tools` (without extra executables). Its result says how many MCP
+  servers and proxied tools the project has, names the variables applied
+  (names only), and lists the servers that did not start with the reason, the
+  ones recorded before that are gone, and the launches that did not answer.
+  It is flagged as an error when a registered server did not start, when a
+  server recorded before is gone, or when the project has no proxied tool
+  afterwards. It works on a project that is `ready`; one that is installing or
+  failed is refused.
+- The prefix is the project's slug exactly as `list_projects` shows it, in
+  lower case, followed by two underscores. Matching is exact and case-sensitive.
+  An empty value counts as set.
+- The variables go to every MCP server of the project, and only to them: not
+  to its command line tools, not to `sandbox_exec`, not to the install.
+- A value from the configuration wins over one stored for the same name by
+  `connect_mcp_server`. `project_info` lists the names a project receives (never
+  the values) and marks a stored name that is overridden.
+- A value with a line break or a NUL character is rejected: the call that
+  would have used it fails with a message that names the variable.
+
+**Route 2: `connect_mcp_server(env: …)`.**
+
+```
 connect_mcp_server(project: "some-api-server",
                    command: ["node", "build/index.js"],
-                   env: { "API_KEY": "..." })
+                   env: { "API_KEY": "replace-with-your-key" })
 ```
+
+A value an agent passes in a tool call is in the conversation transcript, and
+is stored in plain text in the registry. That is generally unsafe, and it is
+not the way to give a server a secret. The one exception is an agentic system
+with proper secrets management, which injects the value at run time outside
+the agent's session. Use `connect_mcp_server` for arguments and entry points,
+and route 1 for secrets.
 
 How it behaves:
 
@@ -247,9 +311,13 @@ confines that to Docker; it does not make untrusted code safe.
 
 What the sandbox does:
 
-- One container and one volume per project. No host directory, Docker socket,
-  or credential is mounted or passed in. Forge tokens stay in the server
-  process and are only sent to their own forge's API.
+- One container and one volume per project. No host directory or Docker socket
+  is mounted. The only values passed into a sandbox are the environment
+  variables of the project's MCP servers: the `<slug>__<NAME>` variables an
+  operator set for that project (see "Giving a server its environment") and
+  whatever `connect_mcp_server(env: …)` stored. mcp-everything itself never
+  stores the former. Forge tokens stay in the server process and are only sent
+  to their own forge's API.
 - All capabilities are dropped except the six needed to run package managers
   as root inside the container (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`,
   `SETUID`, `SETGID`); `no-new-privileges` is set; memory, CPU and process
@@ -278,11 +346,42 @@ What it does not do:
 - **Proxied MCP servers describe themselves.** Their tool descriptions are
   bounded and labelled like generated ones, but their argument schemas are
   passed through as the server wrote them, including any text inside.
-- **Server environment values are stored in plain text** in the registry file
-  (`registry.json`, readable only by you) so the server can be restarted.
-  They are handed to Docker through a private temporary file, not the command
-  line, and are never echoed back by any tool. `disconnect_mcp_server` or
-  `uninstall_project` removes them.
+- **Values given to `connect_mcp_server(env: …)` are stored in plain text** in
+  the registry file (`registry.json`, readable only by you) so the server can
+  be restarted. `disconnect_mcp_server` or `uninstall_project` removes them.
+  Values from `<slug>__<NAME>` variables are never stored. Both kinds are
+  handed to Docker through a private temporary file, not the command line, and
+  mcp-everything itself never writes a value into a tool result, an error
+  message or its diagnostics log; `project_info` shows names only. That
+  promise covers what mcp-everything writes, not what a server prints (see the
+  last point below).
+- **Variables given to a project's MCP servers are exposed to more than those
+  servers.**
+  - Any code running in the project's sandbox can read a running server's
+    variables (for example through `/proc/<pid>/environ`); "MCP servers only"
+    describes what they are handed to, not an isolation boundary inside the
+    sandbox.
+  - The Docker client that starts a server inherits mcp-everything's whole
+    environment, so every project's `<slug>__<NAME>` variables are in that
+    client's environment on the host for each launch. They do not reach a
+    sandbox that way.
+  - Discovery and `refresh_mcp` run the project's commands with the variables.
+    That is online whenever the sandbox's network is on, and at install it
+    follows the network setting the install was asked for.
+  - The variables bind to a slug, not to a repository. If a project is
+    uninstalled and a different repository is later installed under the same
+    slug, it receives the variables set for that slug. `install_project` and
+    `project_info` list the names a project receives.
+  - A server can print its own variables. What it writes on stderr, returns
+    from a call, or puts in a protocol error message reaches the tool error
+    returned to the agent and the diagnostics log, and a protocol error
+    message or a tool description also reaches the registry. mcp-everything
+    does not scrub server output.
+  - Several mcp-everything processes can share a data directory. Give them the
+    same `<slug>__<NAME>` variables: one that lacks a variable drops the tools
+    of servers that need it when it next runs discovery (including
+    `discover_tools`, `connect_mcp_server` and `refresh_mcp`), until a process
+    that has it refreshes again.
 - **License is reported, not enforced.** The license found in the repository
   is shown at install time with a warning when none is found; the server does
   not verify that a repository is open source.
@@ -308,6 +407,7 @@ Environment variables, all optional:
 | `MCPE_MAX_OUTPUT_BYTES` | `100000` | Cap on captured stdout and stderr, each. |
 | `MCPE_IMAGE`, `MCPE_IMAGE_<ECOSYSTEM>` | see table | Override sandbox images. Images need `sh`, `git` and coreutils `timeout`. |
 | `MCPE_NAME_PREFIX` | `mcpe-` | Prefix of container and volume names. |
+| `<slug>__<NAME>` | none | Sets `NAME` in the environment of the MCP servers of the project with that slug (lower case, as `list_projects` shows it), for example an API key. Read at each launch, never stored; apply with a reconnect and `refresh_mcp`. See "Giving a server its environment". |
 
 ## Limitations
 
