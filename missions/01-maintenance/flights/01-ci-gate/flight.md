@@ -1,6 +1,6 @@
 # Flight: CI Gate
 
-**Status**: in-flight
+**Status**: landed
 **Mission**: [Maintenance](../../mission.md)
 
 ## Contributing to Criteria
@@ -57,10 +57,10 @@ Operator-side, after the first green run so the check's name exists: a ruleset o
 One finding, one leg.
 
 ### Checkpoints
-- [ ] The workflow runs green on this flight's own pull request.
-- [ ] A deliberately failing commit on a throwaway branch turns it red (a type error), then is discarded.
+- [x] The workflow runs green on this flight's own pull request.
+- [x] A deliberately failing commit on a throwaway branch turns it red (a type error), then is discarded.
 - [x] `engines`, `.nvmrc` and the README agree.
-- [ ] The operator has been asked for the ruleset, with the exact check name.
+- [x] The operator has been asked for the ruleset, with the exact check name.
 
 ### Adaptation Criteria
 
@@ -84,10 +84,10 @@ One finding, one leg.
 ## Post-Flight
 
 ### Completion Checklist
-- [ ] All legs completed
+- [x] All legs completed
 - [ ] Code merged
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Tests passing
+- [x] Documentation updated
 
 ### Verification
 The pull request for this flight shows the check, green. A scratch branch with a type error shows it red. `node -p "require('./package.json').engines.node"` prints `>=22.12`, and `.nvmrc` and README line 18 agree. After the operator adds the ruleset, `gh api repos/{owner}/{repo}/rulesets` lists it and a pull request cannot be merged while the check is red.

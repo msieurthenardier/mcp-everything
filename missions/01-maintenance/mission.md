@@ -45,6 +45,6 @@ N/A
 
 > **Note:** These are tentative suggestions, not commitments. Flights are planned and created one at a time as work progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] Flight 1: [CI gate](flights/01-ci-gate/flight.md) — the Tier A check, the Node floor, Dependabot (finding 7). First, so the others land under it.
+- [x] Flight 1: [CI gate](flights/01-ci-gate/flight.md) — the Tier A check, the Node floor, Dependabot (finding 7). First, so the others land under it.
 - [ ] Flight 2: [Install failure and interruption paths](flights/02-install-failure-paths/flight.md) — finding 4.
 - [ ] Flight 3: [Local state hygiene and secret hand-off tests](flights/03-local-state-and-secret-handoff-tests/flight.md) — findings 5, 6a, 6d.

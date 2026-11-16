@@ -3,7 +3,7 @@
 **Flight**: [CI Gate](flight.md)
 
 ## Summary
-In flight. One leg, `tier-a-check`.
+Landed on 2026-11-16. One leg, `tier-a-check`, completed with no deviation. The check ran green on this flight's pull request (#7) in 19 seconds and red on a throwaway pull request with a type error. Waiting on the operator for the ruleset on `main`; the check's name is `check`.
 
 ### Flight Director Notes
 - 2026-11-16: The operator said to start the mission after pull request #6 (the squawk turnaround, with squawk 0014) merged. Mission set to `active`, flight to `in-flight`, branch `flight/01-ci-gate` cut from `main` at that merge. The mission's artifacts were untracked until now and are committed with this flight. The maintenance report (`maintenance/2026-11-15.md`) is not: it describes the open design gaps of findings 1b, 2 and 3 in more detail than anything in the public repository, the operator was asked whether to publish it and has not answered, so it stays out of this commit until they do. Links to it from the mission, the flights and squawks 0014 to 0025 do not resolve until then.
@@ -46,6 +46,11 @@ In flight. One leg, `tier-a-check`.
 
 ## Decisions
 
+### The maintenance report is left out of the flight's commit
+**Context**: The mission, the flights and squawks 0014 to 0025 link to `maintenance/2026-11-15.md`, which has never been committed. The repository is public and the report describes findings 1b, 2 and 3, which are open.
+**Decision**: Commit the mission's artifacts and leave the report untracked until the operator says whether to publish it.
+**Impact**: Those links do not resolve on GitHub until the report is committed.
+
 ---
 
 ## Deviations
@@ -59,3 +64,13 @@ None from the leg.
 ---
 
 ## Session Notes
+
+### 2026-11-16 — hosted runs and landing (Flight Director)
+- Commit `969dd07` (`flight/01: CI gate, Node floor 22.12, Dependabot`), made by a Developer from an exact file list after the review confirmed. Branch pushed; draft pull request #7 opened.
+- **Green**: run 43915711264 on pull request #7, job `check`, 19 seconds, every step passed. From its log: Node v22.23.4 from `.nvmrc`; `npm ci` added 137 packages in 4 s; 17 test files passed and 1 skipped; "396 tests passed (floor 350)"; "dist/index.js is packed". The flight's divert condition (a check longer than about 5 minutes) is far off.
+- **Red**: a Developer made branch `scratch/ci-red-check` with one new file holding a type error (`src/ci-red-check.ts(2,14): error TS2322`). Pushed and opened as draft pull request #8 against the flight branch. Run 43915933566 failed. Pull request #8 closed without merging; the branch is deleted locally and on the remote.
+- **Observation**: the red run failed at the Install step, not at Typecheck. `npm ci` runs `prepare`, which builds `src/`, so a type error in `src/` stops the job there and the later steps are skipped. The Typecheck step still adds something: `tsconfig.json` includes `test/`, which the build does not compile. Not changed; noted for the debrief.
+- One annotation on the green run: the `ubuntu-latest` label is moving to Ubuntu 26. No action taken.
+- Documentation: the README's requirement line and Development section were updated in the leg. `CLAUDE.md` describes Flight Control only and needs nothing.
+- Flight set to `landed`; flight 1 checked off in the mission. The mission's first success criterion stays open until this merges and a push to `main` has run the check, and until the ruleset exists.
+- Asked of the operator: a ruleset on `main` requiring a pull request and the status check named `check`, with force-push blocked.
