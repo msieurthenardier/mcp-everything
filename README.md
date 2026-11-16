@@ -15,7 +15,7 @@ ruff__ruff_check({ args: ["."], output_format: "json" })
 
 ## Requirements
 
-- Node.js 20+
+- Node.js 22.12+
 - Docker (the daemon must be reachable by the user running the server)
 
 ## Setup
@@ -482,6 +482,8 @@ npm run typecheck
 ```
 
 `npm run test:docker` skips the fork-pressure cases; run them with `npm run test:docker:pressure` when the idle watchdog (the sandbox entrypoint script) or its tests change.
+
+Every pull request and every push to `main` runs install, typecheck, the unit tests and the build on GitHub Actions; the Docker suite is not part of it and is run locally.
 
 Layout:
 
