@@ -8,6 +8,7 @@ import { searchProjects } from "./forge/search.js";
 import { Installer } from "./install/installer.js";
 import { McpProxy, validateEnv } from "./proxy/mcp-proxy.js";
 import { Registry } from "./registry.js";
+import { VERSION } from "./version.js";
 import { Docker, REPO_DIR, WORK_DIR, type ExecResult } from "./sandbox/docker.js";
 import { buildInvocation, resolveCwd, ToolInputError } from "./toolgen/invoke.js";
 import type { Ecosystem, McpServerSpec, ProjectRecord, ToolDef } from "./types.js";
@@ -73,8 +74,8 @@ const META_TOOLS: MetaTool[] = [
         ecosystem: { type: "string", enum: ECOSYSTEMS, description: "Override the detected build system." },
         image: { type: "string", description: "Override the Docker image used for the sandbox." },
         submodules: { type: "boolean", description: "Also clone git submodules (default false)." },
-        timeout_seconds: { type: "number", description: "Build time limit (default 900)." },
-        wait_seconds: { type: "number", description: "How long this call waits for the build (default 600)." },
+        timeout_seconds: { type: "number", description: "Build time limit in seconds (default 900, min 30, max 7200)." },
+        wait_seconds: { type: "number", description: "How long this call waits for the build, in seconds (default 600, max 3600)." },
         reinstall: { type: "boolean", description: "Discard an existing sandbox for this repository and rebuild." },
       },
       required: ["repo"],
@@ -166,7 +167,7 @@ const META_TOOLS: MetaTool[] = [
       properties: {
         project: projectProp,
         path: { type: "string", description: "File path inside the sandbox." },
-        max_bytes: { type: "number", description: "Read at most this many bytes (default 100000)." },
+        max_bytes: { type: "number", description: "Read at most this many bytes (default 100000, max 2000000)." },
       },
       required: ["project", "path"],
       additionalProperties: false,
@@ -181,7 +182,7 @@ const META_TOOLS: MetaTool[] = [
       properties: {
         project: projectProp,
         path: { type: "string", description: "File path inside the sandbox." },
-        content: { type: "string", description: "File contents." },
+        content: { type: "string", description: "File contents (up to 5000000 characters)." },
       },
       required: ["project", "path", "content"],
       additionalProperties: false,
@@ -193,7 +194,7 @@ const META_TOOLS: MetaTool[] = [
       "Enable or disable outbound network access for a project's sandbox. Enabling lets third-party code reach the internet and the local network.",
     inputSchema: {
       type: "object",
-      properties: { project: projectProp, enabled: { type: "boolean" } },
+      properties: { project: projectProp, enabled: { type: "boolean", description: "true to allow outbound network access, false to cut it off." } },
       required: ["project", "enabled"],
       additionalProperties: false,
     },
@@ -260,7 +261,7 @@ const META_TOOLS: MetaTool[] = [
 const META_NAMES = new Set(META_TOOLS.map((t) => t.name));
 
 /** The tools of a project that are advertised in the tool list, in catalog order. */
-export function publishedTools(project: ProjectRecord): ToolDef[] {
+function publishedTools(project: ProjectRecord): ToolDef[] {
   if (!project.published) return project.tools; // record from before the catalog existed
   const names = new Set(project.published);
   return project.tools.filter((t) => names.has(t.name));
@@ -270,7 +271,7 @@ export function publishedTools(project: ProjectRecord): ToolDef[] {
  * Keyword relevance of a tool. Every query word must appear somewhere; words
  * found in the tool's name count for more than words found in its description.
  */
-export function scoreTool(tool: ToolDef, words: string[]): number {
+function scoreTool(tool: ToolDef, words: string[]): number {
   const name = `${tool.name} ${tool.mcp?.tool ?? ""} ${tool.argv.join(" ")}`.toLowerCase().replace(/[_-]+/g, " ");
   const description = tool.description.toLowerCase();
   let score = 0;
@@ -361,7 +362,7 @@ export class App {
     this.proxy = opts.proxy ?? new McpProxy(this.cfg, this.docker);
     this.installer = new Installer(this.cfg, this.docker, this.registry, this.proxy, undefined, opts.env);
     this.server = new Server(
-      { name: "mcp-everything", version: "0.3.0" },
+      { name: "mcp-everything", version: VERSION },
       { capabilities: { tools: { listChanged: true } }, instructions: INSTRUCTIONS },
     );
 
@@ -479,8 +480,16 @@ export class App {
   }
 
   private findGenerated(name: string): { project: ProjectRecord; tool: ToolDef } {
-    const slug = name.split("__")[0] ?? "";
-    const project = this.registry.get(slug);
+    // Candidates are the projects whose `slug__` prefixes the name (a slug may
+    // itself contain `__`, so one slug can prefix another's). Prefer, longest
+    // slug first, one whose tools contain the name; else the longest slug.
+    const candidates = this.registry
+      .list()
+      .filter((p) => name.startsWith(`${p.slug}__`))
+      .sort((a, b) => b.slug.length - a.slug.length);
+    const owner = candidates.find((p) => p.tools.some((t) => t.name === name)) ?? candidates[0];
+    const slug = owner?.slug ?? name.split("__")[0] ?? "";
+    const project = owner;
     const tool = project?.tools.find((t) => t.name === name);
     if (!project || !tool) {
       const hint = project
@@ -629,6 +638,7 @@ export class App {
         if (image && !/^[a-z0-9][a-z0-9._/:@-]{0,200}$/i.test(image)) throw new ToolInputError('"image" is not a valid image reference');
         const key = repo.id.toLowerCase();
         let job = this.jobs.get(key);
+        const joined = job !== undefined;
         if (!job) {
           const log: string[] = [];
           const created: Job = {
@@ -671,10 +681,14 @@ export class App {
           }),
         ]);
         if (timer) clearTimeout(timer);
+        // wait_seconds is the one option that applies per call; the rest were fixed when the running install began.
+        const joinedNote = joined
+          ? `Note: ${repo.id} was already being installed, so this call joined that install. Its options (other than wait_seconds) were not applied; the running install keeps the ones it started with. To change them, wait for it to finish, then call install_project again with reinstall: true.\n\n`
+          : "";
         if (!done) {
           const tail = job.log.slice(-8).join("\n");
           return text(
-            `Still installing ${repo.id} (${Math.round((Date.now() - job.startedAt) / 1000)}s so far). Call project_info(project: "${repo.id}") to check on it.\n--- recent output ---\n${tail}`,
+            `${joinedNote}Still installing ${repo.id} (${Math.round((Date.now() - job.startedAt) / 1000)}s so far). Call project_info(project: "${repo.id}") to check on it.\n--- recent output ---\n${tail}`,
           );
         }
         const body = this.describe(done, true);
@@ -683,9 +697,9 @@ export class App {
           const advice = kept
             ? "The sandbox was kept. You can repair the build with sandbox_exec (enable set_project_network if it needs downloads) and then run discover_tools, or retry with a different ecosystem/image and reinstall: true."
             : "Nothing was installed.";
-          return text(`${body}\n\n${advice}`, true);
+          return text(`${joinedNote}${body}\n\n${advice}`, true);
         }
-        return text(`${body}\n\nGenerated tools are callable directly, or through call_project_tool.`);
+        return text(`${joinedNote}${body}\n\nGenerated tools are callable directly, or through call_project_tool.`);
       }
 
       case "list_projects": {

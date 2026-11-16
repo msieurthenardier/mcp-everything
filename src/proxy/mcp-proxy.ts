@@ -10,6 +10,7 @@ import type { Config } from "../config.js";
 import type { Docker } from "../sandbox/docker.js";
 import type { McpServerSpec } from "../types.js";
 import { cleanTerminalText } from "../util/text.js";
+import { VERSION } from "../version.js";
 
 /**
  * Proxies MCP servers that live inside project sandboxes.
@@ -46,13 +47,16 @@ export type Connector = (launch: Launch) => Connection;
 
 export const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,100}$/;
 
+/** Matches a value that cannot be carried by the env file (CR, LF or NUL). */
+export const UNUSABLE_ENV_VALUE = /[\r\n\u0000]/;
+
 /** Validate a server environment: names are identifiers, values single-line. */
 export function validateEnv(env: Record<string, unknown>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
     if (!ENV_NAME.test(key)) throw new Error(`Invalid environment variable name "${key}"`);
     if (typeof value !== "string") throw new Error(`Environment variable ${key} must be a string`);
-    if (/[\r\n\u0000]/.test(value)) throw new Error(`Environment variable ${key} must not contain line breaks`);
+    if (UNUSABLE_ENV_VALUE.test(value)) throw new Error(`Environment variable ${key} must not contain line breaks`);
     out[key] = value;
   }
   return out;
@@ -71,7 +75,9 @@ export function dockerConnector(cfg: Config): Connector {
     let envFile: string | undefined;
     if (Object.keys(server.env).length > 0) {
       // Secrets travel in a private file, not in argv (visible to `ps`) and not
-      // in the docker CLI's own environment (which they could then influence).
+      // set under their own names in the docker CLI's environment (where they
+      // could influence the client itself). The client still inherits
+      // mcp-everything's whole environment, prefixed variables included (below).
       const dir = path.join(cfg.dataDir, "tmp");
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       envFile = path.join(dir, `env-${randomBytes(8).toString("hex")}`);
@@ -142,7 +148,7 @@ export class McpProxy {
   ): Promise<{ ok: true; client: Client; launch: Launch; conn: Connection } | { ok: false; message: (afterRestart?: boolean) => string }> {
     const launch: Launch = { container, server, pidFile: `/tmp/mcpe-mcp-${randomBytes(6).toString("hex")}.pid` };
     const conn = this.connector(launch);
-    const client = new Client({ name: "mcp-everything", version: "0.3.0" }, { capabilities: {} });
+    const client = new Client({ name: "mcp-everything", version: VERSION }, { capabilities: {} });
     try {
       await client.connect(conn.transport, { timeout: startupSec * 1000 });
       return { ok: true, client, launch, conn };

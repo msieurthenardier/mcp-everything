@@ -13,6 +13,15 @@ describe("sanitizeIdent", () => {
 
 describe("makeSlug", () => {
   const none = () => false;
+  it("never returns a slug containing a double underscore", () => {
+    const a = makeSlug("abc-defghij-klmnop", "owner2", (s) => s === "abc_defghij_klmnop");
+    const b = makeSlug("cli", "abcdefghijk-lm", none);
+    const c = makeSlug("abcdefghijklm-nop", "owner", (s) => s === "abcdefghijklm_nop" || s === "abcdefghijkl_owner");
+    for (const s of [a, b, c]) expect(s).not.toContain("__");
+    expect(a).toBe("abc_defghij_owner");
+    expect(b).toBe("abcdefghijk_cli");
+    expect(c).toBe("abcdefghijklm_2");
+  });
   it("uses the repository name", () => {
     expect(makeSlug("ripgrep", "BurntSushi", none)).toBe("ripgrep");
     expect(makeSlug("Some.Repo-Name", "o", none)).toBe("some_repo_name");

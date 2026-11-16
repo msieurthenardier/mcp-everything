@@ -11,7 +11,7 @@ import { App } from "../src/server.js";
 import type { ProjectRecord, ToolDef } from "../src/types.js";
 import { McpProxy } from "../src/proxy/mcp-proxy.js";
 import type { Connector } from "../src/proxy/mcp-proxy.js";
-import { FakeDocker, fakeUpstream, record, type FakeUpstream } from "./helpers.js";
+import { FakeDocker, fakeUpstream, record, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
 
 const tool: ToolDef = {
   name: "demo__demo_build",
@@ -44,6 +44,25 @@ beforeEach(() => {
 afterEach(async () => {
   await app.shutdown();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+describe("tool lookup", () => {
+  it("finds and calls a tool of a project whose slug contains a double underscore", async () => {
+    seed({ ...record("abc__def"), tools: [{ ...tool, name: "abc__def__build", argv: ["abc", "build"] }] });
+    expect(body(await app.callTool("abc__def__build", {}))).not.toMatch(/Unknown tool/);
+    expect(body(await app.callTool("call_project_tool", { tool: "abc__def__build", arguments: {} }))).not.toMatch(/Unknown tool/);
+    expect(docker.calls.filter((c) => c.argv[0] === "abc")).toHaveLength(2);
+  });
+  it("resolves a tool whose name begins with another project's slug to the project that has it", async () => {
+    seed({ ...record("abc"), tools: [{ ...tool, name: "abc__def__x", argv: ["abc-x"] }] });
+    seed({ ...record("abc__def"), tools: [{ ...tool, name: "abc__def__build", argv: ["abc-def-build"] }] });
+    expect(body(await app.callTool("abc__def__x", {}))).not.toMatch(/Unknown tool/);
+    expect(body(await app.callTool("abc__def__build", {}))).not.toMatch(/Unknown tool/);
+    expect(docker.calls.map((c) => [c.container, c.argv[0]])).toEqual([
+      ["mcpe-abc", "abc-x"],
+      ["mcpe-abc__def", "abc-def-build"],
+    ]);
+  });
 });
 
 describe("tool listing", () => {
@@ -175,6 +194,52 @@ describe("built-in tools", () => {
       expect(res.isError).toBe(true);
     }
     expect(docker.calls).toEqual([]);
+  });
+});
+
+describe("install_project joining a running install", () => {
+  const JOINED = /already being installed.*joined that install.*options \(other than wait_seconds\) were not applied/s;
+  const stub = (status: "ready" | "failed") => {
+    let finish!: () => void;
+    const gate = new Promise<void>((r) => (finish = r));
+    let calls = 0;
+    (app.installer as unknown as { install: unknown }).install = async () => {
+      calls++;
+      await gate;
+      return { ...record("demo"), status };
+    };
+    return { finish, calls: () => calls };
+  };
+
+  it("says so, with the options not applied, in every response shape of a joining call", async () => {
+    const s = stub("ready");
+    const first = await app.callTool("install_project", { repo: "owner/demo", wait_seconds: 0 });
+    expect(body(first)).toMatch(/^Still installing/);
+    expect(body(first)).not.toMatch(/joined/);
+
+    const second = await app.callTool("install_project", { repo: "owner/demo", network: false, wait_seconds: 0 });
+    expect(body(second)).toMatch(JOINED);
+    expect(body(second)).toMatch(/Still installing/);
+    expect(s.calls()).toBe(1);
+
+    const finished = app.callTool("install_project", { repo: "owner/demo", network: false });
+    s.finish();
+    const res = await finished;
+    expect(res.isError).toBe(false);
+    expect(body(res)).toMatch(JOINED);
+    expect(s.calls()).toBe(1);
+  });
+
+  it("says so when the joined install failed, and not to a call that started it", async () => {
+    const s = stub("failed");
+    const starter = app.callTool("install_project", { repo: "owner/demo" });
+    const joiner = app.callTool("install_project", { repo: "owner/demo", reinstall: true });
+    s.finish();
+    const [a, b] = [await starter, await joiner];
+    expect(a.isError).toBe(true);
+    expect(body(a)).not.toMatch(/joined/);
+    expect(b.isError).toBe(true);
+    expect(body(b)).toMatch(JOINED);
   });
 });
 
@@ -488,7 +553,6 @@ describe("parseProbeOutput", () => {
 
 describe("host environment variables for proxied MCP servers", () => {
   // Long and unlikely to occur in any output by accident.
-  const VALUE = "hv-7Qz3kLx9Vb2NmR8tYw4Pa6Ud1Fs0Jc5";
   const OTHER = "hv-Zp9Wk2Tn6Bx1Lr4Gd8Mc3Va7Hs5Ye0Q";
   const apps: App[] = [];
   let lines: string[];
@@ -526,39 +590,39 @@ describe("host environment variables for proxied MCP servers", () => {
   });
 
   it("callGenerated: a proxied tool call launches once, with the variable", async () => {
-    const a = appWith({ demo__API_KEY: VALUE });
+    const a = appWith({ demo__API_KEY: SECRET_VALUE });
     seeded(a, "demo");
     expect(body(await a.callTool("demo__whoami", {}))).toBe("api env=API_KEY");
     expect(up.launches).toHaveLength(1);
-    expect(up.launches[0]!.server.env).toEqual({ API_KEY: VALUE });
+    expect(up.launches[0]!.server.env).toEqual({ API_KEY: SECRET_VALUE });
   });
 
   it("connectMcp: the first launch has the variable, and what is stored does not", async () => {
-    const a = appWith({ demo__API_KEY: VALUE });
+    const a = appWith({ demo__API_KEY: SECRET_VALUE });
     expect((await connect(a)).isError).toBe(false);
-    expect(up.launches[0]!.server.env).toEqual({ API_KEY: VALUE });
+    expect(up.launches[0]!.server.env).toEqual({ API_KEY: SECRET_VALUE });
     expect(a.registry.get("demo")!.mcpServers![0]!.env).toEqual({});
-    expect(registryBytes()).not.toContain(VALUE);
+    expect(registryBytes()).not.toContain(SECRET_VALUE);
   });
 
   it("discoverMcp, registered servers: discover_tools launches the server with the variable", async () => {
-    const a = appWith({ demo__API_KEY: VALUE });
+    const a = appWith({ demo__API_KEY: SECRET_VALUE });
     seeded(a, "demo");
     docker.next = { code: 1 };
     await a.callTool("discover_tools", { project: "demo" });
     expect(up.launches.length).toBeGreaterThan(0);
-    for (const l of up.launches) expect(l.server.env).toEqual({ API_KEY: VALUE });
+    for (const l of up.launches) expect(l.server.env).toEqual({ API_KEY: SECRET_VALUE });
     expect(a.registry.get("demo")!.mcpServers![0]!.env).toEqual({});
   });
 
   it("the environment wins over a stored value of the same name, and says so in project_info", async () => {
-    const a = appWith({ demo__GREETING: VALUE });
+    const a = appWith({ demo__GREETING: SECRET_VALUE });
     seeded(a, "demo", { GREETING: OTHER, KEEP: "kept" });
     expect(body(await a.callTool("demo__whoami", {}))).toBe("api env=GREETING,KEEP");
-    expect(up.launches[0]!.server.env).toEqual({ GREETING: VALUE, KEEP: "kept" });
+    expect(up.launches[0]!.server.env).toEqual({ GREETING: SECRET_VALUE, KEEP: "kept" });
     const info = body(await a.callTool("project_info", { project: "demo" }));
     expect(info).toContain("env: GREETING (overridden by demo__GREETING), KEEP");
-    expect(info).not.toContain(VALUE);
+    expect(info).not.toContain(SECRET_VALUE);
     expect(info).not.toContain(OTHER);
   });
 
@@ -567,24 +631,24 @@ describe("host environment variables for proxied MCP servers", () => {
     const a = appWith(env);
     seeded(a, "demo");
     expect(body(await a.callTool("demo__whoami", {}))).toBe("api env=");
-    env.demo__LATE = VALUE;
+    env.demo__LATE = SECRET_VALUE;
     expect(body(await a.callTool("demo__whoami", {}))).toBe("api env=LATE");
-    expect(up.launches.map((l) => l.server.env)).toEqual([{}, { LATE: VALUE }]);
+    expect(up.launches.map((l) => l.server.env)).toEqual([{}, { LATE: SECRET_VALUE }]);
   });
 
   it("each project's launches carry only its own variables", async () => {
-    const a = appWith({ demo__API_KEY: VALUE, other__API_KEY: OTHER, other__ONLY_OTHER: "1" });
+    const a = appWith({ demo__API_KEY: SECRET_VALUE, other__API_KEY: OTHER, other__ONLY_OTHER: "1" });
     seeded(a, "demo");
     seeded(a, "other");
     await a.callTool("demo__whoami", {});
     await a.callTool("other__whoami", {});
     const byContainer = (c: string) => up.launches.filter((l) => l.container === c).map((l) => l.server.env);
-    expect(byContainer("mcpe-demo")).toEqual([{ API_KEY: VALUE }]);
+    expect(byContainer("mcpe-demo")).toEqual([{ API_KEY: SECRET_VALUE }]);
     expect(byContainer("mcpe-other")).toEqual([{ API_KEY: OTHER, ONLY_OTHER: "1" }]);
   });
 
   it("a project with no matching variable launches with exactly its stored environment", async () => {
-    const a = appWith({ other__API_KEY: VALUE, npm_config__x: "y" });
+    const a = appWith({ other__API_KEY: SECRET_VALUE, npm_config__x: "y" });
     seeded(a, "demo", { STORED: "s" });
     await a.callTool("demo__whoami", {});
     expect(up.launches.map((l) => l.server.env)).toEqual([{ STORED: "s" }]);
@@ -592,15 +656,15 @@ describe("host environment variables for proxied MCP servers", () => {
 
   it.each([
     ["nothing stored", {}],
-    ["the same name stored with the same value", { API_KEY: VALUE }],
+    ["the same name stored with the same value", { API_KEY: SECRET_VALUE }],
   ])("the session is still shared (%s)", async (_label, storedEnv) => {
-    const a = appWith({ demo__API_KEY: VALUE });
+    const a = appWith({ demo__API_KEY: SECRET_VALUE });
     docker.next = { code: 1 };
     await connect(a, "demo", { env: storedEnv });
     await a.callTool("demo__whoami", {});
     expect(up.launches).toHaveLength(1);
     expect(a.proxy.size).toBe(1);
-    expect(up.launches[0]!.server.env).toEqual({ API_KEY: VALUE });
+    expect(up.launches[0]!.server.env).toEqual({ API_KEY: SECRET_VALUE });
     expect(a.registry.get("demo")!.mcpServers![0]!.env).toEqual(storedEnv);
   });
 
@@ -667,12 +731,12 @@ describe("host environment variables for proxied MCP servers", () => {
 
   describe("visibility", () => {
     it("project_info lists the names a project receives, and no values, before any server exists", async () => {
-      const a = appWith({ demo__API_KEY: VALUE, demo__REGION: "eu", other__NOT_MINE: OTHER });
+      const a = appWith({ demo__API_KEY: SECRET_VALUE, demo__REGION: "eu", other__NOT_MINE: OTHER });
       const info = body(await a.callTool("project_info", { project: "demo" }));
       expect(info).toContain("environment from demo__… variables");
       expect(info).toContain("API_KEY, REGION");
       expect(info).not.toContain("NOT_MINE");
-      expect(info).not.toContain(VALUE);
+      expect(info).not.toContain(SECRET_VALUE);
       expect(info).not.toContain("eu\n");
     });
 
@@ -681,7 +745,7 @@ describe("host environment variables for proxied MCP servers", () => {
       seeded(plain, "demo", { API_KEY: "stored-s3cret" });
       const infoPlain = body(await plain.callTool("project_info", { project: "demo" }));
       const listPlain = body(await plain.callTool("list_projects", {}));
-      const unrelated = appWith({ other__API_KEY: VALUE, npm_config__x: "y" });
+      const unrelated = appWith({ other__API_KEY: SECRET_VALUE, npm_config__x: "y" });
       expect(body(await unrelated.callTool("project_info", { project: "demo" }))).toBe(infoPlain);
       expect(body(await unrelated.callTool("list_projects", {}))).toBe(listPlain);
       expect(infoPlain).toContain("env: API_KEY");
@@ -689,14 +753,14 @@ describe("host environment variables for proxied MCP servers", () => {
     });
 
     it("still lists names for a project that is installing or failed", async () => {
-      const a = appWith({ demo__API_KEY: VALUE });
+      const a = appWith({ demo__API_KEY: SECRET_VALUE });
       a.registry.put({ ...record("demo"), status: "failed", error: "x" });
       expect(body(await a.callTool("list_projects", {}))).toContain("API_KEY");
     });
   });
 
   it("nothing mcp-everything writes contains the value: registry, tool results and log lines", async () => {
-    const a = appWith({ demo__API_KEY: VALUE });
+    const a = appWith({ demo__API_KEY: SECRET_VALUE });
     const results: string[] = [];
     const keep = async (p: Promise<Awaited<ReturnType<App["callTool"]>>>) => {
       const r = await p;
@@ -711,26 +775,26 @@ describe("host environment variables for proxied MCP servers", () => {
     await keep(a.callTool("list_projects", {}));
     // Presence: the launches did carry the value.
     expect(up.launches.length).toBeGreaterThan(0);
-    for (const l of up.launches) expect(l.server.env.API_KEY).toBe(VALUE);
+    for (const l of up.launches) expect(l.server.env.API_KEY).toBe(SECRET_VALUE);
     // Absence.
-    expect(registryBytes()).not.toContain(VALUE);
-    for (const r of results) expect(r).not.toContain(VALUE);
-    for (const l of lines) expect(l).not.toContain(VALUE);
+    expect(registryBytes()).not.toContain(SECRET_VALUE);
+    for (const r of results) expect(r).not.toContain(SECRET_VALUE);
+    for (const l of lines) expect(l).not.toContain(SECRET_VALUE);
     expect(results.length).toBeGreaterThan(4);
   });
 
   it("only MCP server processes receive it: command line tools and sandbox_exec do not", async () => {
-    const a = appWith({ demo__API_KEY: VALUE });
+    const a = appWith({ demo__API_KEY: SECRET_VALUE });
     seeded(a, "demo");
     a.registry.put({ ...a.registry.get("demo")!, tools: [tool, mcpTool("demo", "whoami")] });
     docker.next = { stdout: "ok\n" };
     await a.callTool("demo__demo_build", {});
     await a.callTool("sandbox_exec", { project: "demo", command: "env" });
     expect(docker.calls.length).toBeGreaterThanOrEqual(2);
-    expect(JSON.stringify(docker.calls.map((c) => ({ argv: c.argv, opts: c.opts })))).not.toContain(VALUE);
+    expect(JSON.stringify(docker.calls.map((c) => ({ argv: c.argv, opts: c.opts })))).not.toContain(SECRET_VALUE);
     // Presence: a proxied call for the same project launches with it.
     await a.callTool("demo__whoami", {});
-    expect(up.launches[0]!.server.env.API_KEY).toBe(VALUE);
+    expect(up.launches[0]!.server.env.API_KEY).toBe(SECRET_VALUE);
   });
 
   describe("refresh_mcp", () => {
@@ -799,7 +863,7 @@ describe("host environment variables for proxied MCP servers", () => {
     });
 
     it("fails before anything is stopped when a value is unusable, naming the variable and not the value", async () => {
-      const env: Record<string, string> = { demo__API_KEY: VALUE };
+      const env: Record<string, string> = { demo__API_KEY: SECRET_VALUE };
       const a = appWith(env);
       seeded(a, "demo");
       await a.callTool("demo__whoami", {});
@@ -825,7 +889,7 @@ describe("host environment variables for proxied MCP servers", () => {
     });
 
     it("stops the sessions, discovers again, launches a server that had one, and says what it did", async () => {
-      const a = appWith({ demo__API_KEY: VALUE });
+      const a = appWith({ demo__API_KEY: SECRET_VALUE });
       seeded(a, "demo");
       let changed = 0;
       a.server.sendToolListChanged = async () => {
@@ -849,7 +913,7 @@ describe("host environment variables for proxied MCP servers", () => {
       expect(lines_[1]).toBe("Variables applied (names only): API_KEY.");
       expect(body(res)).toContain("The sandbox is offline");
       expect(body(res).endsWith(body(await a.callTool("project_info", { project: "demo" })))).toBe(true);
-      expect(body(res)).not.toContain(VALUE);
+      expect(body(res)).not.toContain(SECRET_VALUE);
       expect(a.registry.get("demo")!.tools.filter((t) => t.kind === "mcp")).toHaveLength(4);
     });
 
@@ -915,7 +979,7 @@ describe("host environment variables for proxied MCP servers", () => {
     });
 
     it("nothing mcp-everything writes contains the value after a refresh: registry, tool result and log lines", async () => {
-      const a = appWith({ demo__API_KEY: VALUE });
+      const a = appWith({ demo__API_KEY: SECRET_VALUE });
       const results: string[] = [];
       const keep = async (p: Promise<Awaited<ReturnType<App["callTool"]>>>) => {
         const r = await p;
@@ -929,33 +993,33 @@ describe("host environment variables for proxied MCP servers", () => {
       expect(res.isError).toBe(false);
       // Presence: the refresh launched with the value.
       expect(up.launches.length).toBeGreaterThan(before);
-      for (const l of up.launches) expect(l.server.env.API_KEY).toBe(VALUE);
+      for (const l of up.launches) expect(l.server.env.API_KEY).toBe(SECRET_VALUE);
       expect(body(res)).toContain("API_KEY");
       // Absence.
-      expect(registryBytes()).not.toContain(VALUE);
-      for (const r of results) expect(r).not.toContain(VALUE);
-      for (const l of lines) expect(l).not.toContain(VALUE);
+      expect(registryBytes()).not.toContain(SECRET_VALUE);
+      for (const r of results) expect(r).not.toContain(SECRET_VALUE);
+      for (const l of lines) expect(l).not.toContain(SECRET_VALUE);
     });
 
     it("documents a limit: a server that prints its variable on stderr leaves it in the tool error and the log, not in the registry", async () => {
-      const a = appUsing({ demo__API_KEY: VALUE }, (launch) => {
+      const a = appUsing({ demo__API_KEY: SECRET_VALUE }, (launch) => {
         up.launches.push(launch);
         return dead(`invalid API key: ${launch.server.env.API_KEY}`);
       });
       seeded(a, "demo");
       const res = await a.callTool("demo__whoami", {});
       expect(res.isError).toBe(true);
-      expect(up.launches[0]!.server.env.API_KEY).toBe(VALUE);
-      expect(body(res)).toContain(VALUE);
-      expect(lines.some((l) => l.includes(VALUE))).toBe(true);
+      expect(up.launches[0]!.server.env.API_KEY).toBe(SECRET_VALUE);
+      expect(body(res)).toContain(SECRET_VALUE);
+      expect(lines.some((l) => l.includes(SECRET_VALUE))).toBe(true);
       docker.next = { code: 1 };
       await a.callTool("discover_tools", { project: "demo" });
       expect(a.registry.get("demo")!.warnings.some((w) => w.startsWith("MCP:"))).toBe(true);
-      expect(registryBytes()).not.toContain(VALUE);
+      expect(registryBytes()).not.toContain(SECRET_VALUE);
     });
 
     it("documents a limit: a server that puts its variable in a protocol error leaves it in the registry as well", async () => {
-      const a = appUsing({ demo__API_KEY: VALUE }, (launch) => {
+      const a = appUsing({ demo__API_KEY: SECRET_VALUE }, (launch) => {
         up.launches.push(launch);
         const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
         serverSide.onmessage = (msg) => {
@@ -970,13 +1034,13 @@ describe("host environment variables for proxied MCP servers", () => {
       seeded(a, "demo");
       const res = await a.callTool("demo__whoami", {});
       expect(res.isError).toBe(true);
-      expect(up.launches[0]!.server.env.API_KEY).toBe(VALUE);
-      expect(body(res)).toContain(VALUE);
-      expect(lines.some((l) => l.includes(VALUE))).toBe(true);
+      expect(up.launches[0]!.server.env.API_KEY).toBe(SECRET_VALUE);
+      expect(body(res)).toContain(SECRET_VALUE);
+      expect(lines.some((l) => l.includes(SECRET_VALUE))).toBe(true);
       docker.next = { code: 1 };
       await a.callTool("discover_tools", { project: "demo" });
-      expect(a.registry.get("demo")!.warnings.some((w) => w.includes(VALUE))).toBe(true);
-      expect(registryBytes()).toContain(VALUE);
+      expect(a.registry.get("demo")!.warnings.some((w) => w.includes(SECRET_VALUE))).toBe(true);
+      expect(registryBytes()).toContain(SECRET_VALUE);
     });
 
     it("tells agents the route in the instructions and the descriptions of connect_mcp_server", async () => {

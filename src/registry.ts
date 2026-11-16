@@ -26,7 +26,10 @@ export class Registry {
     let stat: fs.Stats;
     try {
       stat = fs.statSync(this.file);
-    } catch {
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`Registry file ${this.file} could not be examined: ${(e as Error).message}`);
+      }
       if (this.mtimeMs === -1 && this.projects.size === 0) return false;
       this.projects = new Map();
       this.mtimeMs = -1;

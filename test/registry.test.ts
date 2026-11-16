@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Registry } from "../src/registry.js";
 import { record } from "./helpers.js";
 
@@ -57,6 +57,23 @@ describe("Registry", () => {
     fs.rmSync(path.join(dir, "registry.json"));
     expect(reg.refresh()).toBe(true);
     expect(reg.list()).toEqual([]);
+  });
+
+  it("throws on a stat error other than ENOENT and keeps the records it has", () => {
+    const reg = new Registry(dir);
+    reg.put(record("keep"));
+    const file = path.join(dir, "registry.json");
+    const real = fs.statSync;
+    const spy = vi.spyOn(fs, "statSync").mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      if (String(p) === file) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      return (real as (...a: unknown[]) => unknown)(p, ...rest);
+    }) as typeof fs.statSync);
+    try {
+      expect(() => reg.refresh()).toThrow(/registry\.json.*permission denied/);
+      expect(reg.list().map((p) => p.slug)).toEqual(["keep"]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("steals a stale lock left by a dead process", () => {

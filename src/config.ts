@@ -38,6 +38,20 @@ export interface Config {
   maxOutputBytes: number;
 }
 
+// Docker reads a zero --memory / --cpus as "no limit"; treat it like an unset
+// value so a stray zero cannot switch a sandbox limit off. Anything else is
+// passed through to docker untouched. The patterns cover the spellings Docker
+// was measured to read as zero (0, 00, .0, 0.0, +0, -0, 0e0, 0_0; for memory
+// also an optional unit such as g, GiB, mb or " g"; for cpus also 0/1 and 0x0).
+const ZERO = String.raw`[+-]?(?:0[0_]*(?:\.0*)?|\.0+)(?:e[+-]?\d+)?`;
+const ZERO_MEMORY = new RegExp(`^${ZERO} ?(?:[kmgtp](?:i?b)?|b)?$`, "i");
+const ZERO_CPUS = new RegExp(`^(?:${ZERO}(?:/[1-9]\\d*)?|[+-]?0x0+)$`, "i");
+
+function limit(value: string | undefined, fallback: string, unit: boolean): string {
+  if (!value) return fallback;
+  return (unit ? ZERO_MEMORY : ZERO_CPUS).test(value) ? fallback : value;
+}
+
 function int(value: string | undefined, fallback: number): number {
   const n = value === undefined ? NaN : Number.parseInt(value, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
@@ -86,10 +100,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     docker: {
       bin: env.MCPE_DOCKER_BIN || "docker",
       runtime: env.MCPE_DOCKER_RUNTIME || undefined,
-      memory: env.MCPE_MEMORY || "4g",
-      cpus: env.MCPE_CPUS || "2",
+      memory: limit(env.MCPE_MEMORY, "4g", true),
+      cpus: limit(env.MCPE_CPUS, "2", false),
       pidsLimit: int(env.MCPE_PIDS_LIMIT, 1024),
-      namePrefix: /^[a-z0-9][a-z0-9_.-]{0,30}$/.test(env.MCPE_NAME_PREFIX ?? "") ? env.MCPE_NAME_PREFIX! : "mcpe-",
+      namePrefix: parseNamePrefix(env.MCPE_NAME_PREFIX),
       probeImage: env.MCPE_PROBE_IMAGE || "alpine/git:latest",
       images: {
         rust: img("rust", "rust:1"),
@@ -123,4 +137,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxToolsPerProject: int(env.MCPE_MAX_TOOLS_PER_PROJECT, 40),
     maxOutputBytes: int(env.MCPE_MAX_OUTPUT_BYTES, 100_000),
   };
+}
+
+/** Unset or empty gives the default; a set value that is not a valid name prefix is an error, not a silent fallback. */
+function parseNamePrefix(raw: string | undefined): string {
+  if (!raw) return "mcpe-";
+  if (!/^[a-z0-9][a-z0-9_.-]{0,30}$/.test(raw)) {
+    throw new Error(
+      `MCPE_NAME_PREFIX=${JSON.stringify(raw)} is not valid: use 1-31 characters from [a-z0-9_.-], starting with a letter or digit.`,
+    );
+  }
+  return raw;
 }

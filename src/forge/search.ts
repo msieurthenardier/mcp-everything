@@ -36,7 +36,7 @@ const num = (v: unknown): number => (typeof v === "number" ? v : 0);
 const obj = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" ? (v as Record<string, unknown>) : {};
 
-export async function searchGitHub(cfg: Config, p: SearchParams, fetchImpl: FetchLike = fetch): Promise<SearchResult[]> {
+async function searchGitHub(cfg: Config, p: SearchParams, fetchImpl: FetchLike = fetch): Promise<SearchResult[]> {
   let q = p.query.trim();
   if (p.language && /^[A-Za-z0-9+#. -]{1,40}$/.test(p.language)) {
     q += ` language:"${p.language}"`;
@@ -71,7 +71,7 @@ export async function searchGitHub(cfg: Config, p: SearchParams, fetchImpl: Fetc
   });
 }
 
-export async function searchGitLab(cfg: Config, p: SearchParams, fetchImpl: FetchLike = fetch): Promise<SearchResult[]> {
+async function searchGitLab(cfg: Config, p: SearchParams, fetchImpl: FetchLike = fetch): Promise<SearchResult[]> {
   const params = new URLSearchParams({
     search: p.query.trim(),
     order_by: "star_count",

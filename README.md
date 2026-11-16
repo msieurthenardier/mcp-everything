@@ -232,8 +232,16 @@ Then reconnect mcp-everything in your client (a running process cannot have
 its environment changed, so the client has to start it again) and call
 `refresh_mcp(project: "some_api_server")`.
 
-- The agent never sees the values, and nothing is stored: the variables are
-  read from mcp-everything's environment each time a server is started.
+- Nothing is stored: the variables are read from mcp-everything's
+  environment each time a server is started, and mcp-everything never writes
+  a value into a tool result, an error message or its log. That is not
+  protection from the agent. Every MCP server of the project gets the values,
+  and so can anything that has `sandbox_exec`, `sandbox_write_file` or
+  `connect_mcp_server` on that project, including the agent: it can read a
+  running server's environment, replace the code a server runs, or register a
+  command of its own whose output comes back to it. The agent is trusted with
+  a project's variables. Do not set a variable for a project the agent is
+  not trusted with.
 - A server that is already published picks up a changed value the next time
   it starts after the reconnect. `refresh_mcp` is needed when a server could
   not start without the variable, or lists different tools once it has it.
@@ -242,6 +250,8 @@ its environment changed, so the client has to start it again) and call
   servers and proxied tools the project has, names the variables applied
   (names only), and lists the servers that did not start with the reason, the
   ones recorded before that are gone, and the launches that did not answer.
+  Because it is a full discovery, it is quick on a small project and takes
+  longer on one with many commands.
   It is flagged as an error when a registered server did not start, when a
   server recorded before is gone, or when the project has no proxied tool
   afterwards. It works on a project that is `ready`; one that is installing or
@@ -360,7 +370,9 @@ What it does not do:
   - Any code running in the project's sandbox can read a running server's
     variables (for example through `/proc/<pid>/environ`); "MCP servers only"
     describes what they are handed to, not an isolation boundary inside the
-    sandbox.
+    sandbox. That includes the agent's own tools: `sandbox_exec`,
+    `sandbox_write_file` and `connect_mcp_server` each give it the values of
+    the project they are used on.
   - The Docker client that starts a server inherits mcp-everything's whole
     environment, so every project's `<slug>__<NAME>` variables are in that
     client's environment on the host for each launch. They do not reach a
@@ -395,18 +407,21 @@ Environment variables, all optional:
 | `GITHUB_TOKEN` / `GH_TOKEN` | none | GitHub API token (search rate limit: 10/min anonymous). |
 | `GITLAB_TOKEN` | none | GitLab API token. |
 | `MCPE_EXTRA_HOSTS` | none | More forges to allow, e.g. `gitlab.gnome.org=gitlab,git.example.com=gitlab`. |
-| `MCPE_DATA_DIR` | `~/.local/share/mcp-everything` | Where the project registry is stored. |
-| `MCPE_MEMORY` / `MCPE_CPUS` / `MCPE_PIDS_LIMIT` | `4g` / `2` / `1024` | Per-sandbox limits. |
+| `MCPE_DATA_DIR` | `$XDG_DATA_HOME/mcp-everything`, else `~/.local/share/mcp-everything` | Where the project registry is stored. The default follows `XDG_DATA_HOME` when it is set. |
+| `MCPE_DOCKER_BIN` | `docker` | The Docker client command, run on the host. |
+| `MCPE_MEMORY` / `MCPE_CPUS` / `MCPE_PIDS_LIMIT` | `4g` / `2` / `1024` | Per-sandbox limits; a zero memory or CPU value (which Docker reads as unlimited) falls back to the default. |
 | `MCPE_DOCKER_RUNTIME` | Docker's default | Container runtime, e.g. `runsc`. |
+| `MCPE_PROBE_IMAGE` | `alpine/git:latest` | Image of the throwaway container that clones a repository and lists its manifests before the build (needs `sh` and `git`). |
 | `MCPE_INSTALL_TIMEOUT` | `900` | Build time limit, seconds. |
 | `MCPE_TOOL_TIMEOUT` | `120` | Default time limit of a tool call, seconds. |
+| `MCPE_HELP_TIMEOUT` | `10` | Time limit of one `--help` call during tool discovery, seconds. |
 | `MCPE_MAX_TOOLS_PER_PROJECT` | `40` | Cap on tools published per project (the catalog is not capped). |
 | `MCPE_MCP_STARTUP_TIMEOUT` | `30` | Seconds a proxied MCP server may take to answer the handshake. |
 | `MCPE_MCP_IDLE_TIMEOUT` | `600` | Seconds of inactivity before a proxied MCP server is stopped. |
 | `MCPE_SANDBOX_IDLE_TIMEOUT` | `1800` | Seconds without activity before a project's sandbox container stops itself; `0` disables this. Applies to sandboxes created after it is set. Not `MCPE_MCP_IDLE_TIMEOUT`, which stops proxied MCP servers, not sandboxes. |
 | `MCPE_MAX_OUTPUT_BYTES` | `100000` | Cap on captured stdout and stderr, each. |
 | `MCPE_IMAGE`, `MCPE_IMAGE_<ECOSYSTEM>` | see table | Override sandbox images. Images need `sh`, `git` and coreutils `timeout`. |
-| `MCPE_NAME_PREFIX` | `mcpe-` | Prefix of container and volume names. |
+| `MCPE_NAME_PREFIX` | `mcpe-` | Prefix of container and volume names; an invalid value is refused at startup. |
 | `<slug>__<NAME>` | none | Sets `NAME` in the environment of the MCP servers of the project with that slug (lower case, as `list_projects` shows it), for example an API key. Read at each launch, never stored; apply with a reconnect and `refresh_mcp`. See "Giving a server its environment". |
 
 ## Limitations
