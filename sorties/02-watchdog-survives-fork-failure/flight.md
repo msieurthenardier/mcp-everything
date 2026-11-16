@@ -1,6 +1,6 @@
 # Sortie: Watchdog Survives Fork Failure
 
-**Status**: landed
+**Status**: completed
 
 ## Charter
 
@@ -11,9 +11,9 @@ A sandbox that hits its process limit keeps running; the idle watchdog never sto
 The [sortie 01 debrief](../01-sandbox-idle-timeout/flight-debrief.md) verified that the watchdog exits when it cannot fork, taking the sandbox down mid-work. That is a regression from `main`, it leaves sortie 01's "never stopped mid-work" criterion unmet, and pull request #1 is held in draft until it is fixed.
 
 ### Success Criteria
-- [ ] A sandbox held at its process limit by processes that keep forking is never stopped, on both a Debian-based image (dash) and a busybox image.
-- [ ] Once the pressure ends and the sandbox goes quiet, it still idle-stops, within a bound stated in the README.
-- [ ] All of sortie 01's idle-timeout behavior is unchanged: its existing integration cases pass unmodified.
+- [x] A sandbox held at its process limit by processes that keep forking is never stopped, on both a Debian-based image (dash) and a busybox image.
+- [x] Once the pressure ends and the sandbox goes quiet, it still idle-stops, within a bound stated in the README.
+- [x] All of sortie 01's idle-timeout behavior is unchanged: its existing integration cases pass unmodified.
 
 ### Constraints
 - The watchdog may busy-retry only while it cannot get a process slot for its `sleep`; at all other times it waits without using CPU, as it does today. *(Revised by the operator on 2026-11-15 from "must not replace the stop with a busy loop that takes CPU from the build", after measurement showed that a zero-CPU wait and guaranteed resumption cannot both hold. See DD2.)*

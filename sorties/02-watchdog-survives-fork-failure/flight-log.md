@@ -3,7 +3,7 @@
 **Flight**: [Watchdog Survives Fork Failure](flight.md)
 
 ## Summary
-Landed 2026-11-15 on `sortie/01-sandbox-idle-timeout`. One leg, `fork-failure-guard`: the watchdog now retries a failed fork instead of exiting. Reviewed and confirmed in two cycles (the second for making the pressure cases opt-in, on the operator's instruction). Awaiting debrief.
+Landed 2026-11-15 on `sortie/01-sandbox-idle-timeout`. One leg, `fork-failure-guard`: the watchdog now retries a failed fork instead of exiting. Reviewed and confirmed in two cycles (the second for making the pressure cases opt-in, on the operator's instruction). Debriefed and completed the same day; see `flight-debrief.md`.
 
 ---
 
@@ -194,3 +194,12 @@ An earlier attempt at the fully packed case killed its own sleepers (GNU `timeou
 ### Flight completion — 2026-11-15
 
 **Status**: landed. One of one legs completed. One deviation (pressure cases opt-in, on the operator's instruction); anomalies as recorded by the Developer (an uncounted first batch, an interrupted run cleaned up). A sandbox at its process limit now keeps its watchdog: verified by a negative control on both shells, 30 of 30 runs per shell by the Developer and 10 of 10 per shell by the Reviewer. Those runs bound the failure rate at roughly 10%; they do not rule out a rare failure.
+
+### 2026-11-15 — Debrief
+
+- Pull request #1 open and unmerged at debrief time, so the debrief is on this branch.
+- Interviews: Developer and Architect (both Sonnet, read-only). The Developer re-ran the unit suite (270 passed, 14 skipped, 1.44 s) and the default Docker suite (12 passed, 2 skipped, 141.6 s); by the operator's rule the pressure cases were not run and their figures were taken from this log. Human interview skipped: the operator's decisions during the flight are already on record here.
+- No defect found. Main finding: the fix's only behavioral tests are opt-in and nothing runs them unprompted.
+- All three charter criteria assessed as met, the first with the caveats in the debrief. Charter boxes ticked in `flight.md`.
+- Status set to `completed` on the operator's instruction. (The instruction as given was to mark both sorties "landed", which they already were; it was read as the transition a debrief leads to.)
+- Sortie 01's open criterion re-assessed and a follow-up note added to its debrief; sortie 01 set to `completed` at the same time.

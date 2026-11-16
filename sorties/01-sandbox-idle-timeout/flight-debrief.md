@@ -105,9 +105,20 @@ All observed with mission-control 1.2.3.
 5. **Route the proxy's launch through one owner of "restart on demand"** so the stopped state is handled in one place, and make installer discovery distinguish "the command never ran" from "the command failed".
 
 ## Action Items
-- [ ] Follow-up sortie: watchdog must survive fork failure (Recommendation 1). Blocks the merge unless the operator accepts the risk.
+- [x] Follow-up sortie: watchdog must survive fork failure (Recommendation 1). Done as [sortie 02](../02-watchdog-survives-fork-failure/flight.md), commit `5cf4fad`.
 - [x] Pull request #1 returned to draft with a comment describing the defect (operator's decision at debrief).
 - [x] Squawk 0001 (completed 2026-11-15, pull request #2): in `McpProxy.open`, carry the failure reason as a field instead of rewriting the message with `replace`, and rename the local `attempt` that shadows the method.
 - [x] Squawk 0002 (completed 2026-11-15, pull request #2): add `loadConfig` cases for lenient values (`"45abc"`, `"1.5"`) of `MCPE_SANDBOX_IDLE_TIMEOUT`.
 - [x] Squawk 0003 (completed 2026-11-15, pull request #2): README note that `docker inspect` on the `mcp-everything.idle-timeout` label shows whether a sandbox has the timeout.
 - [ ] Later flight: CI for the Docker suite; idle-stop status in `project_info`; single owner for restart-on-demand; installer discovery error handling; gVisor and busybox verification.
+
+## Follow-up — 2026-11-15
+
+Added after [sortie 02](../02-watchdog-survives-fork-failure/flight-debrief.md) landed and was debriefed. The assessment above is left as written; this records what changed afterwards.
+
+- **The defect is fixed.** The watchdog now retries a failed fork instead of exiting (commit `5cf4fad` on this branch). Against the script this flight shipped, sortie 02's pressure cases stop the container with exit code 2 on both dash and busybox; against the fixed script they passed 30 of 30 runs per shell, and 10 of 10 per shell in independent review.
+- **The third charter criterion** ("a sandbox is never stopped mid-work") is now recorded as **met for the failure that was found**: on the two default images, under the tested pressure. It is not established as a general property. Still not shown: shells other than dash and busybox, fork failures from causes other than the process limit, retrying for longer than about a minute, gVisor, and an install as such. The repeated runs bound the failure rate at roughly 10%; they do not rule out a rare failure.
+- **This debrief's statement that the spec was wrong stands.** The spec said the watchdog "spins until it can" fork. That is what the watchdog does now; it is not what it did when that sentence was written.
+- **Recommendation 3 (a regression net that runs without being asked) was not acted on, and the gap grew.** Sortie 02's pressure cases are opt-in, by the operator's decision that they are too slow for every review. See sortie 02's debrief, Recommendation 1.
+- **The three squawks** logged from this debrief were completed the same day and are on this branch (`7cb69fd`).
+- **Status**: with the defect fixed, the operator directed that this sortie be closed; set to `completed`.

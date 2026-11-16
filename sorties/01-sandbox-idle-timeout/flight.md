@@ -1,6 +1,6 @@
 # Sortie: Sandbox Idle Timeout
 
-**Status**: landed
+**Status**: completed
 
 ## Charter
 
@@ -11,10 +11,10 @@ A project's sandbox container stops by itself after a period with no activity an
 Every installed project keeps a `sleep infinity` container running forever (the README lists this as a limitation), so containers pile up as projects are installed.
 
 ### Success Criteria
-- [ ] A sandbox with no activity for the configured period ends up stopped, with its volume and installed tools intact.
-- [ ] The next tool call against a stopped sandbox succeeds without user intervention, and its network setting (offline unless enabled) is unchanged.
-- [ ] A sandbox is never stopped mid-work: a running tool call, an install, or a live proxied MCP server counts as activity.
-- [ ] With no configuration the timeout is 30 minutes; `MCPE_SANDBOX_IDLE_TIMEOUT` (seconds) overrides it, and it is documented in the README table.
+- [x] A sandbox with no activity for the configured period ends up stopped, with its volume and installed tools intact.
+- [x] The next tool call against a stopped sandbox succeeds without user intervention, and its network setting (offline unless enabled) is unchanged.
+- [x] A sandbox is never stopped mid-work: a running tool call, an install, or a live proxied MCP server counts as activity. *(Not met when this flight landed; met for the failure that was found after sortie 02. See the debrief's follow-up.)*
+- [x] With no configuration the timeout is 30 minutes; `MCPE_SANDBOX_IDLE_TIMEOUT` (seconds) overrides it, and it is documented in the README table.
 
 ### Constraints
 - No weakening of sandbox isolation: capabilities, resource limits and network-off-after-install stay as they are.
