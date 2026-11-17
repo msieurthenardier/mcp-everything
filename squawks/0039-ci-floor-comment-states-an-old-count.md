@@ -7,11 +7,14 @@
 **Completed**: —
 
 ## Report
-The hosted check fails when fewer than 810 unit tests pass. The comment above that step says how many pass today, and it was written at the end of leg 4 of mission 02's flight 01; the review fix that followed added two cases. Correct the number in the comment. The floor itself is right: 833 rounded down to the ten is 830, less twenty is 810.
+The hosted check fails when fewer than a floor of unit tests pass. The comment above that step says how many pass today, and it was written at the end of leg 4 of mission 02's flight 01; the review fix that followed added two cases. Correct the number in the comment.
+
+**Updated 2026-11-17, after sortie 05.** The comment is wrong again by the same two. Sortie 05 raised the floor and the comment by the 57 tests it added, starting from the comment's old number: the comment now says 888 where 890 pass, and the floor is 867. Correct the comment to the count of the day, and so that it does not happen a third time, word the comment so that it does not need a number that goes stale (the step already prints the count and the floor on every run), or say in it that the number is the count at the date given and is not maintained. The floor (867, which is 23 under the count) stays as it is unless the operator wants it nearer.
 
 ## Evidence
-- `.github/workflows/ci.yml` — `# 831 tests pass as of 2026-11-16.`
-- `npm test -- --testTimeout=20000` at `df7fa8d`: 833 passed, 24 skipped.
+- `.github/workflows/ci.yml` — `# 888 tests pass as of 2026-11-17.` and `const floor = 867;` (was `# 831 tests pass as of 2026-11-16.` and `const floor = 810;` when this squawk was logged).
+- `npm test` on `main` at `82faddc`, run for sortie 05's debrief: 890 passed, 24 skipped. (At `df7fa8d`: 833 passed, 24 skipped.)
+- `sorties/05-serve-the-2026-07-28-protocol/flight-debrief.md`, Process.
 
 ## Corrective Action
 *(written at completion)*

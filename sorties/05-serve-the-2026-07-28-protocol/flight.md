@@ -1,6 +1,6 @@
 # Sortie: Serve the 2026-07-28 Protocol
 
-**Status**: landed
+**Status**: completed
 
 ## Charter
 
