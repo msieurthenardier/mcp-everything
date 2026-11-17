@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { InMemoryTransport } from "@modelcontextprotocol/client";
+import { InMemoryTransport, SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, type Config } from "../src/config.js";
 import { DockerUnavailableError, SandboxRefusedError } from "../src/sandbox/docker.js";
@@ -143,23 +143,26 @@ describe("McpProxy", () => {
  * A raw upstream: answers `initialize` by hand and hands every other request to `answer`, which returns the
  * message to send back (or nothing). Counts the launches it served.
  */
-function rawUpstream(answer: (m: { id: number; method: string }, close: () => void) => object | undefined) {
+function rawUpstream(
+  answer: (m: { id: number; method: string; params?: { cursor?: string } }, close: () => void) => object | undefined,
+  capabilities: Record<string, unknown> = { tools: {} },
+) {
   const state = { launches: 0 };
   const connector: Connector = () => {
     state.launches++;
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     serverSide.onmessage = (msg) => {
-      const m = msg as unknown as { id?: number; method?: string; params?: { protocolVersion?: string } };
+      const m = msg as unknown as { id?: number; method?: string; params?: { protocolVersion?: string; cursor?: string } };
       if (m.id === undefined || m.method === undefined) return;
       if (m.method === "initialize") {
         void serverSide.send({
           jsonrpc: "2.0",
           id: m.id,
-          result: { protocolVersion: m.params?.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "raw", version: "1" } },
+          result: { protocolVersion: m.params?.protocolVersion, capabilities, serverInfo: { name: "raw", version: "1" } },
         });
         return;
       }
-      const reply = answer({ id: m.id, method: m.method }, () => void serverSide.close());
+      const reply = answer({ id: m.id, method: m.method, params: m.params }, () => void serverSide.close());
       if (reply) void serverSide.send({ jsonrpc: "2.0", id: m.id, ...reply } as never);
     };
     void serverSide.start();
@@ -207,6 +210,79 @@ describe("McpProxy error classification", () => {
     await p.closeAll();
   });
 
+  // Every local code of the client library, with the outcome chosen for it on purpose. A code that is missing here
+  // (a release added one) or stale (a release removed one) fails the test below: classify it deliberately.
+  const OUTCOME: Record<string, "timeout" | "gone" | "rejected"> = {
+    [SdkErrorCode.RequestTimeout]: "timeout",
+    [SdkErrorCode.ConnectionClosed]: "gone",
+    [SdkErrorCode.SendFailed]: "gone",
+    [SdkErrorCode.NotConnected]: "gone",
+    [SdkErrorCode.AlreadyConnected]: "rejected",
+    [SdkErrorCode.NotInitialized]: "rejected",
+    [SdkErrorCode.CapabilityNotSupported]: "rejected",
+    [SdkErrorCode.InvalidResult]: "rejected",
+    [SdkErrorCode.UnsupportedResultType]: "rejected",
+    [SdkErrorCode.InputRequiredRoundsExceeded]: "rejected",
+    [SdkErrorCode.ListPaginationExceeded]: "rejected",
+    [SdkErrorCode.MethodNotSupportedByProtocolVersion]: "rejected",
+    [SdkErrorCode.EraNegotiationFailed]: "rejected",
+    [SdkErrorCode.ClientHttpNotImplemented]: "rejected",
+    [SdkErrorCode.ClientHttpAuthentication]: "rejected",
+    [SdkErrorCode.ClientHttpForbidden]: "rejected",
+    [SdkErrorCode.ClientHttpUnexpectedContent]: "rejected",
+    [SdkErrorCode.ClientHttpFailedToOpenStream]: "rejected",
+    [SdkErrorCode.ClientHttpFailedToTerminateSession]: "rejected",
+  };
+
+  it("has an outcome chosen on purpose for every code of the client library, and none for a code it no longer has", () => {
+    const codes = Object.values(SdkErrorCode) as string[];
+    const unclassified = codes.filter((c) => !(c in OUTCOME));
+    const stale = Object.keys(OUTCOME).filter((c) => !codes.includes(c));
+    expect(
+      unclassified,
+      `A new SdkErrorCode has appeared (${unclassified.join(", ")}); it must be classified deliberately as timeout, gone or rejected: ` +
+        `add it to OUTCOME here, and to GONE_CODES in src/proxy/mcp-proxy.ts if the transport is broken by it.`,
+    ).toEqual([]);
+    expect(stale, `OUTCOME names codes that SdkErrorCode no longer has: ${stale.join(", ")}`).toEqual([]);
+  });
+
+  it.each(Object.values(SdkErrorCode) as string[])("sorts the client's error code %s into its chosen outcome", async (code) => {
+    const outcome = OUTCOME[code];
+    expect(outcome, `SdkErrorCode ${code} has no chosen outcome; a new code must be classified deliberately`).toBeDefined();
+    const up2 = fakeUpstream();
+    let thrown = false;
+    const connector: Connector = (launch) => {
+      const conn = up2.connector(launch);
+      const send = conn.transport.send.bind(conn.transport);
+      conn.transport.send = async (msg, opts) => {
+        // The first tools/call of the whole run fails with this code; the client lets the error through unchanged.
+        if (!thrown && (msg as { method?: string }).method === "tools/call") {
+          thrown = true;
+          throw new SdkError(code as SdkErrorCode, "chosen failure");
+        }
+        return send(msg, opts);
+      };
+      return conn;
+    };
+    const p = rawProxy(connector);
+    const err = await p.callTool("c1", spec(), "add", { a: 1, b: 2 }, 5).catch((e: unknown) => e as Error);
+    const msg = (err as Error).message;
+    const kinds = {
+      timeout: /timed out after 5s; the server was stopped/,
+      gone: /stopped while running "add": .*chosen failure/s,
+      rejected: /rejected the call to "add": .*chosen failure/s,
+    } as const;
+    for (const [kind, re] of Object.entries(kinds)) {
+      if (kind === outcome) expect(msg).toMatch(re);
+      else expect(msg).not.toMatch(re);
+    }
+    // Kept or dropped, and what the next call on the same server reaches.
+    expect(p.size).toBe(outcome === "rejected" ? 1 : 0);
+    expect(textOf(await p.callTool("c1", spec(), "add", { a: 1, b: 2 }, 5))).toBe("3");
+    expect(up2.launches).toHaveLength(outcome === "rejected" ? 1 : 2);
+    await p.closeAll();
+  });
+
   it.each([-32000, -32001])("treats a server's own error of code %d as a rejected call and keeps the session", async (code) => {
     const raw = rawUpstream((m) => (m.method === "tools/call" ? { error: { code, message: "mine" } } : undefined));
     const p = rawProxy(raw.connector);
@@ -247,11 +323,73 @@ describe("McpProxy error classification", () => {
     expect(p.size).toBe(0);
   });
 
+  it("asks a server that does not advertise tools for its tools, and writes nothing to stdout", async () => {
+    const tool = { name: "t1", description: "one", inputSchema: { type: "object" } };
+    const raw = rawUpstream((m) => (m.method === "tools/list" ? { result: { tools: [tool] } } : undefined), {});
+    const p = rawProxy(raw.connector);
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const dbg = vi.spyOn(console, "debug");
+    try {
+      const tools = await p.listTools("c1", spec());
+      expect(tools).toEqual([{ name: "t1", description: "one", inputSchema: { type: "object" } }]);
+      expect(out).not.toHaveBeenCalled();
+      expect(dbg).not.toHaveBeenCalled();
+    } finally {
+      out.mockRestore();
+      dbg.mockRestore();
+    }
+    await p.closeAll();
+  });
+
   it("closes the session when a tools/list answer is malformed", async () => {
     const raw = rawUpstream((m) => (m.method === "tools/list" ? { result: { tools: "bad" } } : undefined));
     const p = rawProxy(raw.connector);
     await expect(p.listTools("c1", spec())).rejects.toThrow(/MCP server "srv" failed to list its tools/);
     expect(p.size).toBe(0);
+  });
+
+  describe("paging a tool list", () => {
+    const tool = (name: string) => ({ name, description: name, inputSchema: { type: "object" } });
+    /** An upstream whose page `n` (cursor "p<n>", none for the first) holds `size(n)` tools and points on to `next(n)`. */
+    const paging = (size: (n: number) => number, next: (n: number) => string | undefined) => {
+      const cursors: Array<string | undefined> = [];
+      const raw = rawUpstream((m) => {
+        if (m.method !== "tools/list") return undefined;
+        cursors.push(m.params?.cursor);
+        const n = m.params?.cursor ? Number(m.params.cursor.slice(1)) : 0;
+        const tools = Array.from({ length: size(n) }, (_, i) => tool(`t${n}-${i}`));
+        const nextCursor = next(n);
+        return { result: nextCursor ? { tools, nextCursor } : { tools } };
+      });
+      return { cursors, raw, proxy: rawProxy(raw.connector) };
+    };
+
+    it("follows nextCursor through every page, in order", async () => {
+      const x = paging(() => 2, (n) => (n < 2 ? `p${n + 1}` : undefined));
+      expect((await x.proxy.listTools("c1", spec())).map((t) => t.name)).toEqual([
+        "t0-0", "t0-1", "t1-0", "t1-1", "t2-0", "t2-1",
+      ]);
+      expect(x.cursors).toEqual([undefined, "p1", "p2"]);
+      await x.proxy.closeAll();
+    });
+
+    it("stops after 10 pages of a server that never stops giving a cursor, without an error or closing the session", async () => {
+      const x = paging(() => 1, (n) => `p${n + 1}`);
+      const tools = await x.proxy.listTools("c1", spec());
+      expect(x.cursors).toHaveLength(10);
+      expect(tools.map((t) => t.name)).toEqual(Array.from({ length: 10 }, (_, n) => `t${n}-0`));
+      expect(x.proxy.size).toBe(1);
+      await x.proxy.closeAll();
+    });
+
+    it("stops at the first page that brings the total to 500 or more, and does not ask again", async () => {
+      const x = paging(() => 200, (n) => `p${n + 1}`);
+      const tools = await x.proxy.listTools("c1", spec());
+      expect(x.cursors).toEqual([undefined, "p1", "p2"]);
+      expect(tools).toHaveLength(600);
+      expect(x.proxy.size).toBe(1);
+      await x.proxy.closeAll();
+    });
   });
 });
 

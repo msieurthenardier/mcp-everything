@@ -19,15 +19,18 @@ export interface EntryWiring {
   serve: () => Promise<Serving>;
   deadlineMs?: number;
   log: (line: string) => void;
+  /** The console `guardStdout` redirects; the real one by default. */
+  console?: Pick<Console, "debug" | "log" | "info" | "error">;
 }
 
 /**
- * Starts serving, then registers the shutdown on the input's end and on the two
+ * Guards stdout first (nothing may reach it but protocol), starts serving, then registers the shutdown on the input's end and on the two
  * signals. A trigger shuts the app down, then closes the serving handle (also
  * when the shutdown failed), then exits, within the deadline. Registering only
  * after serving has started keeps this listener behind the transport's own.
  */
 export async function runEntry(w: EntryWiring): Promise<void> {
+  guardStdout(w.console ?? console, w.console ?? console);
   const serving = await w.serve();
   const shutdown = boundedShutdown({
     close: async () => {
@@ -54,4 +57,16 @@ export async function runEntry(w: EntryWiring): Promise<void> {
  */
 export function serveApp(app: { createServer(): Server }, transport?: Transport): Serving {
   return serveStdio(() => app.createServer(), transport ? { transport } : undefined);
+}
+
+/**
+ * stdout carries this process's MCP protocol, so nothing else may write to it. Node's `console.debug`, `console.log`
+ * and `console.info` write to stdout; a dependency calling one would put a non-protocol line in the stream. Called
+ * first thing at the entry: sends the three to stderr (`console.warn` and `console.error` already go there).
+ */
+export function guardStdout(c: Pick<Console, "debug" | "log" | "info"> = console, stderr: Pick<Console, "error"> = console): void {
+  const toStderr = (...args: unknown[]) => stderr.error(...args);
+  c.debug = toStderr;
+  c.log = toStderr;
+  c.info = toStderr;
 }

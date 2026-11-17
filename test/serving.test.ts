@@ -173,7 +173,6 @@ describe("a 2026-07-28 client", () => {
     const s = stubInstall(["cloning", "building"]);
     const r = raw();
     const answer = r.modern("tools/call", { name: "install_project", arguments: { repo: "owner/demo" }, _meta: { progressToken: "p1" } });
-    await new Promise((res) => setImmediate(res));
     s.open();
     const result = await answer;
     expect(result.result).toBeDefined();
@@ -213,10 +212,17 @@ describe("a 2025 client", () => {
 describe("a change to the tool list", () => {
   it("reaches a 2025 client before the answer of an install that waited for its job", async () => {
     const s = stubInstall();
-    const c = await connected();
+    const r = raw();
+    await r.initialize("2025-11-25");
+    await r.notify("notifications/initialized");
     s.open();
-    await c.client.callTool({ name: "install_project", arguments: { repo: "owner/demo" } });
-    expect(c.count()).toBe(1);
+    const answer = await r.legacy("tools/call", { name: "install_project", arguments: { repo: "owner/demo" } });
+    expect(answer.result).toBeDefined();
+    // The order is read off the wire (the client's received messages, in arrival order), not off when a handler ran.
+    const at = (m: Wire) => r.got.indexOf(m);
+    const changes = r.got.filter((m) => m.method === LIST_CHANGED);
+    expect(changes.length).toBe(1);
+    expect(at(changes[0]!)).toBeLessThan(at(answer));
   });
 
   it("reaches a 2025 client when an install that answered `still installing` finishes later", async () => {
@@ -374,5 +380,8 @@ describe("the line written for a connection", () => {
     expect(app.connections).toBe(1);
     expect(() => s.oninitialized?.()).not.toThrow();
     expect(connectionLines()).toEqual([]);
+    // `s` is not closed: it was never connected, so it has no transport and `close()` does not fire `onclose`, which
+    // is what removes an instance from the live set (tried: the count stays 1). It cannot leak into another test:
+    // `app` is built afresh in `beforeEach`, so the instance lives and dies with this test's app.
   });
 });
