@@ -3,7 +3,7 @@
 **Flight**: [Serve the 2026-07-28 Protocol](flight.md)
 
 ## Summary
-In flight. Both autonomous legs are completed, reviewed and committed: mcp-everything is on the v2 SDK packages and serves each connection in the revision its client opens with. The HAT leg with the operator's GleepGlorp client remains. Charter agreed 2026-11-16; criterion 3 reworded and the spec approved by the operator on 2026-11-17.
+Landed on 2026-11-17, three legs of three. mcp-everything is on the v2 SDK packages and serves each connection in the revision its client opens with; the operator's GleepGlorp client shows it at version `0.5.0` in `2026-07-28`. Pull request #20. Not yet debriefed; the charter's criteria are assessed there.
 
 ---
 
@@ -141,6 +141,22 @@ Tests added after the Reviewer's confirmation (10). No file of `src/` changed. E
   - "disconnect_mcp_server announces a tool list change once".
 - CI: floor 857 to 867, comment 878 to 888 (for 890 passing).
 
+### hat-and-alignment
+**Status**: completed
+**Started**: 2026-11-17
+**Completed**: 2026-11-17
+
+#### Changes Made
+- The version raised from `0.4.0` to `0.5.0` at the operator's request (`f0590c2`), so that the branch's build could be told from `main`'s in the client. No other source change.
+
+#### Notes
+All of this is the operator's report unless it says otherwise.
+- Steps 1 to 3, met. The first two attempts, on the operator's existing entry for mcp-everything, showed `2025-11-25` (at `0.4.0`, then at `0.5.0`). Added as a new entry in GleepGlorp, the branch's build shows version `0.5.0` and protocol `2026-07-28`, lists its tools, and answers `list_projects`. Charter criterion 4.
+- Why the existing entry showed `2025-11-25` is not established. Two mechanisms in GleepGlorp were found by reading its source and one was reproduced with its own code (Flight Director Notes); the operator takes it as a fault on that side.
+- Step 4, skipped by the operator: the diagnostics line was not compared in the operator's client.
+- Step 5: the operator added a project from GleepGlorp, saw its sandbox in Docker with the installation's id in the name, got its tools, and removed it cleanly. **Not reported**: whether GleepGlorp's tool list changed without a reconnect, so nothing is recorded about whether it subscribes to tool-list changes. Under criterion 3 as reworded, that does not bear on the criteria.
+- Step 6: asked together with step 5; the operator answered step 5 and asked for no change of wording.
+
 ---
 
 ## Decisions
@@ -193,6 +209,22 @@ Tests added after the Reviewer's confirmation (10). No file of `src/` changed. E
 - HAT leg (`hat-and-alignment`) designed and set `in-flight`: interactive, no crew spawned, low risk. `dist/` was rebuilt after the commit (two source files carried newer timestamps than the build, from the reviewers' mutations, which were undone by editing) and the pipe script re-run on it: `RESULT: PASS`. The operator is guided one step at a time.
 - HAT, step 1, first attempt. The operator asked how to point the client at the branch and was given the `npx` form with `#sortie/05-serve-the-2026-07-28-protocol` (or `#eed2610`), neither run by the Flight Director, and the checkout's `dist/index.js`. GleepGlorp then showed: version `0.4.0`, protocol `2025-11-25`, offers tools. That does not yet tell a stale build from a client that opened with `initialize`: `main` and the branch both say `0.4.0`.
 - The operator asked for the minor version to be raised on the branch, so that the build can be told apart. **Classed as a fix, not a feature**, said out loud: it changes four version values and no behavior, on one surface. Made inline by a Developer (`0.4.0` to `0.5.0`), committed and pushed at once, since the operator fetches the branch from GitHub.
+- Version bump committed by a Developer as `f0590c2` and pushed. HAT, step 1, second attempt: GleepGlorp shows version `0.5.0`, protocol `2025-11-25`. So the branch's build is what ran, and criterion 2 of the leg is **not met**. The operator added that another server on the same GleepGlorp ("NVIDIA App", version 1.0.0) shows protocol `2026-07-28`. So GleepGlorp does reach `2026-07-28` with some server, and the spec's third divert condition ("GleepGlorp opens with `initialize`": land with criteria 1 to 3 and reword criterion 4) is not applied yet: what GleepGlorp sends to this server is not known, and the difference between the two servers has to be found first.
+- Measured by the Flight Director on the `0.5.0` build, one run each, to see which openings this server does not take as `2026-07-28`: a `server/discover` with no `params` is answered `-32601` "Method not found"; a `server/discover` whose `_meta` has the protocol version but no client capabilities is answered `-32602`, naming the missing key; an `initialize` asking for `2026-07-28` is answered `2025-11-25`. A client that probes in either of the first two ways and then falls back would show `2025-11-25`.
+- To find out which, a pass-through tap (a script outside the repository, written and tested by the Flight Director: it copies every byte both ways and logs each line with its direction) is offered to the operator to put between GleepGlorp and the built entry for one connection. Nothing in the repository changes for this.
+- The tap was not needed: the operator pointed the Flight Director at GleepGlorp's own source. Read there (its negotiation module and the Python MCP SDK `2.3.0` in its environment), nothing in it changed:
+  - It opens with `server/discover` carrying the full envelope, and falls back to `initialize` on any protocol error from that probe. The probe has a 10 s timeout in the SDK.
+  - It keeps, in memory and per configured server, the revision that server last connected on. When that is a 2025 revision, the next ordinary connect sends `initialize` at once, with no probe. The memory is dropped when the client restarts, when the server's entry is updated or deleted, and on "Reset connection". A test of a connection ignores it.
+- Measured by the Flight Director with GleepGlorp's SDK and its own `negotiate` function, from its environment, against this checkout's `0.5.0` build with a temporary data directory, one run each:
+  - `send_discover` at `2026-07-28`: answered; the result validated as the SDK's `DiscoverResult`; adopted; the session's revision was `2026-07-28`.
+  - `negotiate` with nothing remembered and the server starting at once: `2026-07-28` after 0.2 s.
+  - The same with the server's start delayed 11 s: `2025-11-25` after 11.2 s, and the server's diagnostics line said `2025-11-25`. So a server that takes longer than 10 s to start is served in the 2025 revision by this client, by the client's own fallback. The server did what the spec's DD4 describes for a probe followed by `initialize`.
+- Measured, the time from starting `npx -y github:…#f0590c2` to the answer to a `server/discover` sent at once: 7.5 s on the first run (nothing cached for that commit), 1.7 s on the second and third. Starting `node dist/index.js` directly: 0.17 s. So on this machine a first `npx` launch of a new commit is inside the 10 s, with 2.5 s to spare; where the client runs it may not be.
+- The operator then added mcp-everything to GleepGlorp as a new server entry and reports that it shows the revision properly, and that the fault with the old entry looks to be on GleepGlorp's side. Both mechanisms above would produce what the operator saw with the old entry (a remembered 2025 revision; or a first launch slower than the probe's timeout), and a new entry escapes the first. **Which one it was is not established**; that belongs to GleepGlorp, not to this sortie.
+- HAT, steps 1 to 3, **met**, on the operator's report: with mcp-everything added to GleepGlorp as a new entry, running the branch's build, GleepGlorp shows version `0.5.0` and protocol `2026-07-28`; its tool list shows the tools, and `list_projects` called from it works. That is charter criterion 4. The old entry's `2025-11-25` is put down to GleepGlorp (see above) and is not a failure of this leg.
+- HAT, step 4: skipped by the operator. The diagnostics line was **not compared** with GleepGlorp's display in the operator's client. It was seen once with the right revision in each of the pipe check's three cases and in the Flight Director's runs with GleepGlorp's SDK.
+- HAT, steps 5 and 6, and landing. The operator's answer covered the install and the removal and did not say whether the tool list followed without a reconnect; it is recorded as that and not rounded up. The last two steps were put to the operator in one message, not one at a time, after the operator skipped step 4: neither could fail the leg. Leg 3 `completed`; all three legs have log entries; the README was updated in leg 2 and no other document describes the protocol; flight status set to `landed`. `[COMPLETE:flight]`. The artifact updates of the HAT are committed by the Flight Director (artifacts only, no source). Pull request #20 marked ready for review.
+- Open for the operator at merge: the version is `0.5.0` on the branch. It was raised to tell builds apart; it is also a fair number for a release that adds a protocol revision. No tag was made.
 
 ### 2026-11-16: planning
 

@@ -1,6 +1,6 @@
 # Sortie: Serve the 2026-07-28 Protocol
 
-**Status**: in-flight
+**Status**: landed
 
 ## Charter
 
@@ -176,7 +176,7 @@ Statements of fact below are marked **measured** (observed by running something 
 ### Checkpoints
 - [x] Leg 1: the shutdown order test passes on v1 and again after the package move; `npm ls @modelcontextprotocol/sdk` is empty; typecheck, unit suite and Docker suite pass; the built entry still answers `initialize` with `2025-11-25`
 - [x] Leg 2: the shutdown order test still passes after the switch to `serveStdio`; `npm ls @modelcontextprotocol/sdk` is still empty; a pinned `2026-07-28` client and a 2025 client both list, call and hear a tool-list change, in memory; the built entry answers `server/discover` over a pipe
-- [ ] HAT: against a build of the sortie's branch, GleepGlorp's UI shows `2026-07-28`; where GleepGlorp shows the server's stderr, the diagnostics line names the same revision
+- [x] HAT: against a build of the sortie's branch, GleepGlorp's UI shows `2026-07-28`; where GleepGlorp shows the server's stderr, the diagnostics line names the same revision
 
 ### Adaptation Criteria
 
@@ -196,17 +196,17 @@ Statements of fact below are marked **measured** (observed by running something 
 
 - [x] `sdk-v2-packages` - Make the entry wiring testable and pin the shutdown order; then move server, proxy and tests from `@modelcontextprotocol/sdk` to the v2 packages with nothing a client can observe changed
 - [x] `serve-both-eras` - Serve through `serveStdio` from a factory; announce tool-list changes to every live instance; the diagnostics line; tests for both eras; README and CI floor
-- [ ] `hat-and-alignment` - Guided HAT (human acceptance test) session with the operator's GleepGlorp client, with iterative fixes
+- [x] `hat-and-alignment` - Guided HAT (human acceptance test) session with the operator's GleepGlorp client, with iterative fixes
 
 ---
 
 ## Post-Flight
 
 ### Completion Checklist
-- [ ] All legs completed
+- [x] All legs completed
 - [ ] Code merged
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Tests passing
+- [x] Documentation updated
 
 ### Verification
 

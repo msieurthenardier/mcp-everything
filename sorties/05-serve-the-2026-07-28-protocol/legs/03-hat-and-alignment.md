@@ -1,6 +1,6 @@
 # Leg: hat-and-alignment
 
-**Status**: in-flight
+**Status**: completed
 **Flight**: [Serve the 2026-07-28 Protocol](../flight.md)
 
 ## Objective
@@ -24,12 +24,12 @@ The operator sees, in their own GleepGlorp client, mcp-everything served in the 
 - Any fix made along the way, reviewed and committed.
 
 ## Acceptance Criteria
-- [ ] 1. GleepGlorp starts mcp-everything from the branch build and connects.
-- [ ] 2. GleepGlorp's UI shows the connection's revision as `2026-07-28`. *(Charter criterion 4.)*
-- [ ] 3. GleepGlorp lists mcp-everything's tools, the built-in ones and the installed projects', and a call made from it (`list_projects`) returns its result.
-- [ ] 4. If GleepGlorp shows the server's stderr: it holds `[mcp-everything] connection: MCP protocol 2026-07-28`, once for the connection. If it does not show stderr, this is recorded as not compared.
-- [ ] 5. The operator installs a small project they do not already have, and then uninstalls it, and reports each time whether GleepGlorp's tool list showed the change without a reconnect. Recorded as seen; neither answer fails the leg.
-- [ ] 6. The operator says whether the README's "Protocol revisions" section and the diagnostics line read right to them; anything they want changed is fixed or recorded.
+- [x] 1. GleepGlorp starts mcp-everything from the branch build and connects.
+- [x] 2. GleepGlorp's UI shows the connection's revision as `2026-07-28`. *(Charter criterion 4.)*
+- [x] 3. GleepGlorp lists mcp-everything's tools, the built-in ones and the installed projects', and a call made from it (`list_projects`) returns its result.
+- [x] 4. *(Not compared: skipped by the operator, 2026-11-17.)* If GleepGlorp shows the server's stderr: it holds `[mcp-everything] connection: MCP protocol 2026-07-28`, once for the connection. If it does not show stderr, this is recorded as not compared.
+- [x] 5. *(Done; see the flight log for what was and was not reported.)* The operator installs a small project they do not already have, and then uninstalls it, and reports each time whether GleepGlorp's tool list showed the change without a reconnect. Recorded as seen; neither answer fails the leg.
+- [x] 6. *(Asked; no change requested, 2026-11-17.)* The operator says whether the README's "Protocol revisions" section and the diagnostics line read right to them; anything they want changed is fixed or recorded.
 
 ## Verification Steps
 One step per criterion, in order, each performed by the operator and reported back. A step that fails is diagnosed, and fixed or diverted, before the next one starts.
