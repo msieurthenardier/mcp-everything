@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, type Config } from "../src/config.js";
 import { parseRepoRef } from "../src/forge/repo-ref.js";
 import { Installer, staleInstallLimitSec } from "../src/install/installer.js";
@@ -10,8 +10,16 @@ import { McpProxy } from "../src/proxy/mcp-proxy.js";
 import type { Connector, Launch } from "../src/proxy/mcp-proxy.js";
 import { Registry } from "../src/registry.js";
 import { App } from "../src/server.js";
-import type { ExecOptions, ExecResult, ProbeData } from "../src/sandbox/docker.js";
-import { FakeDocker, fakeUpstream, record as seedRecord, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
+import {
+  DockerUnavailableError,
+  SandboxRefusedError,
+  type ExecOptions,
+  type ExecResult,
+  type ProbeData,
+  type SandboxFacts,
+  type SandboxRef,
+} from "../src/sandbox/docker.js";
+import { FakeDocker, fakeUpstream, record as seedRecord, SECRET_VALUE, targetName, TEST_INSTALLATION_ID, type FakeUpstream, type SandboxTarget } from "./helpers.js";
 import type { ProjectRecord } from "../src/types.js";
 
 const TOOL_HELP = `Tool does things.
@@ -57,8 +65,27 @@ class ScriptedDocker extends FakeDocker {
   /** Throw from setNetwork on the given 1-based calls ("all" for every call). */
   setNetworkFails: number[] | "all" = [];
   removeContainerFails: number[] = [];
+  /** Throw from createContainer on the given 1-based calls. */
+  createContainerFails: number[] = [];
+  /** References whose container `removeContainer` has removed: `setNetwork` on one throws, as Docker does. */
+  private gone = new Set<string>();
   destroyFails: number[] | "all" = [];
+  /** Throw this from `destroy` of the container with this name (a refusal or "could not be asked"). */
+  destroyErrors: Record<string, Error> = {};
+  /** Throw this from `setNetwork` (any call). */
+  setNetworkError?: Error;
+  /** Throw what this returns from an `exec` whose argv it accepts. */
+  execError?: (argv: string[]) => Error | undefined;
   private counts = { setNetwork: 0, removeContainer: 0, destroy: 0 };
+  /**
+   * Every call the installer makes into this double, with the arguments and the
+   * widget record as registry.json holds it on disk at that moment (not an
+   * object the installer may still be changing).
+   */
+  trace: Array<{ call: string; args: string[]; rec: ProjectRecord | undefined }> = [];
+  traced(call: string, ...args: string[]): void {
+    this.trace.push({ call, args, rec: onDisk("widget") });
+  }
 
   private fail(which: keyof ScriptedDocker["counts"], when: number[] | "all"): void {
     const n = ++this.counts[which];
@@ -69,17 +96,25 @@ class ScriptedDocker extends FakeDocker {
   unavailable = false;
   onAvailable?: () => void;
   onSetNetwork?: () => void;
-  override async setNetwork(container: string, enabled: boolean): Promise<void> {
+  override async setNetwork(target: SandboxTarget, enabled: boolean): Promise<void> {
+    this.traced("setNetwork", targetName(target), String(enabled));
     this.onSetNetwork?.();
+    if (typeof target !== "string" && this.gone.has(target.id)) throw new Error(`Sandbox ${target.name} no longer exists`);
+    if (this.setNetworkError) throw this.setNetworkError;
     this.fail("setNetwork", this.setNetworkFails);
-    return super.setNetwork(container, enabled);
+    return super.setNetwork(target, enabled);
   }
   override async removeContainer(container: string): Promise<void> {
+    this.traced("removeContainer", container);
     this.fail("removeContainer", this.removeContainerFails);
+    for (const ref of this.created) if (ref.name === container) this.gone.add(ref.id);
     return super.removeContainer(container);
   }
-  override async destroy(container: string): Promise<void> {
+  override async destroy(container: string, volume?: string): Promise<void> {
+    this.traced("destroy", container, volume ?? "");
     this.fail("destroy", this.destroyFails);
+    const refused = this.destroyErrors[container];
+    if (refused) throw refused;
     return super.destroy(container);
   }
 
@@ -89,14 +124,24 @@ class ScriptedDocker extends FakeDocker {
     if (this.unavailable) throw new Error("Docker CLI could not be run");
   }
   override async probe(): Promise<ProbeData> {
+    this.traced("probe");
     if (this.probeError) throw this.probeError;
     return this.probeData;
   }
   override async ensureImage(image: string): Promise<void> {
     if (this.missingImages.has(image)) throw new Error(`Failed to pull image ${image}: not found`);
   }
-  override async createContainer(opts: { image: string }): Promise<void> {
+  /** Every reference `createContainer` handed out, in order; each has a different id. */
+  created: SandboxRef[] = [];
+  private createCalls = 0;
+  override async createContainer(opts: { image: string; name: string }): Promise<SandboxRef> {
+    this.traced("createContainer", opts.name);
+    const call = ++this.createCalls;
+    if (this.createContainerFails.includes(call)) throw new Error(`createContainer failed (call ${call})`);
     this.images.push(opts.image);
+    const ref = Object.freeze({ id: `${this.created.length + 1}`.padStart(64, "e"), name: opts.name });
+    this.created.push(ref);
+    return ref;
   }
 
   private answer(argv: string[]): Partial<ExecResult> {
@@ -124,19 +169,38 @@ class ScriptedDocker extends FakeDocker {
     return { code: 1 };
   }
 
-  override async exec(container: string, argv: string[], opts: ExecOptions): Promise<ExecResult> {
-    this.calls.push({ container, argv, opts });
+  override async exec(target: SandboxTarget, argv: string[], opts: ExecOptions): Promise<ExecResult> {
+    this.calls.push({ container: targetName(target), argv, opts, sandbox: typeof target === "string" ? undefined : target });
+    const failure = this.execError?.(argv);
+    if (failure) throw failure;
     const res = { code: 0, stdout: "", stderr: "", timedOut: false, truncated: false, ...this.answer(argv) };
     if (res.stdout) opts.onOutput?.(res.stdout);
     return res;
   }
 }
 
+/** The sandbox name a fresh install of acme/widget gets: prefix, installation id, slug. */
+const WIDGET = `mcpe-${TEST_INSTALLATION_ID}-widget`;
+
+/** A refusal as the Docker layer raises it, built from the facts of the parts it found. */
+const refusal = (...facts: SandboxFacts[]) => new SandboxRefusedError(facts, TEST_INSTALLATION_ID);
+const part = (kind: "container" | "volume", sandbox: string, cls: SandboxFacts["cls"], owner?: string): SandboxFacts => ({ kind, sandbox, cls, owner });
+const OTHER = "deadbeef";
+
 const SOFT_FAIL = { stdout: "MCPE_SOFT_FAIL\nMCPE_WARN build script failed; binaries that need a build step may be missing\n" };
 const pkg = (body: object) => JSON.stringify({ name: "tool-pkg", bin: { tool: "cli.js" }, ...body });
 
 let dir: string;
+/** A record as registry.json holds it right now, read afresh. */
+const onDisk = (slug: string): ProjectRecord | undefined => {
+  try {
+    return (JSON.parse(fs.readFileSync(path.join(dir, "registry.json"), "utf8")) as { projects: Record<string, ProjectRecord> }).projects[slug];
+  } catch {
+    return undefined;
+  }
+};
 let cfg: Config;
+let proxy: McpProxy;
 let docker: ScriptedDocker;
 let up: FakeUpstream;
 let registry: Registry;
@@ -148,7 +212,8 @@ function setup(env: Record<string, string> = {}): void {
   up = fakeUpstream();
   up.answer = false;
   registry = new Registry(dir);
-  installer = new Installer(cfg, docker, registry, new McpProxy(cfg, docker, up.connector));
+  proxy = new McpProxy(cfg, docker, up.connector);
+  installer = new Installer(cfg, docker, registry, proxy);
 }
 const install = (extra: object = {}) => installer.install({ repo: parseRepoRef("acme/widget", cfg.hosts), ...extra });
 
@@ -193,7 +258,7 @@ describe("runtime selection during install", () => {
     // The stale warning from the failed attempt is not carried over.
     expect(record.warnings).not.toContain("build script failed; binaries that need a build step may be missing");
     // The container was replaced and the checkout cleaned; the volume was kept.
-    expect(docker.destroyed.filter((d) => d.startsWith("container:"))).toEqual(["container:mcpe-widget"]);
+    expect(docker.destroyed.filter((d) => d.startsWith("container:"))).toEqual([`container:${WIDGET}`]);
     const order = docker.calls.map((c) => c.argv[2] ?? "").filter((s) => s.includes("git clean") || s.includes("soft_fail()"));
     expect(order.map((s) => (s.includes("git clean") ? "clean" : "recipe"))).toEqual(["recipe", "clean", "recipe"]);
   });
@@ -541,7 +606,7 @@ describe("refresh_mcp on a scripted sandbox", () => {
 
 describe("install failure paths", () => {
   const lastNetwork = () => docker.network[docker.network.length - 1];
-  const destroys = () => docker.destroyed.filter((d) => d === "mcpe-widget");
+  const destroys = () => docker.destroyed.filter((d) => d === WIDGET);
   const retryable = () => {
     docker.repoFiles = { "package.json": pkg({ engines: { node: "^22.23.4 || ^24.22.1 || >=26.12.1" } }) };
     docker.recipe = (image) => (image === "node:26" ? SOFT_FAIL : { stdout: "built\n" });
@@ -584,7 +649,7 @@ describe("install failure paths", () => {
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: false, error: "Install recipe for node exited with code 1." });
       expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
-      expect(lastNetwork()).toEqual(["mcpe-widget", false]);
+      expect(lastNetwork()).toEqual([WIDGET, false]);
     });
 
     it("takes it off the network when the recipe times out, and names the limit", async () => {
@@ -594,7 +659,7 @@ describe("install failure paths", () => {
       expect(record).toMatchObject({ status: "failed", network: false });
       expect(record.error).toMatch(/^Install timed out after 45s/);
       expect(registry.get("widget")?.network).toBe(false);
-      expect(lastNetwork()).toEqual(["mcpe-widget", false]);
+      expect(lastNetwork()).toEqual([WIDGET, false]);
     });
 
     it("takes it off the network when the second attempt's image cannot be pulled", async () => {
@@ -603,7 +668,7 @@ describe("install failure paths", () => {
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: false, error: "Failed to pull image node:lts: not found" });
       expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
-      expect(lastNetwork()).toEqual(["mcpe-widget", false]);
+      expect(lastNetwork()).toEqual([WIDGET, false]);
     });
 
     it("takes it off the network when removing the container for the second attempt fails", async () => {
@@ -612,7 +677,33 @@ describe("install failure paths", () => {
       docker.removeContainerFails = [1];
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: false, error: "removeContainer failed (call 1)" });
-      expect(lastNetwork()).toEqual(["mcpe-widget", false]);
+      expect(lastNetwork()).toEqual([WIDGET, false]);
+    });
+
+    it("keeps no claim about a container that is gone when the second container cannot be created", async () => {
+      retryable();
+      // Call 1 makes the first container; call 2 (the rebuild's) throws, after the first was removed.
+      docker.createContainerFails = [2];
+      const record = await install({ network: true });
+      expect(record.status).toBe("failed");
+      expect(record.error).toBe("createContainer failed (call 2)");
+      expect(record.warnings.join("\n")).not.toContain("may still be online");
+      // No container exists, so the install ends as one that never made one: the record is deleted ...
+      expect(registry.get("widget")).toBeUndefined();
+      // ... and what is at the new names is removed (opening destroy, then this rollback).
+      expect(destroys()).toHaveLength(2);
+      // The install never asked about the removed container's network.
+      expect(docker.trace.filter((t) => t.call === "setNetwork")).toEqual([]);
+    });
+
+    it("takes the second container offline, through its own reference, when the second build fails", async () => {
+      docker.repoFiles = { "package.json": pkg({ engines: { node: ">=20" } }) };
+      docker.recipe = () => ({ code: 1, stderr: "boom\n" });
+      const record = await install({ network: true });
+      expect(record).toMatchObject({ status: "failed", network: false, error: "Install recipe for node exited with code 1." });
+      expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
+      expect(docker.created).toHaveLength(2);
+      expect(record.warnings.join("\n")).not.toContain("may still be online");
     });
 
     it("takes it off the network when a step fails after the requested policy was applied", async () => {
@@ -624,8 +715,8 @@ describe("install failure paths", () => {
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: false, error: "discovery lost the daemon" });
       expect(docker.network).toEqual([
-        ["mcpe-widget", true],
-        ["mcpe-widget", false],
+        [WIDGET, true],
+        [WIDGET, false],
       ]);
       expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
     });
@@ -635,7 +726,7 @@ describe("install failure paths", () => {
       docker.setNetworkFails = [1];
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: false, error: "setNetwork failed (call 1)" });
-      expect(lastNetwork()).toEqual(["mcpe-widget", false]);
+      expect(lastNetwork()).toEqual([WIDGET, false]);
     });
 
     it("keeps the original error and records the network as on when it cannot be turned off", async () => {
@@ -664,14 +755,14 @@ describe("install failure paths", () => {
       docker.repoFiles = { "package.json": pkg({}) };
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "ready", network: true });
-      expect(docker.network).toEqual([["mcpe-widget", true]]);
+      expect(docker.network).toEqual([[WIDGET, true]]);
     });
 
     it("leaves the sandbox detached and recorded off by default", async () => {
       docker.repoFiles = { "package.json": pkg({}) };
       const record = await install();
       expect(record).toMatchObject({ status: "ready", network: false });
-      expect(docker.network).toEqual([["mcpe-widget", false]]);
+      expect(docker.network).toEqual([[WIDGET, false]]);
     });
   });
 
@@ -862,5 +953,690 @@ describe("stale installs at startup", () => {
     expect(w).toHaveLength(3);
     expect(w[2]).toContain("set_project_network");
     expect(registry.get("x")).toMatchObject({ status: "failed", network: true });
+  });
+});
+
+describe("sandbox names and reinstall order", () => {
+  const OLD = "mcpe-widget";
+  const OLD_WARNING = "A reinstall could not remove this project's old sandbox, which may be partly removed; reinstall again to retry.";
+  /** A project installed by an earlier version: names without the installation id. */
+  const seedOld = (over: Partial<ProjectRecord> = {}): ProjectRecord => {
+    const r: ProjectRecord = {
+      ...seedRecord("widget", "acme/widget"),
+      tools: [{ name: "widget__tool" } as ProjectRecord["tools"][number]],
+      selection: { include: ["tool"], exclude: [], maxTools: 3 },
+      ...over,
+    };
+    registry.put(r);
+    return structuredClone(r);
+  };
+  /** What closing proxied servers sees, recorded like a Docker call. */
+  const spyClose = () => {
+    const real = proxy.closeProject.bind(proxy);
+    vi.spyOn(proxy, "closeProject").mockImplementation(async (container: string) => {
+      docker.traced("closeProject", container);
+      return real(container);
+    });
+  };
+  const steps = () => docker.trace.map((t) => `${t.call} ${t.args.join(" ")}`.trim());
+  const named = (t: { rec: ProjectRecord | undefined }) => t.rec?.container;
+  beforeEach(() => {
+    docker.repoFiles = { "package.json": pkg({}) };
+  });
+
+  it("gives a first install names made of the prefix, the id and the slug, with one removal opening it", async () => {
+    spyClose();
+    const record = await install();
+    expect(record).toMatchObject({ status: "ready", container: WIDGET, volume: WIDGET });
+    expect(registry.get("widget")).toMatchObject({ container: WIDGET, volume: WIDGET });
+    expect(steps().slice(0, 4)).toEqual([`closeProject ${WIDGET}`, `destroy ${WIDGET} ${WIDGET}`, "probe", `createContainer ${WIDGET}`]);
+    expect(steps().some((s) => s.includes(OLD))).toBe(false);
+    expect(docker.destroyed).toEqual([WIDGET]);
+  });
+
+  it("puts the chosen prefix before the id", async () => {
+    setup({ MCPE_NAME_PREFIX: "box-" });
+    const record = await install();
+    expect(record).toMatchObject({ container: `box-${TEST_INSTALLATION_ID}-widget`, volume: `box-${TEST_INSTALLATION_ID}-widget` });
+  });
+
+  it("moves a reinstall from the old names to the new ones, never holding the new names before the old sandbox is gone", async () => {
+    spyClose();
+    const before = seedOld();
+    const record = await install({ reinstall: true });
+    expect(record).toMatchObject({ status: "ready", container: WIDGET, volume: WIDGET });
+    expect(registry.get("widget")?.selection).toEqual(before.selection);
+    expect(steps().slice(0, 6)).toEqual([
+      `closeProject ${OLD}`,
+      `destroy ${OLD} ${OLD}`,
+      `closeProject ${WIDGET}`,
+      `destroy ${WIDGET} ${WIDGET}`,
+      "probe",
+      `createContainer ${WIDGET}`,
+    ]);
+    // Until the old sandbox's removal has returned (the call after it), the record, read from disk, says installing with the old names.
+    const [closeOld, destroyOld, closeNew, destroyNew, probe] = docker.trace;
+    for (const t of [closeOld!, destroyOld!]) {
+      expect(t.rec).toMatchObject({ status: "installing", container: OLD, volume: OLD });
+    }
+    for (const t of [closeNew!, destroyNew!, probe!]) {
+      expect(t.rec).toMatchObject({ status: "installing", container: WIDGET, volume: WIDGET });
+    }
+    // At no call into the double does the record hold the new names while the old sandbox stands.
+    const oldGone = docker.trace.findIndex((t) => t.call === "destroy" && t.args[0] === OLD) + 1;
+    docker.trace.forEach((t, i) => expect(named(t)).toBe(i < oldGone ? OLD : WIDGET));
+  });
+
+  it("treats the two old names as two names", async () => {
+    seedOld({ volume: "mcpe-widget-data" });
+    spyClose();
+    await install({ reinstall: true });
+    expect(steps()[1]).toBe(`destroy ${OLD} mcpe-widget-data`);
+  });
+
+  it("removes the sandbox once, not twice, when the record already holds the names computed now", async () => {
+    seedOld({ container: WIDGET, volume: WIDGET });
+    await install({ reinstall: true });
+    expect(docker.trace.filter((t) => t.call === "destroy").map((t) => t.args[0])).toEqual([WIDGET]);
+  });
+
+  it("puts the record back and rejects when that removal throws, instead of deleting the record of a project that was ready", async () => {
+    spyClose();
+    const before = seedOld({ container: WIDGET, volume: WIDGET, status: "ready" });
+    docker.destroyFails = [1];
+    await expect(install({ reinstall: true })).rejects.toThrow(/widget.*old sandbox could not be removed.*destroy failed \(call 1\).*left as it was/s);
+    // The record is there, as it was, with the one warning; the sandbox was removed once, tried once, and nothing was built.
+    expect(onDisk("widget")).toEqual({ ...before, warnings: [...before.warnings, OLD_WARNING] });
+    expect(registry.get("widget")).toEqual({ ...before, warnings: [...before.warnings, OLD_WARNING] });
+    expect(steps()).toEqual([`closeProject ${WIDGET}`, `destroy ${WIDGET} ${WIDGET}`]);
+    expect(docker.created).toEqual([]);
+    expect(docker.destroyed).toEqual([]);
+  });
+
+  it("does the same when closing proxied servers throws on unchanged names", async () => {
+    const before = seedOld({ container: WIDGET, volume: WIDGET, status: "ready" });
+    vi.spyOn(proxy, "closeProject").mockRejectedValue(new Error("close failed"));
+    await expect(install({ reinstall: true })).rejects.toThrow(/old sandbox could not be removed.*close failed/s);
+    expect(onDisk("widget")).toEqual({ ...before, warnings: [...before.warnings, OLD_WARNING] });
+    expect(docker.trace.filter((t) => t.call === "destroy")).toEqual([]);
+  });
+
+  it("still takes today's branch for a failure after that removal, on unchanged names (no sandbox made: the record is removed)", async () => {
+    seedOld({ container: WIDGET, volume: WIDGET, status: "ready" });
+    docker.probeError = new Error("clone failed");
+    const record = await install({ reinstall: true });
+    expect(record.status).toBe("failed");
+    expect(onDisk("widget")).toBeUndefined();
+  });
+
+  describe("when the old sandbox cannot be removed", () => {
+    it("rejects, puts the record back as it was plus one warning, and starts nothing", async () => {
+      spyClose();
+      const before = seedOld({ status: "ready" });
+      docker.destroyFails = [1];
+      await expect(install({ reinstall: true })).rejects.toThrow(/widget.*old sandbox could not be removed.*destroy failed \(call 1\).*left as it was/s);
+      expect(onDisk("widget")).toEqual({ ...before, warnings: [...before.warnings, OLD_WARNING] });
+      expect(steps()).toEqual([`closeProject ${OLD}`, `destroy ${OLD} ${OLD}`]);
+      expect(docker.destroyed).toEqual([]);
+    });
+
+    it("leaves exactly one copy of the warning after a second failure, and none of the error in it", async () => {
+      seedOld();
+      docker.destroyFails = "all";
+      await expect(install({ reinstall: true })).rejects.toThrow();
+      await expect(install({ reinstall: true })).rejects.toThrow();
+      const warnings = onDisk("widget")!.warnings;
+      expect(warnings).toEqual([OLD_WARNING]);
+      expect(warnings[0]).not.toContain("destroy failed");
+    });
+
+    it("takes the same branch when closing proxied servers throws", async () => {
+      const before = seedOld();
+      vi.spyOn(proxy, "closeProject").mockRejectedValueOnce(new Error("close failed"));
+      await expect(install({ reinstall: true })).rejects.toThrow(/close failed/);
+      expect(onDisk("widget")).toEqual({ ...before, warnings: [OLD_WARNING] });
+      expect(docker.trace).toEqual([]);
+    });
+
+    it("returns an error result through the tool, without the advice for a failed build", async () => {
+      seedOld();
+      docker.destroyFails = [1];
+      const app = new App({ cfg, docker, proxy });
+      try {
+        const res = await app.callTool("install_project", { repo: "acme/widget", reinstall: true });
+        const out = (res.content[0] as { text: string }).text;
+        expect(res.isError).toBe(true);
+        expect(out).toMatch(/old sandbox could not be removed.*destroy failed/s);
+        expect(out).not.toContain("The sandbox was kept");
+        expect(out).not.toContain("Nothing was installed");
+      } finally {
+        await app.shutdown();
+      }
+    });
+  });
+
+  describe("when the old sandbox is refused", () => {
+    const another = () => refusal(part("container", OLD, "another", OTHER), part("volume", OLD, "mine"));
+    const WARNING = /^The previous sandbox of this project was left in place, untouched/;
+
+    it("leaves it alone, builds under its own names, and says what was left and whose it is", async () => {
+      spyClose();
+      const before = seedOld({ status: "ready" });
+      docker.destroyErrors[OLD] = another();
+      const record = await install({ reinstall: true });
+      expect(record).toMatchObject({ status: "ready", container: WIDGET, volume: WIDGET });
+      expect(registry.get("widget")).toMatchObject({ status: "ready", container: WIDGET, volume: WIDGET });
+      expect(registry.get("widget")?.selection).toEqual(before.selection);
+      const w = record.warnings.filter((x) => WARNING.test(x));
+      expect(w).toHaveLength(1);
+      expect(w[0]).toContain(`container "${OLD}" is another installation's (owner label "${OTHER}")`);
+      expect(w[0]).toContain(`volume "${OLD}" is this installation's`);
+      // Not removed by the filters that recompute the MCP and tool warnings.
+      expect(w[0]).not.toMatch(/^(MCP|Tools): /);
+      expect(onDisk("widget")!.warnings).toContain(w[0]);
+      // Proxied servers on the old name were closed; only the new names were removed; the old record held the old names until then.
+      expect(steps().slice(0, 4)).toEqual([`closeProject ${OLD}`, `destroy ${OLD} ${OLD}`, `closeProject ${WIDGET}`, `destroy ${WIDGET} ${WIDGET}`]);
+      expect(docker.destroyed).toEqual([WIDGET]);
+      expect(docker.trace.slice(0, 2).map(named)).toEqual([OLD, OLD]);
+      expect(docker.trace.slice(2).every((t) => named(t) === WIDGET)).toBe(true);
+    });
+
+    it.each([
+      ["a container that is not ours", refusal(part("container", OLD, "not-ours")), `container "${OLD}" was not created by mcp-everything`],
+      ["only a container", refusal(part("container", OLD, "another", OTHER)), `container "${OLD}" is another installation's`],
+      ["a volume that was made before ownership", refusal(part("container", OLD, "not-ours"), part("volume", OLD, "before")), `volume "${OLD}" was made before ownership was recorded`],
+      [
+        "an owner label with a line break and excessive length",
+        refusal(part("container", OLD, "another", `ab\ncd${"x".repeat(200)}`)),
+        'owner label "ab cdxxxxxxxx',
+      ],
+    ])("words the warning from the facts: %s", async (_n, refused, expected) => {
+      seedOld();
+      docker.destroyErrors[OLD] = refused;
+      const record = await install({ reinstall: true });
+      const w = record.warnings.find((x) => WARNING.test(x))!;
+      expect(w).toContain(expected);
+      expect(w).not.toContain("\n");
+      expect(w.length).toBeLessThan(400);
+    });
+
+    it("carries the warning on the failed record when the build then fails once a container exists", async () => {
+      seedOld();
+      docker.destroyErrors[OLD] = another();
+      docker.recipe = () => ({ code: 1 });
+      const record = await install({ reinstall: true });
+      expect(record.status).toBe("failed");
+      expect(record.warnings.filter((x) => WARNING.test(x))).toHaveLength(1);
+      expect(onDisk("widget")).toMatchObject({ status: "failed", container: WIDGET });
+      expect(onDisk("widget")!.warnings.filter((x) => WARNING.test(x))).toHaveLength(1);
+    });
+
+    it("deletes the record, as for any install that fails before a container exists, and the returned record carries the warning", async () => {
+      seedOld();
+      docker.destroyErrors[OLD] = another();
+      docker.probeError = new Error("clone failed: not found");
+      const record = await install({ reinstall: true });
+      expect(record).toMatchObject({ status: "failed", error: "clone failed: not found" });
+      expect(record.warnings.filter((x) => WARNING.test(x))).toHaveLength(1);
+      expect(onDisk("widget")).toBeUndefined();
+      expect(docker.created).toEqual([]);
+    });
+
+    it("does the same when what is at the new names is refused too, and touches neither", async () => {
+      seedOld();
+      docker.destroyErrors[OLD] = another();
+      docker.destroyErrors[WIDGET] = refusal(part("container", WIDGET, "not-ours"));
+      const record = await install({ reinstall: true });
+      expect(record.status).toBe("failed");
+      expect(record.error).toContain(`container "${WIDGET}" was not created by mcp-everything`);
+      expect(record.warnings.filter((x) => WARNING.test(x))).toHaveLength(1);
+      expect(onDisk("widget")).toBeUndefined();
+      expect(docker.created).toEqual([]);
+      expect(docker.destroyed).toEqual([]);
+    });
+
+    it("lets any other failure of the old sandbox's removal take leg 3's path: the record is put back and the install fails", async () => {
+      const before = seedOld({ status: "ready" });
+      docker.destroyErrors[OLD] = new DockerUnavailableError("Docker could not be asked");
+      await expect(install({ reinstall: true })).rejects.toThrow(/old sandbox could not be removed.*Docker could not be asked.*left as it was/s);
+      expect(onDisk("widget")).toEqual({ ...before, warnings: [OLD_WARNING] });
+      expect(docker.created).toEqual([]);
+    });
+  });
+
+  describe("when the name this install needs is held by a sandbox that is not this installation's", () => {
+    const held = () => refusal(part("container", WIDGET, "not-ours"), part("volume", WIDGET, "mine"));
+
+    it("puts the record back, and both the error and the warning say to remove or rename it by hand", async () => {
+      const before = seedOld({ container: WIDGET, volume: WIDGET, status: "ready" });
+      docker.destroyErrors[WIDGET] = held();
+      const error = await install({ reinstall: true }).then(() => null, (e: Error) => e);
+      expect(error).toBeInstanceOf(Error);
+      const stored = onDisk("widget")!;
+      expect(stored).toEqual({ ...before, warnings: [stored.warnings[0]] });
+      for (const text of [error!.message, stored.warnings[0]!]) {
+        expect(text).toContain("held by a sandbox that is not this installation's");
+        expect(text).toContain(`container "${WIDGET}" was not created by mcp-everything`);
+        expect(text).toContain(`volume "${WIDGET}" is this installation's`);
+        expect(text).toMatch(/removed or renamed by hand in Docker|Remove or rename it by hand in Docker/);
+        expect(text).not.toMatch(/reinstall again to retry/i);
+        expect(text).not.toMatch(/partly removed/i);
+      }
+      expect(error!.message).toContain("left as it was");
+      expect(docker.created).toEqual([]);
+      expect(docker.destroyed).toEqual([]);
+    });
+
+    it("leaves one copy of the warning after a second attempt", async () => {
+      seedOld({ container: WIDGET, volume: WIDGET });
+      docker.destroyErrors[WIDGET] = held();
+      await expect(install({ reinstall: true })).rejects.toThrow();
+      await expect(install({ reinstall: true })).rejects.toThrow();
+      expect(onDisk("widget")!.warnings).toHaveLength(1);
+    });
+
+    it("keeps leg 3's warning and error for a plain failure and for 'Docker could not be asked' on unchanged names", async () => {
+      for (const failure of [new Error("rm failed"), new DockerUnavailableError("Docker could not be asked")]) {
+        registry.delete("widget");
+        const before = seedOld({ container: WIDGET, volume: WIDGET, status: "ready" });
+        docker.destroyErrors[WIDGET] = failure;
+        await expect(install({ reinstall: true })).rejects.toThrow(new RegExp(`old sandbox could not be removed \\(${failure.message}\\)`));
+        expect(onDisk("widget")).toEqual({ ...before, warnings: [OLD_WARNING] });
+      }
+    });
+  });
+
+  describe("failures after the record took the new names", () => {
+    it("removes what is at the new names and deletes the record when the clone fails", async () => {
+      seedOld();
+      docker.probeError = new Error("clone failed: not found");
+      const record = await install({ reinstall: true });
+      expect(record).toMatchObject({ status: "failed", container: WIDGET });
+      expect(registry.get("widget")).toBeUndefined();
+      expect(docker.destroyed).toEqual([OLD, WIDGET, WIDGET]);
+    });
+
+    it("takes the sandbox offline and keeps the record as failed, with the new names, once a container exists", async () => {
+      seedOld();
+      docker.recipe = () => ({ code: 1 });
+      const record = await install({ reinstall: true });
+      expect(record.status).toBe("failed");
+      expect(onDisk("widget")).toMatchObject({ status: "failed", container: WIDGET, volume: WIDGET, network: false });
+      expect(docker.network).toEqual([[WIDGET, false]]);
+    });
+  });
+
+  it.each(["failed", "installing"] as const)("takes the same path over a %s record without reinstall", async (status) => {
+    spyClose();
+    seedOld({ status, error: status === "failed" ? "boom" : undefined });
+    const record = await install();
+    expect(record).toMatchObject({ status: "ready", container: WIDGET });
+    expect(steps().slice(0, 4)).toEqual([`closeProject ${OLD}`, `destroy ${OLD} ${OLD}`, `closeProject ${WIDGET}`, `destroy ${WIDGET} ${WIDGET}`]);
+  });
+
+  it("leaves a record with old names alone when it is not reinstalled", async () => {
+    const before = seedOld();
+    expect((await install()).container).toBe(OLD);
+    expect(docker.trace).toEqual([]);
+    expect(registry.get("widget")).toEqual(before);
+  });
+});
+
+describe("the reference of one operation", () => {
+  const FALLBACK_RANGE = { engines: { node: "^22.23.4 || ^24.22.1 || >=26.12.1" } };
+  const ref = (c: { sandbox?: SandboxRef }) => c.sandbox?.id;
+
+  describe("an install", () => {
+    it("runs the recipe, the network setting and the whole discovery on the reference createContainer returned", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      const record = await install();
+      expect(record.status).toBe("ready");
+      expect(docker.created).toHaveLength(1);
+      const id = docker.created[0]!.id;
+      expect(docker.calls.length).toBeGreaterThan(5); // the recipe and a discovery, not an empty set
+      expect(docker.calls.map(ref)).toEqual(docker.calls.map(() => id));
+      expect(docker.network).toEqual([[WIDGET, false]]);
+      expect(docker.networkRefs[0]).toBe(docker.created[0]);
+      // Nothing resolved the name again: no acquire, no ensureRunning.
+      expect(docker.ensureCalls).toEqual([]);
+    });
+
+    it("runs the clean step, the second recipe, the network setting and the discovery on the second reference after a rebuild, and only the first recipe on the first", async () => {
+      docker.repoFiles = { "package.json": pkg(FALLBACK_RANGE) };
+      docker.recipe = (image) => (image === "node:26" ? SOFT_FAIL : { stdout: "built\n" });
+      const record = await install();
+      expect(record.image).toBe("node:24");
+      expect(docker.created).toHaveLength(2);
+      const [first, second] = docker.created;
+      expect(first!.id).not.toBe(second!.id);
+      const kind = (c: { argv: string[] }) => (c.argv[2]?.includes("soft_fail()") ? "recipe" : c.argv[2]?.includes("git clean") ? "clean" : "other");
+      const onFirst = docker.calls.filter((c) => ref(c) === first!.id).map(kind);
+      expect(onFirst).toEqual(["recipe"]);
+      const rest = docker.calls.filter((c) => ref(c) !== first!.id);
+      expect(rest.map(ref)).toEqual(rest.map(() => second!.id));
+      expect(rest.slice(0, 2).map(kind)).toEqual(["clean", "recipe"]);
+      expect(rest.length).toBeGreaterThan(5); // and the discovery that follows
+      expect(docker.networkRefs[0]).toBe(second);
+    });
+  });
+
+  describe("an operation on an installed project", () => {
+    let project: ProjectRecord;
+    beforeEach(async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      project = await install();
+      expect(project.status).toBe("ready");
+      docker.calls = [];
+      docker.ensureCalls = [];
+      docker.acquired = [];
+    });
+
+    const acquiredOnce = () => {
+      expect(docker.ensureCalls).toEqual([WIDGET]);
+      expect(docker.acquired).toHaveLength(1);
+      expect(docker.calls.length).toBeGreaterThan(3);
+      expect(docker.calls.every((c) => c.sandbox === docker.acquired[0])).toBe(true);
+    };
+
+    it("rediscover checks once and runs every command of the discovery on that reference", async () => {
+      await installer.rediscover(registry.get("widget")!, []);
+      acquiredOnce();
+    });
+
+    it("refreshMcp checks once and runs every command of the discovery on that reference", async () => {
+      await installer.refreshMcp(registry.get("widget")!);
+      acquiredOnce();
+    });
+
+    it("connectMcp and disconnectMcp: the check of the operation is the first, and every command runs on it", async () => {
+      up.answer = true;
+      await installer.connectMcp(registry.get("widget")!, { name: "srv", argv: ["node", "s.js"], cwd: "/workspace/repo", env: {}, origin: "registered" });
+      // The second check is the proxied session being opened, by name; it runs no command.
+      expect(docker.ensureCalls).toEqual([WIDGET, WIDGET]);
+      expect(docker.calls.length).toBeGreaterThan(3);
+      expect(docker.calls.every((c) => c.sandbox === docker.acquired[0])).toBe(true);
+
+      const session = docker.acquired[1]; // the reference the open session was launched with
+      docker.calls = [];
+      docker.ensureCalls = [];
+      docker.acquired = [];
+      await installer.disconnectMcp(registry.get("widget")!, "srv");
+      // Closing the session kills its server on the reference that session holds; everything else is this operation's.
+      const isKill = (c: { argv: string[] }) => c.argv[2]?.includes("kill") === true;
+      expect(docker.calls.filter(isKill).map((c) => c.sandbox)).toEqual([session]);
+      docker.calls = docker.calls.filter((c) => !isKill(c));
+      acquiredOnce();
+    });
+
+    it.each([
+      ["rediscover", () => installer.rediscover(registry.get("widget")!, [])],
+      ["refreshMcp", () => installer.refreshMcp(registry.get("widget")!)],
+      ["connectMcp", () => installer.connectMcp(registry.get("widget")!, { name: "srv", argv: ["srv"], cwd: "/workspace/repo", env: {}, origin: "registered" })],
+    ] as const)("%s: a sandbox that is not there still says so, and runs nothing", async (_n, call) => {
+      docker.exists = false;
+      await expect(call()).rejects.toThrow(/Sandbox for widget no longer exists; reinstall it with install_project\(reinstall: true\)\./);
+      expect(docker.calls).toEqual([]);
+    });
+
+    it("rediscover lets a refusal or an unanswered Docker rise as itself", async () => {
+      docker.acquireError = new DockerUnavailableError("Docker could not be asked: down");
+      await expect(installer.rediscover(registry.get("widget")!, [])).rejects.toThrow("Docker could not be asked: down");
+      expect(docker.calls).toEqual([]);
+    });
+  });
+});
+
+describe("what a refusal does to each operation", () => {
+  const OLD = "mcpe-widget";
+  const seedReady = (over: Partial<ProjectRecord> = {}): ProjectRecord => {
+    const r: ProjectRecord = { ...seedRecord("widget", "acme/widget"), ...over };
+    registry.put(r);
+    return r;
+  };
+
+  describe("uninstall", () => {
+    it("lets go of a sandbox the guard refuses: the record is deleted, nothing is destroyed, and the facts come back", async () => {
+      const r = seedReady();
+      const facts = [part("container", OLD, "another", OTHER), part("volume", OLD, "mine")];
+      docker.destroyErrors[OLD] = refusal(...facts);
+      const closed = vi.spyOn(proxy, "closeProject");
+      expect(await installer.uninstall(r)).toEqual(facts);
+      expect(closed).toHaveBeenCalledWith(OLD);
+      expect(registry.get("widget")).toBeUndefined();
+      expect(onDisk("widget")).toBeUndefined();
+      expect(docker.destroyed).toEqual([]);
+    });
+
+    it("returns nothing when the sandbox was removed", async () => {
+      const r = seedReady();
+      expect(await installer.uninstall(r)).toEqual([]);
+      expect(docker.destroyed).toEqual([OLD]);
+      expect(registry.get("widget")).toBeUndefined();
+    });
+
+    it.each([
+      ["Docker could not be asked", new DockerUnavailableError("Docker could not be asked")],
+      ["a plain error from the removal", new Error("Failed to remove container mcpe-widget: busy")],
+    ])("fails and keeps the record for %s", async (_n, failure) => {
+      const r = seedReady();
+      docker.destroyErrors[OLD] = failure;
+      await expect(installer.uninstall(r)).rejects.toBe(failure);
+      expect(registry.get("widget")).toEqual(r);
+      expect(onDisk("widget")).toEqual(r);
+    });
+  });
+
+  describe("discovery", () => {
+    const argvMatches: Array<[string, (argv: string[]) => boolean]> = [
+      ["the python probe", (a) => a[0]!.endsWith("/bin/python")],
+      ["the node check", (a) => a[0] === "sh" && a[2]!.includes("command -v node")],
+      ["the node probe", (a) => a[0] === "node"],
+      ["the bin listing", (a) => a[0] === "ls"],
+      ["the alias fold", (a) => a[0] === "sh" && a[2]!.includes("readlink")],
+      ["a manifest read", (a) => a[0] === "head"],
+      ["the root help of a command (fetchHelp)", (a) => a[0] === "tool" && a[1] === "--help"],
+      ["a subcommand's help (fetchHelp)", (a) => a[0] === "tool" && a[1] === "run"],
+      ["the scratch directory", (a) => a[0] === "mkdir"],
+    ];
+    const unavailable = () => new DockerUnavailableError("Docker could not be asked");
+    let ready: ProjectRecord;
+    beforeEach(async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      ready = await install();
+      expect(ready.status).toBe("ready");
+      expect(ready.commands.length).toBeGreaterThan(0);
+    });
+
+    it.each(argvMatches)("ends the discovery with the error, and rewrites nothing, when %s could not be asked", async (_n, matches) => {
+      docker.execError = (argv) => (matches(argv) ? unavailable() : undefined);
+      const stored = structuredClone(registry.get("widget")!);
+      const error = await installer.rediscover(stored, []).then(() => null, (e: unknown) => e);
+      expect(error).toBeInstanceOf(DockerUnavailableError);
+      expect(registry.get("widget")).toEqual(stored);
+      expect(onDisk("widget")).toEqual(stored);
+    });
+
+    it("writes nothing to the record it was given, even a live one, when a late command could not be asked", async () => {
+      // The callers work on a copy; this pins the discovery's own promise, which an install's live record relies on.
+      docker.execError = (argv) => (argv[0] === "tool" && argv[1] === "run" ? unavailable() : undefined);
+      // Different from what a discovery would write, so that a write would show.
+      const live: ProjectRecord = { ...structuredClone(registry.get("widget")!), commands: [], tools: [], published: [] };
+      const snapshot = structuredClone(live);
+      const discover = (installer as unknown as { discover: (r: ProjectRecord, s: SandboxRef, extra: string[]) => Promise<unknown> }).discover.bind(installer);
+      await expect(discover(live, docker.created[0]!, [])).rejects.toBeInstanceOf(DockerUnavailableError);
+      expect(live).toEqual(snapshot);
+    });
+
+    it("also ends refresh_mcp, without the 'no commands' warning or a rewrite", async () => {
+      docker.execError = (argv) => (argv[0] === "ls" ? unavailable() : undefined);
+      const stored = structuredClone(registry.get("widget")!);
+      await expect(installer.refreshMcp(stored)).rejects.toBeInstanceOf(DockerUnavailableError);
+      expect(registry.get("widget")).toEqual(stored);
+    });
+
+    it("does not call an executable that the caller vouched for missing when Docker could not be asked", async () => {
+      docker.execError = (argv) => (argv[0] === "sh" && argv[2]!.includes('command -v "$1"') ? unavailable() : undefined);
+      const stored = structuredClone(registry.get("widget")!);
+      const error = await installer.rediscover(stored, ["tool"]).then(() => null, (e: unknown) => e);
+      expect(error).toBeInstanceOf(DockerUnavailableError);
+      expect(registry.get("widget")).toEqual(stored);
+    });
+
+    it("keeps a registered command only when it exists, and still ends the discovery when that question could not be asked", async () => {
+      const withRegistered = { ...structuredClone(registry.get("widget")!), commands: [{ name: "mine", origin: "registered" }] };
+      registry.put(withRegistered);
+      docker.execError = (argv) => (argv[0] === "sh" && argv[2]!.includes('command -v "$1"') ? unavailable() : undefined);
+      await expect(installer.rediscover(withRegistered, [])).rejects.toBeInstanceOf(DockerUnavailableError);
+      expect(registry.get("widget")).toEqual(withRegistered);
+    });
+
+    it("still reads a command that merely fails as it does today: the discovery completes", async () => {
+      docker.execError = (argv) => (argv[0] === "ls" ? new Error("exec failed") : undefined);
+      const record = await installer.rediscover(structuredClone(registry.get("widget")!), []);
+      expect(record.status).toBe("ready");
+    });
+
+    it("ends an install with the error as its failed record, not as a project with no commands", async () => {
+      registry.delete("widget");
+      docker.execError = (argv) => (argv[0] === "ls" ? unavailable() : undefined);
+      const record = await install();
+      expect(record).toMatchObject({ status: "failed", error: "Docker could not be asked" });
+      expect(onDisk("widget")).toMatchObject({ status: "failed" });
+      expect(record.warnings.join("\n")).not.toContain("No executables");
+    });
+  });
+
+  describe("opening a proxied server during discovery", () => {
+    const registered = { name: "reg", argv: ["tool", "mcp"], cwd: "/workspace/repo", env: {}, origin: "registered" as const };
+    const errors: Array<[string, () => Error]> = [
+      ["a refusal", () => refusal(part("container", WIDGET, "another", OTHER))],
+      ["'Docker could not be asked'", () => new DockerUnavailableError("Docker could not be asked")],
+    ];
+    beforeEach(() => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      up.answer = true;
+      up.answerIf = (launch) => launch.server.argv.join(" ") === "tool";
+    });
+
+    /** The first check of a refresh is the operation's own; the proxy's opening of a session is the second. */
+    const failSecondAcquire = (error: Error) => {
+      const real = docker.acquire.bind(docker);
+      let n = 0;
+      vi.spyOn(docker, "acquire").mockImplementation(async (name) => {
+        if (++n >= 2) throw error;
+        return real(name);
+      });
+    };
+
+    it.each(errors)("ends the install of a detected server's probe with %s as the failed record's error, not an MCP warning", async (_n, make) => {
+      docker.sdkBins = ["tool"];
+      const error = make();
+      docker.acquireError = error;
+      const record = await install();
+      expect(record).toMatchObject({ status: "failed", error: error.message });
+      expect(record.warnings.filter((w) => w.startsWith("MCP:"))).toEqual([]);
+      expect(record.mcpServers).toBeUndefined(); // discovery did not finish
+    });
+
+    it.each(errors)("ends a refresh over a detected server's probe with %s and rewrites nothing", async (_n, make) => {
+      docker.sdkBins = ["tool"];
+      const ready = await install();
+      expect(ready.status).toBe("ready");
+      const stored = structuredClone(registry.get("widget")!);
+      const error = make();
+      failSecondAcquire(error);
+      await expect(installer.refreshMcp(stored)).rejects.toBe(error);
+      expect(registry.get("widget")).toEqual(stored);
+      expect(onDisk("widget")).toEqual(stored);
+    });
+
+    it.each(errors)("ends a refresh over a registered server with %s and rewrites nothing", async (_n, make) => {
+      const ready = await install();
+      const withServer = { ...structuredClone(ready), mcpServers: [registered] };
+      registry.put(withServer);
+      const error = make();
+      failSecondAcquire(error);
+      await expect(installer.refreshMcp(structuredClone(withServer))).rejects.toBe(error);
+      expect(registry.get("widget")).toEqual(withServer);
+    });
+
+    it("still turns a failed handshake into the warning it always was", async () => {
+      docker.sdkBins = ["tool"];
+      // A launch that fails at once, so that no handshake has to time out.
+      installer = new Installer(cfg, docker, registry, new McpProxy(cfg, docker, () => { throw new Error("spawn failed"); }));
+      const record = await install();
+      expect(record.status).toBe("ready");
+      expect(record.warnings.filter((w) => w.startsWith("MCP:"))).toHaveLength(1);
+    });
+  });
+
+  describe("taking a sandbox off the network", () => {
+    it("an install does it through the reference it holds", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      docker.recipe = () => ({ code: 1 });
+      await install({ network: true });
+      expect(docker.networkRefs).toEqual([docker.created[0]]);
+    });
+
+    it("an install whose build fails after the setting still does, on the reference", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      (installer as unknown as { discover: () => Promise<void> }).discover = async () => {
+        throw new Error("discovery lost the daemon");
+      };
+      await install({ network: true });
+      expect(docker.networkRefs).toEqual([docker.created[0], docker.created[0]]);
+      expect(docker.network.map((n) => n[1])).toEqual([true, false]);
+    });
+
+    describe("the startup reconciliation", () => {
+      const NOW = Date.parse("2026-11-16T12:00:00.000Z");
+      const seedStale = (): ProjectRecord => {
+        const r = {
+          ...seedRecord("x"),
+          status: "installing" as const,
+          network: true,
+          installedAt: new Date(NOW - staleInstallLimitSec(cfg) * 1000 - 1000).toISOString(),
+        };
+        registry.put(r);
+        return r;
+      };
+
+      it.each([
+        ["another installation's", refusal(part("container", "mcpe-x", "another", OTHER)), `container "mcpe-x" is another installation's (owner label "${OTHER}")`],
+        ["not created by mcp-everything", refusal(part("container", "mcpe-x", "not-ours")), 'container "mcpe-x" was not created by mcp-everything'],
+      ])("marks the install failed, leaves network as it was, and says the sandbox is %s and was left alone", async (_n, refused, expected) => {
+        seedStale();
+        docker.setNetworkError = refused;
+        expect(await installer.reconcileStale(NOW)).toEqual(["x"]);
+        const stored = registry.get("x")!;
+        expect(stored).toMatchObject({ status: "failed", network: true });
+        expect(stored.error).toMatch(/^Install was interrupted/);
+        expect(stored.warnings).toHaveLength(1);
+        expect(stored.warnings[0]).toContain("not this installation's");
+        expect(stored.warnings[0]).toContain("left alone");
+        expect(stored.warnings[0]).toContain(expected);
+        expect(stored.warnings.join("\n")).not.toContain("may still be online");
+      });
+
+      it("leaves a network that was off as off, with the same words", async () => {
+        const r = seedStale();
+        registry.put({ ...r, network: false });
+        docker.setNetworkError = refusal(part("container", "mcpe-x", "not-ours"));
+        await installer.reconcileStale(NOW);
+        expect(registry.get("x")).toMatchObject({ status: "failed", network: false });
+        expect(registry.get("x")!.warnings.join("\n")).not.toContain("may still be online");
+      });
+
+      it("behaves as before when Docker could not be asked: network on, the 'may still be online' warning", async () => {
+        seedStale();
+        docker.setNetworkError = new DockerUnavailableError("Docker could not be asked");
+        expect(await installer.reconcileStale(NOW)).toEqual(["x"]);
+        const stored = registry.get("x")!;
+        expect(stored).toMatchObject({ status: "failed", network: true });
+        expect(stored.warnings).toHaveLength(1);
+        expect(stored.warnings[0]).toContain("may still be online");
+        expect(stored.warnings[0]).toContain("Docker could not be asked");
+      });
+    });
   });
 });

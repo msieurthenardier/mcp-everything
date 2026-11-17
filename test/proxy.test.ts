@@ -3,9 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, type Config } from "../src/config.js";
+import { DockerUnavailableError, SandboxRefusedError } from "../src/sandbox/docker.js";
 import { dockerConnector, McpProxy, sweepEnvFiles, validateEnv } from "../src/proxy/mcp-proxy.js";
+import type { SandboxRef } from "../src/sandbox/docker.js";
 import type { McpServerSpec } from "../src/types.js";
-import { FakeDocker, fakeUpstream, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
+import { FakeDocker, fakeSandboxId, fakeUpstream, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
 
 const spec = (over: Partial<McpServerSpec> = {}): McpServerSpec => ({
   name: "srv",
@@ -15,6 +17,8 @@ const spec = (over: Partial<McpServerSpec> = {}): McpServerSpec => ({
   origin: "registered",
   ...over,
 });
+/** A checked reference as the Docker double would hand it out. */
+const refOf = (name: string): SandboxRef => Object.freeze({ id: fakeSandboxId(name), name });
 const textOf = (res: unknown) => (res as { content: Array<{ text: string }> }).content[0]!.text;
 
 let dir: string;
@@ -153,6 +157,7 @@ describe("dockerConnector", () => {
   it("passes the environment through a private env file, never through argv", () => {
     const conn = dockerConnector(cfg)({
       container: "mcpe-x",
+      sandbox: refOf("mcpe-x"),
       server: spec({ argv: ["node", "server.js", "--stdio"], env: { API_KEY: "s3cret" } }),
       pidFile: "/tmp/p.pid",
     });
@@ -164,8 +169,12 @@ describe("dockerConnector", () => {
     expect(fs.statSync(envFile).mode & 0o777).toBe(0o600);
     // docker exec -i -w <cwd> --env-file <f> <container> sh -c <script> <pidfile> <argv...>
     expect(params.args.slice(0, 4)).toEqual(["exec", "-i", "-w", "/workspace/repo"]);
-    expect(params.args.slice(params.args.indexOf("mcpe-x"))).toEqual([
-      "mcpe-x", "sh", "-c", expect.stringContaining('exec "$@"'), "/tmp/p.pid", "node", "server.js", "--stdio",
+    // The container is named by its id, and its name appears nowhere on the command line.
+    const id = fakeSandboxId("mcpe-x");
+    expect(params.args).not.toContain("mcpe-x");
+    expect(params.args.join(" ")).not.toContain("mcpe-x");
+    expect(params.args.slice(params.args.indexOf(id))).toEqual([
+      id, "sh", "-c", expect.stringContaining('exec "$@"'), "/tmp/p.pid", "node", "server.js", "--stdio",
     ]);
     conn.cleanup?.();
     expect(fs.existsSync(envFile)).toBe(false);
@@ -176,6 +185,7 @@ describe("dockerConnector", () => {
     expect(process.env[name]).toBeUndefined();
     const conn = dockerConnector(cfg)({
       container: "mcpe-x",
+      sandbox: refOf("mcpe-x"),
       server: spec({ env: { [name]: "handoff-value-1" } }),
       pidFile: "/tmp/p.pid",
     });
@@ -188,13 +198,13 @@ describe("dockerConnector", () => {
 
   it("throws on a value the env file cannot carry and leaves no file behind", () => {
     expect(() =>
-      dockerConnector(cfg)({ container: "mcpe-x", server: spec({ env: { A: "one\nB=injected" } }), pidFile: "/tmp/p.pid" }),
+      dockerConnector(cfg)({ container: "mcpe-x", sandbox: refOf("mcpe-x"), server: spec({ env: { A: "one\nB=injected" } }), pidFile: "/tmp/p.pid" }),
     ).toThrow(/line breaks/);
     expect(fs.readdirSync(path.join(dir, "tmp"))).toEqual([]);
   });
 
   it("creates no env file when there is no environment", () => {
-    const conn = dockerConnector(cfg)({ container: "mcpe-x", server: spec(), pidFile: "/tmp/p.pid" });
+    const conn = dockerConnector(cfg)({ container: "mcpe-x", sandbox: refOf("mcpe-x"), server: spec(), pidFile: "/tmp/p.pid" });
     const params = (conn.transport as unknown as { _serverParams: { args: string[] } })._serverParams;
     expect(params.args).not.toContain("--env-file");
     expect(fs.existsSync(path.join(dir, "tmp"))).toBe(false);
@@ -422,9 +432,8 @@ describe("McpProxy start-up after an idle stop", () => {
   it("does not relaunch when the restart reports the sandbox gone", async () => {
     up.answer = false;
     docker.stateResult = "stopped";
-    const original = docker.ensureRunning.bind(docker);
-    let n = 0;
-    docker.ensureRunning = async (c: string) => ((n++ === 0 ? await original(c) : false));
+    // The first ensureRunning of the session is the restart: open's own check is `acquire`.
+    docker.ensureRunning = async () => false;
     await expect(proxy.listTools("c1", spec(), 0.05)).rejects.toThrow(/did not start: no MCP handshake/);
     expect(up.launches).toHaveLength(1);
   });
@@ -432,10 +441,8 @@ describe("McpProxy start-up after an idle stop", () => {
   it("does not relaunch when the restart throws, and mentions why", async () => {
     up.answer = false;
     docker.stateResult = "stopped";
-    let n = 0;
     docker.ensureRunning = async () => {
-      if (n++ > 0) throw new Error("Failed to start sandbox c1: boom");
-      return true;
+      throw new Error("Failed to start sandbox c1: boom");
     };
     await expect(proxy.listTools("c1", spec(), 0.05)).rejects.toThrow(/did not start[^]*Failed to start sandbox c1: boom/);
     expect(up.launches).toHaveLength(1);
@@ -480,12 +487,106 @@ describe("host variables and the real docker connector", () => {
     const project = record("demo");
     const installer = new Installer(cfg, docker, registry, proxy, undefined, { demo__API_KEY: SECRET_VALUE });
     const launch = installer.launchSpec(project, spec({ argv: ["node", "server.js"] }));
-    const conn = dockerConnector(cfg)({ container: "mcpe-demo", server: launch, pidFile: "/tmp/p.pid" });
+    const conn = dockerConnector(cfg)({ container: "mcpe-demo", sandbox: refOf("mcpe-demo"), server: launch, pidFile: "/tmp/p.pid" });
     const params = (conn.transport as unknown as { _serverParams: { args: string[] } })._serverParams;
     expect(params.args.join(" ")).not.toContain(SECRET_VALUE);
     const envFile = params.args[params.args.indexOf("--env-file") + 1]!;
     expect(fs.readFileSync(envFile, "utf8")).toBe(`API_KEY=${SECRET_VALUE}\n`);
     conn.cleanup?.();
     expect(fs.existsSync(envFile)).toBe(false);
+  });
+});
+
+describe("McpProxy and the checked reference", () => {
+  const refusal = () =>
+    new SandboxRefusedError([{ kind: "container", sandbox: "c1", cls: "another", owner: "ffff0000", project: "github:o/r" }], "0123abcd");
+  const unavailable = () => new DockerUnavailableError("Docker could not be asked: down");
+
+  it("carries the reference with the launch, beside the container's name, and keys the session by the name", async () => {
+    await proxy.listTools("c1", spec());
+    expect(docker.acquired).toHaveLength(1);
+    expect(up.launches[0]!.container).toBe("c1");
+    expect(up.launches[0]!.sandbox).toBe(docker.acquired[0]);
+    expect(up.launches[0]!.sandbox.id).toBe(fakeSandboxId("c1"));
+    await proxy.closeProject("c1"); // by name
+    expect(proxy.size).toBe(0);
+  });
+
+  it("runs the kill on the launch's reference, without restarting, whichever way the session ends", async () => {
+    await proxy.listTools("c1", spec());
+    await proxy.closeAll();
+    const kill = docker.calls.filter((c) => c.argv[0] === "sh");
+    expect(kill).toHaveLength(1);
+    expect(kill[0]!.sandbox).toBe(up.launches[0]!.sandbox);
+    expect(kill[0]!.opts).toMatchObject({ restart: false });
+    // Opening acquired once; the kill did not acquire or resolve the name again.
+    expect(docker.ensureCalls).toEqual(["c1"]);
+  });
+
+  it("swallows a failing kill", async () => {
+    await proxy.listTools("c1", spec());
+    docker.exec = async () => {
+      throw new DockerUnavailableError("Docker could not be asked: down");
+    };
+    await expect(proxy.closeAll()).resolves.toBeUndefined();
+    expect(proxy.size).toBe(0);
+  });
+
+  it.each([
+    ["a refusal", refusal],
+    ["a Docker that could not be asked", unavailable],
+  ])("rejects the open with the typed error on %s, leaves no session, and tries again next time", async (_n, make) => {
+    const error = make();
+    docker.acquireError = error;
+    await expect(proxy.listTools("c1", spec())).rejects.toBe(error);
+    await expect(proxy.callTool("c1", spec(), "add", { a: 1, b: 1 }, 5)).rejects.toBe(error);
+    expect(proxy.size).toBe(0);
+    expect(up.launches).toHaveLength(0);
+    expect(docker.calls).toEqual([]);
+    expect(docker.ensureCalls).toEqual(["c1", "c1"]); // asked again, not remembered
+    docker.acquireError = undefined;
+    expect(textOf(await proxy.callTool("c1", spec(), "add", { a: 1, b: 1 }, 5))).toBe("2");
+    expect(proxy.size).toBe(1);
+  });
+
+  it("gives a sandbox that is not there the message it gave, with no session left", async () => {
+    docker.exists = false;
+    await expect(proxy.listTools("c1", spec())).rejects.toThrow("The sandbox c1 no longer exists; reinstall the project.");
+    expect(proxy.size).toBe(0);
+  });
+
+  it("restarts a stopped sandbox and makes the second attempt on the reference it opened with", async () => {
+    up.answerIf = (l) => l !== up.launches[0];
+    docker.stateResult = "stopped";
+    const state = vi.spyOn(docker, "state");
+    const ensure = vi.spyOn(docker, "ensureRunning");
+    await proxy.listTools("c1", spec(), 0.05);
+    expect(docker.acquired).toHaveLength(1); // one check; the restart did not resolve the name again
+    expect((state.mock.calls as unknown[][]).map((c) => c[0])).toEqual([docker.acquired[0]]);
+    expect((ensure.mock.calls as unknown[][]).map((c) => c[0])).toEqual([docker.acquired[0]]);
+    expect(up.launches).toHaveLength(2);
+    expect(up.launches[0]!.sandbox).toBe(docker.acquired[0]);
+    expect(up.launches[1]!.sandbox).toBe(docker.acquired[0]);
+    // The failed first attempt was killed on that reference too.
+    expect(docker.calls.filter((c) => c.argv[0] === "sh").map((c) => c.sandbox)).toEqual([docker.acquired[0]]);
+  });
+
+  it("drops a session whose container was replaced under its name, and opens a new one on the new container", async () => {
+    await proxy.listTools("c1", spec());
+    const old = up.launches[0]!.sandbox;
+    // Another session reinstalled the project: the old container's server dies while a call is in flight.
+    const pending = proxy.callTool("c1", spec(), "hang", {}, 5);
+    await new Promise((r) => setTimeout(r, 10));
+    await up.servers[0]!.close();
+    await expect(pending).rejects.toThrow(/stopped while running "hang"/);
+    expect(proxy.size).toBe(0);
+
+    const replacement = Object.freeze({ id: "9".repeat(64), name: "c1" });
+    docker.acquire = async () => replacement;
+    expect(textOf(await proxy.callTool("c1", spec(), "add", { a: 1, b: 1 }, 5))).toBe("2");
+    expect(up.launches).toHaveLength(2);
+    expect(up.launches[1]!.sandbox).toBe(replacement);
+    expect(up.launches[1]!.sandbox.id).not.toBe(old.id);
+    expect(proxy.size).toBe(1);
   });
 });

@@ -1,6 +1,6 @@
 # Flight: Owned Sandboxes
 
-**Status**: ready
+**Status**: completed
 **Mission**: [Sandbox Ownership on a Shared Machine](../../mission.md)
 
 > **History.** Logged on 2026-11-16 as sortie 04, "Ownership on a Shared Machine", with a draft charter. At pickup the same day it failed three of the four sortie criteria and was escalated; the charter became the starting point of the mission, and the artifact was moved here as the mission's first flight. The [flight log](flight-log.md) has the escalation, the reconnaissance report this design rests on, and what the design review changed.
@@ -8,11 +8,11 @@
 ## Contributing to Criteria
 For sandboxes made after this flight. A sandbox that exists already behaves as today until its project is reinstalled, and the reinstall gives the project an owned one (DD5, DD6). This is now the mission's only flight.
 
-- [ ] Two installations that share one Docker daemon and install the same repository each end up with their own working sandbox, and neither install changes the other's.
-- [ ] An installation acts only on sandboxes it owns, and refuses each operation on one it does not own, not only removal.
-- [ ] Both of the above hold for two installations that configured nothing.
-- [ ] For every sandbox made after this change, the operator can find out which installation owns it.
-- [ ] The README says what an installation is, where its data directory is by default, how sandboxes are named and kept apart, what the protection does not cover, and that a project installed before the change should be reinstalled after upgrading.
+- [x] Two installations that share one Docker daemon and install the same repository each end up with their own working sandbox, and neither install changes the other's.
+- [x] An installation acts only on sandboxes it owns, and refuses each operation on one it does not own, not only removal.
+- [x] Both of the above hold for two installations that configured nothing.
+- [x] For every sandbox made after this change, the operator can find out which installation owns it.
+- [x] The README says what an installation is, where its data directory is by default, how sandboxes are named and kept apart, what the protection does not cover, and that a project installed before the change should be reinstalled after upgrading.
 
 Retired at reconnaissance (see the flight log):
 - [x] Finding 3a, an invalid `MCPE_NAME_PREFIX` falling back silently: already an error at startup (`src/config.ts:143-150`, squawk 0015).
@@ -198,15 +198,15 @@ Expected fallout in the tests, from the design review's reading (not run): about
 Not touched: the registry's format and lock, the slug, tool names, variable names, the seven-hour rule (the reconciliation reaches Docker through `setNetwork`, which is guarded like everything else), and the structure of `Installer` and `server.ts` beyond DD6 and DD8.
 
 ### Checkpoints
-- [ ] An id file is created once per data directory; a second start, and two starts at once, read the same id; an invalid file stops the process.
-- [ ] A new install's container and volume are named with the id and carry the owner label; the record stores those names.
-- [ ] A reinstall of a project with old names removes the old sandbox, ends with new names, and leaves no sandbox unnamed at any step.
-- [ ] Every operation in the Docker layer classifies before acting and acts on the id it classified; the coverage test passes; no `docker exec` by bare name remains in `src/`; a tool call makes no more Docker round trips than today.
-- [ ] A refusal reaches the caller as a refusal from discovery, from a failed install going offline, and from the proxy.
-- [ ] Two installations with nothing configured install the same repository and each has its own working sandbox (Docker suite).
-- [ ] Each operation against another installation's sandbox is refused and leaves it unchanged (Docker suite).
-- [ ] A sandbox from before the change works as today (unit suite and Docker suite).
-- [ ] README updated; hosted floor raised; Docker suite time recorded against the 154 s baseline; the operator's five container ids unchanged.
+- [x] An id file is created once per data directory; a second start, and two starts at once, read the same id; an invalid file stops the process.
+- [x] A new install's container and volume are named with the id and carry the owner label; the record stores those names.
+- [x] A reinstall of a project with old names removes the old sandbox, ends with new names, and leaves no sandbox unnamed at any step.
+- [x] Every operation in the Docker layer classifies before acting and acts on the id it classified; the coverage test passes; no `docker exec` by bare name remains in `src/`; a tool call makes no more Docker round trips than today.
+- [x] A refusal reaches the caller as a refusal from discovery, from a failed install going offline, and from the proxy.
+- [x] Two installations with nothing configured install the same repository and each has its own working sandbox (Docker suite).
+- [x] Each operation against another installation's sandbox is refused and leaves it unchanged (Docker suite).
+- [x] A sandbox from before the change works as today (unit suite and Docker suite).
+- [x] README updated; hosted floor raised; Docker suite time recorded against the 154 s baseline; the operator's five container ids unchanged.
 
 ### Adaptation Criteria
 
@@ -228,9 +228,11 @@ Not touched: the registry's format and lock, the slug, tool names, variable name
 
 > **Note:** These are tentative suggestions, not commitments. Legs are planned and created one at a time as the flight progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] `installation-identity-and-owned-names` - The id file; the Docker layer constructed with the id; names and owner labels on everything created; the reinstall order of DD6 and its failure branch; the id in `list_projects` and the sandbox's name in a project's description; the README's naming sentence; the tests whose assertions name a newly installed sandbox.
-- [ ] `ownership-guard` - The classification and the two error types; the guard on every operation in the Docker layer; creation guards; the checked reference carried through the server, the installer's discovery and the proxy; the new scripted double and the coverage test.
-- [ ] `refusal-outcomes-and-two-installations` - DD7 for uninstall and reinstall; DD8 at the swallow sites; `project_info`'s line; the two-installation cases in the Docker suite; the README; the hosted floor.
+- [x] `installation-identity-and-owned-names` - The id file; the Docker layer constructed with the id; names and owner labels on everything created; the reinstall order of DD6 and its failure branch; the id in `list_projects` and the sandbox's name in a project's description; the README's naming sentence; the tests whose assertions name a newly installed sandbox.
+- [x] `ownership-guard` - The classification and the two error types; the guard on every operation in the Docker layer; creation guards; the new scripted double, the coverage test and the structural test. Callers still pass names.
+- [x] `checked-reference` - The checked reference carried through the server, the installer's discovery and install, and the proxy's launch and kill, so that one operation checks once. *(Split from `ownership-guard` at its design review, which found the two together too large for one pass.)*
+- [x] `refusal-outcomes` - DD7 for uninstall and reinstall; DD8 at the swallow sites; `project_info`'s line; the tool descriptions; the hosted floor.
+- [x] `two-installations-and-readme` - The two-installation cases in the Docker suite, with their safety rules; the README's section on several installations. *(Split from `refusal-outcomes` at its design review, for the same reason as the split above.)*
 
 No HAT leg, by the operator's choice.
 
@@ -239,10 +241,10 @@ No HAT leg, by the operator's choice.
 ## Post-Flight
 
 ### Completion Checklist
-- [ ] All legs completed
+- [x] All legs completed
 - [ ] Code merged
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Tests passing
+- [x] Documentation updated
 
 ### Verification
 - `npm test`: green, with the new unit cases, and the hosted floor raised to match.

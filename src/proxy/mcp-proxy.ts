@@ -7,7 +7,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { Config } from "../config.js";
-import type { Docker } from "../sandbox/docker.js";
+import type { Docker, SandboxRef } from "../sandbox/docker.js";
 import type { McpServerSpec } from "../types.js";
 import { cleanTerminalText } from "../util/text.js";
 import { VERSION } from "../version.js";
@@ -28,7 +28,10 @@ export interface UpstreamTool {
 }
 
 export interface Launch {
+  /** The container's name: what a launch reports, and the key of its session. */
   container: string;
+  /** The checked container this launch runs in. Commands name its id, never the name. */
+  sandbox: SandboxRef;
   server: McpServerSpec;
   /** Where, inside the sandbox, the server's PID is written. */
   pidFile: string;
@@ -106,9 +109,9 @@ export function sweepEnvFiles(cfg: Config, now = Date.now(), log: (line: string)
   return removed;
 }
 
-/** The real connector: `docker exec -i <container> <server argv>` over stdio. */
+/** The real connector: `docker exec -i <container id> <server argv>` over stdio. */
 export function dockerConnector(cfg: Config): Connector {
-  return ({ container, server, pidFile }) => {
+  return ({ sandbox, server, pidFile }) => {
     const args = ["exec", "-i", "-w", server.cwd];
     let envFile: string | undefined;
     if (Object.keys(server.env).length > 0) {
@@ -123,7 +126,7 @@ export function dockerConnector(cfg: Config): Connector {
       fs.writeFileSync(envFile, lines.join(""), { mode: 0o600 });
       args.push("--env-file", envFile);
     }
-    args.push(container, "sh", "-c", LAUNCH_SCRIPT, pidFile, ...server.argv);
+    args.push(sandbox.id, "sh", "-c", LAUNCH_SCRIPT, pidFile, ...server.argv);
 
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
@@ -173,24 +176,27 @@ export class McpProxy {
   }
 
   private async kill(launch: Launch): Promise<void> {
+    // Swallows every error on purpose, "could not be asked" included: the kill runs on the reference checked at
+    // launch, so it cannot meet a refusal, and a throw here could stop an uninstall before it deletes the record.
     await this.docker
-      .exec(launch.container, ["sh", "-c", KILL_SCRIPT, "sh", launch.pidFile], { timeoutSec: 10, restart: false })
+      .exec(launch.sandbox, ["sh", "-c", KILL_SCRIPT, "sh", launch.pidFile], { timeoutSec: 10, restart: false })
       .catch(() => undefined);
   }
 
   /** One launch and handshake. On failure the client is closed and the server killed. */
   private async attempt(
-    container: string,
+    sandbox: SandboxRef,
     server: McpServerSpec,
     startupSec: number,
   ): Promise<{ ok: true; client: Client; launch: Launch; conn: Connection } | { ok: false; message: (afterRestart?: boolean) => string }> {
-    const launch: Launch = { container, server, pidFile: `/tmp/mcpe-mcp-${randomBytes(6).toString("hex")}.pid` };
+    const launch: Launch = { container: sandbox.name, sandbox, server, pidFile: `/tmp/mcpe-mcp-${randomBytes(6).toString("hex")}.pid` };
     const conn = this.connector(launch);
     const client = new Client({ name: "mcp-everything", version: VERSION }, { capabilities: {} });
     try {
       await client.connect(conn.transport, { timeout: startupSec * 1000 });
       return { ok: true, client, launch, conn };
     } catch (e) {
+      // The close swallows its own failure: this branch is reporting the handshake's failure, which `reason` keeps.
       await client.close().catch(() => undefined);
       await this.kill(launch);
       const stderr = conn.stderr();
@@ -212,26 +218,32 @@ export class McpProxy {
   }
 
   private async open(key: string, container: string, server: McpServerSpec, startupSec: number): Promise<Session> {
-    if (!(await this.docker.ensureRunning(container))) {
+    // The one check of this session: a refusal or "could not be asked" rejects the open, and
+    // everything after it (the launch, the restart, the second attempt) uses this reference.
+    const sandbox = await this.docker.acquire(container);
+    if (!sandbox) {
       throw new Error(`The sandbox ${container} no longer exists; reinstall the project.`);
     }
-    let first = await this.attempt(container, server, startupSec);
+    let first = await this.attempt(sandbox, server, startupSec);
     if (!first.ok) {
       // A sandbox that idled out between the check above and the launch fails
       // the handshake at once; start it and launch once more.
       let restartNote = "";
       let restarted = false;
-      const stopped = await this.docker.state(container).then((st) => st === "stopped", () => false);
+      // The failure being reported is the handshake's: a typed error from this question (on a held reference, only
+      // "could not be asked") reads as "not stopped", and the thrown message below is the handshake's own text.
+      const stopped = await this.docker.state(sandbox).then((st) => st === "stopped", () => false);
       if (stopped) {
         try {
-          restarted = await this.docker.ensureRunning(container);
+          restarted = await this.docker.ensureRunning(sandbox);
           if (!restarted) restartNote = `\n(restarting the sandbox failed: ${container} no longer exists)`;
         } catch (e) {
+          // Keeps the original failure and adds this one as a note; a typed error here is reworded into the note.
           restartNote = `\n(restarting the sandbox failed: ${describeError(e)})`;
         }
       }
       if (restarted) {
-        const second = await this.attempt(container, server, startupSec);
+        const second = await this.attempt(sandbox, server, startupSec);
         if (second.ok) first = second;
         else throw new Error(second.message(true));
       } else {
@@ -246,6 +258,7 @@ export class McpProxy {
         (current) => {
           if (current === session) this.sessions.delete(key);
         },
+        // The session's own opening failed: nothing was registered under this key to retire.
         () => undefined,
       );
     };
@@ -259,6 +272,8 @@ export class McpProxy {
     if (!pending) {
       pending = this.open(key, container, server, startupSec ?? this.cfg.mcpStartupTimeoutSec);
       this.sessions.set(key, pending);
+      // A rejected opening, a refusal or "could not be asked" included, is the caller's to see (it awaits `pending`);
+      // this handler only makes sure the failed attempt does not stay in the table, so the next call asks again.
       pending.catch(() => {
         if (this.sessions.get(key) === pending) this.sessions.delete(key);
       });
@@ -270,6 +285,7 @@ export class McpProxy {
     const pending = this.sessions.get(key);
     if (!pending) return;
     this.sessions.delete(key);
+    // Closing a session that never opened is nothing to do; the opening's caller got the error.
     const session = await pending.catch(() => null);
     if (!session) return;
     await session.client.close().catch(() => undefined);
@@ -297,6 +313,8 @@ export class McpProxy {
       }
       return tools;
     } catch (e) {
+      // Errors from here on come from an open session, so they are plain errors: the typed ones were
+      // thrown by `session()` above, outside this try, and rise unchanged.
       await this.closeSession(session.key);
       throw new Error(`MCP server "${server.name}" failed to list its tools: ${describeError(e)}`);
     } finally {
@@ -318,6 +336,8 @@ export class McpProxy {
     try {
       return await session.client.callTool({ name: tool, arguments: args }, undefined, { timeout: timeoutSec * 1000 });
     } catch (e) {
+      // Rewords what the upstream server did, keeping the error's own message; the typed errors were thrown by
+      // `session()` above, outside this try, and rise unchanged.
       const code = e instanceof McpError ? e.code : undefined;
       if (code === ErrorCode.RequestTimeout) {
         // A server that stopped answering is restarted on the next call.
@@ -354,6 +374,7 @@ export class McpProxy {
   /** Close sessions that have been idle for longer than the configured limit. */
   async reapIdle(now = Date.now()): Promise<void> {
     for (const [key, pending] of [...this.sessions]) {
+      // A session that failed to open is not idle; its caller got the error.
       const session = await pending.catch(() => null);
       if (session && session.inFlight === 0 && now - session.lastUsed > this.cfg.mcpIdleSec * 1000) {
         await this.closeSession(key);
@@ -363,6 +384,7 @@ export class McpProxy {
 
   private startReaper(): void {
     if (this.reaper) return;
+    // Idle reaping acts on sessions already open; a failure to reap is retried a minute later.
     this.reaper = setInterval(() => void this.reapIdle().catch(() => undefined), 60_000);
     this.reaper.unref();
   }

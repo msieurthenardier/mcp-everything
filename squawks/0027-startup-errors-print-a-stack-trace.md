@@ -11,6 +11,8 @@ When mcp-everything refuses to start because a setting is invalid, the one line 
 
 For an error that reports an invalid setting, print the message without the stack. Keep the stack for anything unexpected, where it is the only clue. The configuration errors are plain `Error` today, so they need a way to be told apart (their own error class is the obvious one). Exit status and message text do not change.
 
+Added on 2026-11-16, at the [debrief of mission 02's flight 01](../missions/02-sandbox-ownership-on-a-shared-machine/flights/01-owned-sandboxes/flight-debrief.md): that flight added a startup error of the same kind. An `installation-id` file that does not hold a valid id, or a data directory that cannot be made or read, throws a plain `Error` from `loadInstallationId` (`src/installation.ts`) when `App` is constructed, and its message, which tells the operator what to do, is followed by the same stack. Cover it with the configuration errors. Read, not run.
+
 ## Evidence
 - `src/index.ts` — `main().catch((e) => { process.stderr.write(`[mcp-everything] fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`); process.exit(1); });`
 - `src/config.ts` — three `throw new Error(…)` sites: two for `MCPE_EXTRA_HOSTS`, one in `parseNamePrefix`.

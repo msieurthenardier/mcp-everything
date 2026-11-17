@@ -1,8 +1,10 @@
 # Mission: Sandbox Ownership on a Shared Machine
 
-**Status**: active
+**Status**: completed
 
 > **Agreed with the operator on 2026-11-16.** Escalated the same day from sortie 04, which failed three of the four sortie criteria at pickup and is now this mission's [first flight](flights/01-owned-sandboxes/flight.md). No alignment flight, by the operator's choice. **Reduced to one flight on 2026-11-16**, at flight 1's approval: the operator dropped the second flight, which would have claimed existing sandboxes in place, in favor of reinstalling existing projects once.
+>
+> **Completed on 2026-11-16**, at the [mission debrief](mission-debrief.md), on the operator's confirmation. The six criteria are met by the code in pull request #17 and are ticked when it merges.
 >
 > **Viability**: checked by the Architect on 2026-11-16 against the code, without running Docker: feasible with caveats. The caveats are folded into criteria 2, 4 and 5, the constraints and the open questions below.
 
@@ -78,5 +80,5 @@ N/A
 
 > **Note:** These are tentative suggestions, not commitments. Flights are planned and created one at a time as work progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] Flight 1: [Owned sandboxes](flights/01-owned-sandboxes/flight.md) — an installation has an identity; sandboxes it makes carry it and get names that cannot collide; every operation checks ownership before acting; the README describes the model. Reaches every criterion. Sortie 04, re-homed.
+- [x] Flight 1: [Owned sandboxes](flights/01-owned-sandboxes/flight.md) — an installation has an identity; sandboxes it makes carry it and get names that cannot collide; every operation checks ownership before acting; the README describes the model. Reaches every criterion. Sortie 04, re-homed.
 - ~~Flight 2: Carrying existing sandboxes forward~~ — dropped by the operator on 2026-11-16, before it was designed. Reinstalling a project once gives it an owned sandbox (flight 1, DD5 and DD6). What that flight would have had to solve is in the open questions above, as set aside.

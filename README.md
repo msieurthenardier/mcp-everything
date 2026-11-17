@@ -62,7 +62,7 @@ claude mcp add mcp-everything -- node "$PWD/dist/index.js"
 | --- | --- |
 | `search_projects` | Search GitHub and GitLab; returns ids, stars, language, license. |
 | `install_project` | Clone, build and generate tools for a repository. |
-| `list_projects` / `project_info` | What is installed, its status, warnings, and its published tools. |
+| `list_projects` / `project_info` | What is installed, its status, warnings, and its published tools. `list_projects` states this installation's id; `project_info` also says whose its sandbox container is, according to Docker. |
 | `find_project_tools` | Search every generated tool, published or not, by keyword. |
 | `select_project_tools` | Choose which of a project's tools are published in the tool list. |
 | `call_project_tool` | Call a generated tool by name, for clients that do not refresh their tool list. |
@@ -72,7 +72,7 @@ claude mcp add mcp-everything -- node "$PWD/dist/index.js"
 | `discover_tools` | Regenerate tools, optionally for executables you built by hand. |
 | `connect_mcp_server` / `disconnect_mcp_server` | Proxy an MCP server that runs inside a project's sandbox. |
 | `refresh_mcp` | Stop a project's MCP servers and run discovery again, e.g. after giving a server its environment variables. Reports what started and what did not. |
-| `uninstall_project` | Delete a project's container, volume and tools. |
+| `uninstall_project` | Delete a project's container, volume and tools. A sandbox that is another installation's, or was not created by mcp-everything, is never touched: the project's record and tools go, the sandbox stays in Docker, and the result says which parts were left and whose they are. |
 
 Repositories can be given as `owner/name` (GitHub), `github:owner/name`,
 `gitlab:group/sub/name`, or an `https://` URL. `ref` pins a branch, tag or
@@ -322,7 +322,10 @@ confines that to Docker; it does not make untrusted code safe.
 
 What the sandbox does:
 
-- One container and one volume per project. No host directory or Docker socket
+- One container and one volume per project, named and labelled with the
+  installation's id so that installations sharing a Docker daemon do not
+  touch each other's (see [Several installations on one Docker daemon](#several-installations-on-one-docker-daemon)). No
+  host directory or Docker socket
   is mounted. The only values passed into a sandbox are the environment
   variables of the project's MCP servers: the `<slug>__<NAME>` variables an
   operator set for that project (see "Giving a server its environment") and
@@ -392,19 +395,143 @@ What it does not do:
     returned to the agent and the diagnostics log, and a protocol error
     message or a tool description also reaches the registry. mcp-everything
     does not scrub server output.
-  - Several mcp-everything processes can share a data directory. Give them the
-    same `<slug>__<NAME>` variables: one that lacks a variable drops the tools
+  - Several mcp-everything processes can share a data directory; they are
+    sessions of one installation (one `installation-id`), not several
+    installations (see [Several installations on one Docker daemon](#several-installations-on-one-docker-daemon)). Give them
+    the same `<slug>__<NAME>` variables: one that lacks a variable drops the tools
     of servers that need it when it next runs discovery (including
     `discover_tools`, `connect_mcp_server` and `refresh_mcp`), until a process
     that has it refreshes again.
   - At startup, an install left unfinished for more than seven hours (by
-    default) is marked failed and its sandbox is taken off the network. If
-    Docker is not reachable, this waits for the next start. Until it is marked
+    default) is marked failed and its sandbox is taken off the network, unless
+    the sandbox is not this installation's: that one is left alone and the
+    project's warnings say so (see [Several installations on one Docker daemon](#several-installations-on-one-docker-daemon)). If Docker is not reachable, this waits for the next start. Until it is marked
     failed, `project_info` says the install was started by another session or
     was interrupted.
 - **License is reported, not enforced.** The license found in the repository
   is shown at install time with a warning when none is found; the server does
   not verify that a repository is open source.
+
+## Several installations on one Docker daemon
+
+An installation is one data directory: the registry (`registry.json`) and a
+file named `installation-id` beside it. The id is eight lowercase hexadecimal
+characters, generated the first time a server starts on that directory and
+never rewritten. `list_projects` prints it as `Installation id: <id>`, also
+when no project is installed. Two copies of mcp-everything that share a Docker
+daemon (a Linux shell and a Windows desktop client, say) are two installations,
+and they need two data directories. Where the directory is by default:
+
+- Linux: `~/.local/share/mcp-everything/`, or `$XDG_DATA_HOME/mcp-everything/`
+  when `XDG_DATA_HOME` is set. The id is in `installation-id` there.
+- Windows: `C:\Users\<your user name>\.local\share\mcp-everything\`. There is
+  no Windows-specific default; it is the home directory plus `.local\share`.
+- `MCPE_DATA_DIR` replaces either.
+
+**Names and labels.** A sandbox made by this version is named
+`<MCPE_NAME_PREFIX><id>-<slug>` (with nothing configured, `mcpe-1a2b3c4d-gron`),
+for its container and its volume alike. Both carry the labels
+`mcp-everything=1` and `mcp-everything.owner=<id>`. The name is for people; the
+label is what the code checks. To list every mcp-everything sandbox on the
+daemon with its owner:
+
+```sh
+docker ps -a --filter label=mcp-everything=1 --format '{{.Names}}\t{{.Label "mcp-everything.owner"}}'
+docker volume ls --filter label=mcp-everything=1 --format '{{.Name}}\t{{.Label "mcp-everything.owner"}}'
+```
+
+An empty owner means the sandbox was made by an earlier version, which wrote
+no owner label.
+
+**What an installation does with a sandbox that is not its own.** A container
+or volume is not this installation's when its owner label is another id, or
+when it lacks the `mcp-everything=1` label altogether. For such a sandbox the
+installation will not start it, run a command in it, give its servers
+variables, change its network or remove it. The first four fail with a message
+that names the sandbox and its owner, for example
+`container "<name>" is another installation's (owner label "<id>")`; removal
+is described next. A mixed pair is treated as a whole: if either the container
+or the volume a record names is not this installation's, neither is removed.
+
+- `uninstall_project` still completes. It removes the project's record and
+  tools, leaves the sandbox in Docker, and says so: "Its sandbox was left in
+  place, because it is not this installation's to remove", with each part left
+  and whose it is. This is not an error. A removal that fails for another
+  reason (Docker did not answer, a failed `docker rm`) keeps the record, as
+  before.
+- `install_project` with `reinstall: true` leaves that sandbox where it is,
+  builds a new one under this installation's own names and ends `ready`, with
+  a warning on the project beginning "The previous sandbox of this project was
+  left in place, untouched". The old sandbox now has no record; remove it in
+  Docker if it is not wanted. A reinstall also fails when the names it needs are
+  themselves held by a sandbox that is not this installation's. If the project
+  already has this version's names, that is met before anything is removed: the
+  record is kept as it was and the error says to remove or rename that sandbox
+  by hand. If the names are changing (a project installed before this version,
+  or a record that named another sandbox), its old sandbox has already been
+  removed or let go by then, so the install fails like any install that fails
+  before a container exists: what it created at the new names is removed and
+  the record is deleted.
+- At startup, the reconciliation of an interrupted install leaves such a
+  sandbox alone and says so in the project's warnings.
+
+A sandbox with `mcp-everything=1` and no owner label (made before this
+version) is treated as this installation's, because its registry names it:
+it is started, used, reinstalled over and removed as it was before.
+
+**`project_info`** ends with one line about the project's container, asked of
+Docker at that moment: `Sandbox owner: ...` says it is this installation's, was
+made before ownership was recorded, is another installation's (with the owner
+label), was not created by mcp-everything, does not exist, or could not be
+checked because Docker did not answer. It never fails because of that question.
+`list_projects` and the results of an install ask Docker nothing.
+
+**On upgrading.**
+
+- Projects installed before this version keep working with no change. To give
+  one an owner, reinstall it (`install_project` with `reinstall: true`): the
+  old sandbox is removed and a new one is built under the new names.
+- When two installations both list a project that was installed before this
+  version, they share the one old sandbox (`mcpe-<slug>`), and neither is
+  protected from the other until that project has been reinstalled. The first
+  installation to reinstall it removes the shared sandbox; the other then finds
+  its sandbox gone and must reinstall it too.
+- Upgrade every installation on the machine. An installation still on an
+  earlier version does not read labels.
+- A reinstall changes a project's sandbox name. Another session of the same
+  installation that has a proxied MCP server open on the old sandbox loses it,
+  and the server opens again on the next call, on the new sandbox.
+
+**What this does not cover.**
+
+- Anything that can reach the Docker daemon can remove any sandbox. The
+  labels are checked by mcp-everything, not enforced by Docker.
+- An installation still on an earlier version treats every `mcpe-<slug>`
+  sandbox as its own and will remove it.
+- A copied data directory is two installations with one id. They cannot be told
+  apart and protect nothing from each other. Copying `registry.json` alone,
+  without `installation-id`, gives the copy an id of its own; its records then
+  name sandboxes that are the other installation's, and are refused as above.
+- A deleted data directory leaves sandboxes whose owner is gone. Find them with
+  the two commands above (the owner label is an id no installation has) and
+  remove them by hand.
+- Two sessions of one installation racing a reinstall of the same project: one
+  can write the old names back to the registry after the other has built the
+  new sandbox, which then has no record. The two commands above find it.
+- Windows. Nothing was tested there.
+
+**What was tested.** Linux, one Docker daemon, two data directories. The
+Docker suite (`npm run test:docker`) runs two installations as two `App`
+instances in one test process, each on its own temporary data directory with
+`MCPE_NAME_PREFIX` unset. Both install `tomnomnom/gron` under
+their own names and labels, and the first's container is unchanged by the
+second's install. With the second's record pointed at the first's sandbox, a
+generated tool, `sandbox_exec` and `set_project_network` are each refused and
+the first's container keeps its id, running state and networks; a reinstall
+builds beside it and warns; an uninstall leaves it and says so. A sandbox made
+by hand with the earlier labels is run in, described and removed. The startup
+reconciliation and the discovery paths are covered by unit tests only. No test
+ran two separate processes, two machines or Windows.
 
 ## Configuration
 
@@ -415,7 +542,7 @@ Environment variables, all optional:
 | `GITHUB_TOKEN` / `GH_TOKEN` | none | GitHub API token (search rate limit: 10/min anonymous). |
 | `GITLAB_TOKEN` | none | GitLab API token. |
 | `MCPE_EXTRA_HOSTS` | none | More forges to allow, e.g. `gitlab.gnome.org=gitlab,git.example.com=gitlab`. |
-| `MCPE_DATA_DIR` | `$XDG_DATA_HOME/mcp-everything`, else `~/.local/share/mcp-everything` | Where the project registry is stored. The default follows `XDG_DATA_HOME` when it is set. A registry written by a newer version of mcp-everything is refused and left untouched; upgrade, or move `registry.json` aside to start with an empty registry (the sandboxes of the projects in it stay in Docker). |
+| `MCPE_DATA_DIR` | `$XDG_DATA_HOME/mcp-everything`, else `~/.local/share/mcp-everything` | Where the project registry and the `installation-id` file are stored. The default follows `XDG_DATA_HOME` when it is set. Copying the directory copies the id, and two installations with one id cannot be told apart; see [Several installations on one Docker daemon](#several-installations-on-one-docker-daemon). A registry written by a newer version of mcp-everything is refused and left untouched; upgrade, or move `registry.json` aside to start with an empty registry (the sandboxes of the projects in it stay in Docker). |
 | `MCPE_DOCKER_BIN` | `docker` | The Docker client command, run on the host. |
 | `MCPE_MEMORY` / `MCPE_CPUS` / `MCPE_PIDS_LIMIT` | `4g` / `2` / `1024` | Per-sandbox limits; a zero memory or CPU value (which Docker reads as unlimited) falls back to the default. |
 | `MCPE_DOCKER_RUNTIME` | Docker's default | Container runtime, e.g. `runsc`. |
@@ -429,7 +556,7 @@ Environment variables, all optional:
 | `MCPE_SANDBOX_IDLE_TIMEOUT` | `1800` | Seconds without activity before a project's sandbox container stops itself; `0` disables this. Applies to sandboxes created after it is set. Not `MCPE_MCP_IDLE_TIMEOUT`, which stops proxied MCP servers, not sandboxes. |
 | `MCPE_MAX_OUTPUT_BYTES` | `100000` | Cap on captured stdout and stderr, each. |
 | `MCPE_IMAGE`, `MCPE_IMAGE_<ECOSYSTEM>` | see table | Override sandbox images. Images need `sh`, `git` and coreutils `timeout`. |
-| `MCPE_NAME_PREFIX` | `mcpe-` | Prefix of container and volume names; an invalid value is refused at startup. |
+| `MCPE_NAME_PREFIX` | `mcpe-` | Prefix of container and volume names, followed by the installation's id and the project's slug (`mcpe-<id>-<slug>`); an invalid value is refused at startup. The prefix does not separate installations; the id does. |
 | `<slug>__<NAME>` | none | Sets `NAME` in the environment of the MCP servers of the project with that slug (lower case, as `list_projects` shows it), for example an API key. Read at each launch, never stored; apply with a reconnect and `refresh_mcp`. See "Giving a server its environment". |
 
 ## Limitations
@@ -463,9 +590,14 @@ Environment variables, all optional:
     `reinstall: true`) to get it.
   - To check a sandbox, run `docker inspect --format
     '{{index .Config.Labels "mcp-everything.idle-timeout"}}' <container>`.
-    The container is named `MCPE_NAME_PREFIX` (default `mcpe-`) plus the
-    project's slug; `docker ps -a --filter label=mcp-everything=1` lists them
-    all. A number is the idle seconds it stops after, `0` means it was
+    A sandbox made by this version is named `MCPE_NAME_PREFIX` (default
+    `mcpe-`), then the installation's id, then the project's slug, for example
+    `mcpe-1a2b3c4d-gron`; one made by an earlier version is the prefix plus
+    the slug (`mcpe-gron`). `project_info` shows a project's sandbox name, and
+    `docker ps -a --filter label=mcp-everything=1 --format '{{.Names}}\t{{.Label "mcp-everything.owner"}}'`
+    lists them all with their owners (an empty owner is a sandbox from before
+    owners were recorded; see [Several installations on one Docker daemon](#several-installations-on-one-docker-daemon)).
+    A number is the idle seconds it stops after, `0` means it was
     created with the timeout disabled, and empty output means it predates
     the setting and needs the reinstall above.
   - A running tool call, an install, a live proxied MCP server (until

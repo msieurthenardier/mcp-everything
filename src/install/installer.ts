@@ -2,7 +2,19 @@ import type { Config } from "../config.js";
 import { hostVariableNames, isUnusableValueError, launchVariables } from "../proxy/host-env.js";
 import type { McpProxy, UpstreamTool } from "../proxy/mcp-proxy.js";
 import type { Registry } from "../registry.js";
-import { BIN_DIR, Docker, REPO_DIR, VENV_DIR, WORK_DIR, WORKSPACE, type ExecResult } from "../sandbox/docker.js";
+import {
+  BIN_DIR,
+  Docker,
+  DockerUnavailableError,
+  REPO_DIR,
+  SandboxRefusedError,
+  VENV_DIR,
+  WORK_DIR,
+  WORKSPACE,
+  type ExecResult,
+  type SandboxFacts,
+  type SandboxRef,
+} from "../sandbox/docker.js";
 import { buildTools, crawlCommand, fetchRootHelp, selectPublished, type SandboxExec } from "../toolgen/discover.js";
 import { parseHelp } from "../toolgen/help-parser.js";
 import { helpLaunches, manifestLaunches, type LaunchCandidate } from "../toolgen/mcp-launch.js";
@@ -17,7 +29,7 @@ import type {
   RepoRef,
   ToolSelection,
 } from "../types.js";
-import { cleanTerminalText } from "../util/text.js";
+import { cleanTerminalText, oneLine } from "../util/text.js";
 import { detect } from "./detect.js";
 import { NODE_DISCOVERY, PYTHON_DISCOVERY, recipeFor } from "./recipes.js";
 import { chooseToolchain, type ToolchainChoice } from "./toolchain.js";
@@ -32,6 +44,44 @@ export interface InstallParams {
   submodules?: boolean;
   timeoutSec?: number;
   reinstall?: boolean;
+}
+
+/** Added to a record when a reinstall could not remove the sandbox the record names. Carries no part of the error. */
+const OLD_SANDBOX_WARNING =
+  "A reinstall could not remove this project's old sandbox, which may be partly removed; reinstall again to retry.";
+
+/** How much of an owner label is shown: it is text from Docker, so it is flattened to one line and cut. */
+const OWNER_SHOWN = 40;
+
+/** One part of a sandbox that was left alone, and whose it is. Built from facts, never from a message. */
+export function describeLeftPart(f: SandboxFacts): string {
+  const what = `${f.kind} "${oneLine(f.sandbox, 80)}"`;
+  switch (f.cls) {
+    case "another":
+      return `${what} is another installation's (owner label "${oneLine(f.owner ?? "", OWNER_SHOWN)}")`;
+    case "not-ours":
+      return `${what} was not created by mcp-everything`;
+    case "before":
+      return `${what} was made before ownership was recorded`;
+    default:
+      return `${what} is this installation's`;
+  }
+}
+
+const describeLeft = (facts: readonly SandboxFacts[]): string => facts.map(describeLeftPart).join("; ");
+
+/**
+ * Added to the new record of a reinstall that let go of a sandbox because it is
+ * not this installation's to remove. Must not begin with the prefixes that
+ * discovery and publishing use for the warnings they recompute.
+ */
+function leftInPlaceWarning(facts: readonly SandboxFacts[]): string {
+  return `The previous sandbox of this project was left in place, untouched, because it is not this installation's to remove: ${describeLeft(facts)}. It now has no record; remove it by hand in Docker if it is not wanted.`;
+}
+
+/** Added to a record put back after a reinstall met a sandbox at the very names it needs. */
+function nameHeldWarning(facts: readonly SandboxFacts[]): string {
+  return `The name this project's sandbox needs is held by a sandbox that is not this installation's: ${describeLeft(facts)}. It was not touched. Remove or rename it by hand in Docker.`;
 }
 
 export type Logger = (line: string) => void;
@@ -168,9 +218,9 @@ export class Installer {
     return { ...server, env: { ...server.env, ...launchVariables(project.slug, this.slugsWith(project), this.env) } };
   }
 
-  /** An exec function bound to one project's sandbox. */
-  execFor(project: ProjectRecord): SandboxExec {
-    return (argv, opts) => this.docker.exec(project.container, argv, opts);
+  /** An exec function bound to one checked sandbox: every command of an operation runs on the reference it was given. */
+  execFor(sandbox: SandboxRef): SandboxExec {
+    return (argv, opts) => this.docker.exec(sandbox, argv, opts);
   }
 
   async install(params: InstallParams, log: Logger = () => {}): Promise<ProjectRecord> {
@@ -181,8 +231,11 @@ export class Installer {
 
     const owner = params.repo.path.split("/")[0] ?? "";
     const slug = existing?.slug ?? makeSlug(params.repo.name, owner, (s) => this.registry.get(s) !== undefined);
-    const container = `${this.cfg.docker.namePrefix}${slug}`;
+    const container = this.docker.sandboxName(slug);
     const volume = container;
+    // `existing` belongs to the registry: keep a copy that no later write can change.
+    const before = existing ? structuredClone(existing) : undefined;
+    const renamed = before !== undefined && (before.container !== container || before.volume !== volume);
 
     const record: ProjectRecord = {
       slug,
@@ -204,12 +257,42 @@ export class Installer {
       meta: { npmScripts: [], makeTargets: [], pythonModules: [], nodePackages: [], hasPythonEnv: false, hasNode: false },
       installedAt: new Date().toISOString(),
     };
-    this.registry.put(record);
+
+    // Where the install is, for the failure branch: for a reinstall, "old" until
+    // the removal that opens it (the previous sandbox's if the names changed, the
+    // one at these names if not) has succeeded and the record holds the new
+    // names; "new" from then on, and always for a first install.
+    let phase: "old" | "new" = before ? "old" : "new";
+    if (before && renamed) {
+      // The registry keeps the object it is given, so the record that carries the
+      // old names is a separate one: the new names go on `record` only after the
+      // old sandbox is gone.
+      this.registry.put(structuredClone({ ...record, container: before.container, volume: before.volume }));
+    } else {
+      this.registry.put(record);
+    }
 
     let sandboxCreated = false;
+    // The reference of the container this install made, once there is one: its own failure branches take that container offline through it.
+    let sandbox: SandboxRef | undefined;
     try {
+      if (before && renamed) {
+        await this.proxy.closeProject(before.container);
+        try {
+          await this.docker.destroy(before.container, before.volume);
+        } catch (e) {
+          // Only a refusal: the old sandbox is another installation's or not ours, so it is left exactly as it is
+          // and the reinstall goes on beside it. Any other failure (Docker did not answer, a failed removal) rises
+          // with `phase` still "old" and the old record is put back.
+          if (!(e instanceof SandboxRefusedError)) throw e;
+          record.warnings.push(leftInPlaceWarning(e.sandboxes));
+        }
+        this.registry.put(record);
+        phase = "new";
+      }
       await this.proxy.closeProject(container);
       await this.docker.destroy(container, volume);
+      phase = "new";
 
       log(`Cloning ${params.repo.cloneUrl}${params.ref ? ` @ ${params.ref}` : ""}…`);
       const probe = await this.docker.probe(params.repo, volume, {
@@ -257,14 +340,21 @@ export class Installer {
           await this.docker.ensureImage(image, (c) => log(c.trimEnd()));
         }
         record.image = image;
-        if (i > 0) await this.docker.removeContainer(container);
-        await this.docker.createContainer({ name: container, volume, image, project: params.repo.id });
+        if (i > 0) {
+          await this.docker.removeContainer(container);
+          sandbox = undefined;
+          sandboxCreated = false;
+          // The first attempt's container is gone: until `createContainer` returns the next one, this install holds none.
+        }
+        // The reference this attempt's container was made with; a rebuild replaces it.
+        const made = await this.docker.createContainer({ name: container, volume, image, project: params.repo.id });
+        sandbox = made;
         sandboxCreated = true;
-        if (i > 0) await this.docker.exec(container, ["sh", "-c", CLEAN_SCRIPT], { timeoutSec: 300 });
+        if (i > 0) await this.docker.exec(made, ["sh", "-c", CLEAN_SCRIPT], { timeoutSec: 300 });
 
         tail = new Tail(6000);
         const output = tail;
-        res = await this.docker.exec(container, ["sh", "-c", recipeFor(record.primary)], {
+        res = await this.docker.exec(made, ["sh", "-c", recipeFor(record.primary)], {
           cwd: REPO_DIR,
           timeoutSec,
           maxBytes: 4_000_000,
@@ -296,7 +386,7 @@ export class Installer {
           ? `Install timed out after ${timeoutSec}s.`
           : `Install recipe for ${record.primary} exited with code ${res.code}.`;
         record.errorLog = tail.toString().slice(-2500);
-        await this.takeOffline(record);
+        await this.takeOffline(record, sandbox);
         this.registry.put(record);
         return record;
       }
@@ -304,23 +394,48 @@ export class Installer {
       // From here on the project's code only runs with the network policy the
       // caller asked for (off unless requested).
       const wantNetwork = params.network === true;
-      await this.docker.setNetwork(container, wantNetwork);
+      await this.docker.setNetwork(sandbox!, wantNetwork);
       record.network = wantNetwork;
 
       log("Discovering commands and generating tools…");
-      await this.discover(record, []);
+      await this.discover(record, sandbox!, []);
       record.status = "ready";
       this.registry.put(record);
       return record;
     } catch (e) {
+      if (phase === "old" && before) {
+        // The old sandbox may still exist and no build has started: put the record
+        // back as it was, with a note, and report the failure rather than a failed build.
+        const why = e instanceof Error ? e.message : String(e);
+        // A refusal at the very names this install needs: the sandbox there is not this installation's, and "reinstall
+        // again" can never succeed, so it gets its own words. Any other failure keeps the original warning and error.
+        const held = e instanceof SandboxRefusedError;
+        const warning = held ? nameHeldWarning(e.sandboxes) : OLD_SANDBOX_WARNING;
+        this.registry.put({
+          ...before,
+          warnings: before.warnings.includes(warning) ? before.warnings : [...before.warnings, warning],
+        });
+        if (held) {
+          throw new Error(
+            `Could not reinstall ${before.slug}: the name of its sandbox is held by a sandbox that is not this installation's (${describeLeft(e.sandboxes)}). It was not touched and must be removed or renamed by hand in Docker. The project was left as it was; nothing new was built.`,
+          );
+        }
+        throw new Error(
+          `Could not reinstall ${before.slug}: the old sandbox could not be removed (${why}). The project was left as it was; nothing new was built.`,
+        );
+      }
+      // Any failure of the build, a typed error included, becomes the failed record's error with its own message.
       record.status = "failed";
       record.error = e instanceof Error ? e.message : String(e);
       if (sandboxCreated) {
-        await this.takeOffline(record);
+        await this.takeOffline(record, sandbox);
         this.registry.put(record);
       } else {
         // Nothing usable exists (bad repository, clone or image failure):
-        // leave no half-project behind.
+        // leave no half-project behind. This rollback of the install's own new names
+        // swallows every error on purpose, a refusal and "could not be asked" included:
+        // a refusal means the thing at these names is not ours, so there is nothing of
+        // this install to remove, and the record that names them is deleted just below.
         await this.docker.destroy(container, volume).catch(() => {});
         this.registry.delete(slug);
       }
@@ -341,6 +456,7 @@ export class Installer {
     try {
       await this.docker.assertAvailable();
     } catch (e) {
+      // Reachability only: whatever the failure, nothing is changed and the next start tries again.
       log(`${stale.length} interrupted install(s) not reconciled, Docker is not reachable: ${(e as Error).message.split("\n")[0]}`);
       return [];
     }
@@ -378,6 +494,8 @@ export class Installer {
           log(`${slug}: marked failed, its install was interrupted (started ${installedAt})`);
         }
       } catch (e) {
+        // Per record: a failure is logged and the record stays as it was. `takeOffline` never throws, so this meets
+        // only the registry and the guarded write; a refusal is reported by `takeOffline` itself, in the record.
         log(`${slug}: not reconciled: ${(e as Error).message.split("\n")[0]}`);
       }
     }
@@ -386,13 +504,24 @@ export class Installer {
 
   /**
    * After a failed install the kept sandbox must not stay online, whatever the
-   * caller asked for. Never throws: the record says what is known.
+   * caller asked for. Never throws: the record says what is known. An install
+   * passes the reference it holds, so that it cannot meet a refusal; the startup
+   * reconciliation resolves the record's name, and can.
    */
-  private async takeOffline(record: ProjectRecord): Promise<void> {
+  private async takeOffline(record: ProjectRecord, sandbox?: SandboxRef): Promise<void> {
     try {
-      await this.docker.setNetwork(record.container, false);
+      await this.docker.setNetwork(sandbox ?? record.container, false);
       record.network = false;
     } catch (e) {
+      if (e instanceof SandboxRefusedError) {
+        // The sandbox this record names is not this installation's: it was not touched, so what the record says
+        // about its network stays as it was, and "may still be online" would be a claim about a stranger's sandbox.
+        record.warnings.push(
+          `The sandbox this record names is not this installation's and was left alone, so its network was not changed: ${describeLeft(e.sandboxes)}.`,
+        );
+        return;
+      }
+      // Anything else, "could not be asked" included, is reported as what it is: this sandbox may still be online.
       const reason = (e instanceof Error ? e.message : String(e)).split("\n")[0];
       record.network = true;
       record.warnings.push(
@@ -401,10 +530,13 @@ export class Installer {
     }
   }
 
-  private async requireSandbox(project: ProjectRecord): Promise<void> {
-    if (!(await this.docker.ensureRunning(project.container))) {
+  /** Checks the project's sandbox once and returns the reference its operation then runs on. */
+  private async requireSandbox(project: ProjectRecord): Promise<SandboxRef> {
+    const sandbox = await this.docker.acquire(project.container);
+    if (!sandbox) {
       throw new Error(`Sandbox for ${project.slug} no longer exists; reinstall it with install_project(reinstall: true).`);
     }
+    return sandbox;
   }
 
   private finish(record: ProjectRecord): ProjectRecord {
@@ -421,9 +553,9 @@ export class Installer {
    * manual build via sandbox_exec.
    */
   async rediscover(project: ProjectRecord, extraCommands: string[]): Promise<ProjectRecord> {
-    await this.requireSandbox(project);
+    const sandbox = await this.requireSandbox(project);
     const record: ProjectRecord = { ...project, warnings: [...project.warnings] };
-    await this.discover(record, extraCommands);
+    await this.discover(record, sandbox, extraCommands);
     return this.finish(record);
   }
 
@@ -436,11 +568,11 @@ export class Installer {
   async refreshMcp(project: ProjectRecord): Promise<RefreshOutcome> {
     // Before anything is stopped: an unusable value fails the call and changes nothing.
     launchVariables(project.slug, this.slugsWith(project), this.env);
-    await this.requireSandbox(project);
+    const sandbox = await this.requireSandbox(project);
     await this.proxy.closeProject(project.container);
     const record: ProjectRecord = { ...project, warnings: [...project.warnings] };
     const before = (project.mcpServers ?? []).map((s) => s.name);
-    const mcp = await this.discover(record, []);
+    const mcp = await this.discover(record, sandbox, []);
     this.finish(record);
     return {
       record,
@@ -458,14 +590,14 @@ export class Installer {
    * start, leaving the project unchanged.
    */
   async connectMcp(project: ProjectRecord, spec: McpServerSpec): Promise<ProjectRecord> {
-    await this.requireSandbox(project);
+    const sandbox = await this.requireSandbox(project);
     // Before anything is stopped: an unusable value fails the call and changes nothing.
     const launch = this.launchSpec(project, spec);
     await this.proxy.closeProject(project.container);
     await this.proxy.listTools(project.container, launch);
     const others = (project.mcpServers ?? []).filter((s) => s.name !== spec.name);
     const record: ProjectRecord = { ...project, mcpServers: [...others, spec], warnings: [...project.warnings] };
-    await this.discover(record, []);
+    await this.discover(record, sandbox, []);
     return this.finish(record);
   }
 
@@ -476,14 +608,14 @@ export class Installer {
     if (server.origin !== "registered") {
       throw new Error(`"${name}" was detected automatically and would be found again; uninstall the project to remove it.`);
     }
-    await this.requireSandbox(project);
+    const sandbox = await this.requireSandbox(project);
     await this.proxy.closeProject(project.container);
     const record: ProjectRecord = {
       ...project,
       mcpServers: (project.mcpServers ?? []).filter((s) => s.name !== name),
       warnings: [...project.warnings],
     };
-    await this.discover(record, []);
+    await this.discover(record, sandbox, []);
     return this.finish(record);
   }
 
@@ -506,8 +638,25 @@ export class Installer {
     record.warnings.push(...notes.map((n) => `${TOOLS_WARNING}${n}`));
   }
 
-  private async discover(record: ProjectRecord, extraCommands: string[]): Promise<McpDiscovery> {
-    const exec = this.execFor(record);
+  private async discover(record: ProjectRecord, sandbox: SandboxRef, extraCommands: string[]): Promise<McpDiscovery> {
+    // Every command of a discovery has a place that reads its failure as "no": eight `.catch(() => null)` in this
+    // file and the `catch` in `fetchHelp` (toolgen/discover.ts), which receives this wrapped function. "Docker could not be asked" must not become "no commands", so the first one
+    // is remembered, thrown again on every later command, and thrown by the discovery before it writes or returns.
+    // Only that type: a command on a held reference reads no labels, so it cannot raise a refusal.
+    let unavailable: DockerUnavailableError | undefined;
+    const bound = this.execFor(sandbox);
+    const exec: SandboxExec = async (argv, opts) => {
+      if (unavailable) throw unavailable;
+      try {
+        return await bound(argv, opts);
+      } catch (e) {
+        if (e instanceof DockerUnavailableError) unavailable = e;
+        throw e;
+      }
+    };
+    const checkAsked = () => {
+      if (unavailable) throw unavailable;
+    };
     const quick = { timeoutSec: 60, cwd: REPO_DIR };
     const commands = new Map<string, CommandSpec>();
     const add = (name: string, origin: string) => {
@@ -516,8 +665,11 @@ export class Installer {
     };
 
     // Commands registered by hand survive re-discovery for as long as they exist.
-    const exists = async (name: string) =>
-      (await exec(["sh", "-c", 'command -v "$1" >/dev/null', "sh", name], quick).catch(() => null))?.code === 0;
+    const exists = async (name: string) => {
+      const res = await exec(["sh", "-c", 'command -v "$1" >/dev/null', "sh", name], quick).catch(() => null);
+      checkAsked(); // not "there is no such executable"
+      return res?.code === 0;
+    };
     for (const c of record.commands) {
       if (c.origin === "registered" && (await exists(c.name))) add(c.name, c.origin);
     }
@@ -594,6 +746,7 @@ export class Installer {
       rootHelp.set(c.name, text ? parseHelp(text) : null);
     }
 
+    checkAsked(); // before any proxied server is opened
     const mcp = await this.discoverMcp(record, exec, {
       commands: kept.map((c) => c.name),
       aliasOf,
@@ -613,6 +766,7 @@ export class Installer {
       roots.push({ command, node: text ? await crawlCommand(exec, command.name, limits, text) : null });
     }
 
+    checkAsked(); // before anything is written to the record
     record.meta = meta;
     record.commands = kept;
     record.mcpServers = mcp.servers;
@@ -629,6 +783,7 @@ export class Installer {
     this.publish(record);
     // Scratch dir may have been removed by the project; tools default to it.
     await exec(["mkdir", "-p", WORK_DIR], quick).catch(() => null);
+    checkAsked();
     return mcp;
   }
 
@@ -710,6 +865,8 @@ export class Installer {
       try {
         lists.push({ server: server.name, tools: await this.proxy.listTools(record.container, this.launchSpec(record, server)) });
       } catch (e) {
+        // A refusal or "could not be asked" is not "the server did not start": it ends the discovery.
+        if (e instanceof SandboxRefusedError || e instanceof DockerUnavailableError) throw e;
         const text = brief(e);
         startFailures.push({ server: server.name, reason: text });
         // The hint goes after the cut; an unusable value already says what to fix.
@@ -759,6 +916,8 @@ export class Installer {
         claimed.add(command);
         if (candidate.argv.length === 1) bare.add(command);
       } catch (e) {
+        // Same rule as above: not "did not answer the handshake".
+        if (e instanceof SandboxRefusedError || e instanceof DockerUnavailableError) throw e;
         failed.push(candidate.argv.join(" "));
         if (!reason) {
           reason = brief(e);
@@ -780,9 +939,24 @@ export class Installer {
     return { servers, lists, bare, failed: startFailures, unanswered, reason };
   }
 
-  async uninstall(project: ProjectRecord): Promise<void> {
+  /**
+   * Remove a project's sandbox and its record. Returns what was left in Docker:
+   * nothing when the sandbox was removed (or was not there), the facts of every
+   * part found when Docker's guard refused it as another installation's or not
+   * ours. A refusal still deletes the record, since a record that can be neither
+   * used nor removed helps no one; any other failure (Docker did not answer, a
+   * failed removal) rises before the record is deleted, so it can be tried again.
+   */
+  async uninstall(project: ProjectRecord): Promise<readonly SandboxFacts[]> {
     await this.proxy.closeProject(project.container);
-    await this.docker.destroy(project.container, project.volume);
+    let left: readonly SandboxFacts[] = [];
+    try {
+      await this.docker.destroy(project.container, project.volume);
+    } catch (e) {
+      if (!(e instanceof SandboxRefusedError)) throw e;
+      left = e.sandboxes;
+    }
     this.registry.delete(project.slug);
+    return left;
   }
 }

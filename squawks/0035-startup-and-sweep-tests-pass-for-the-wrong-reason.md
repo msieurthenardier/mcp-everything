@@ -15,6 +15,8 @@ Three of the cases flight 03 (mission 01) added say more in their names than the
 
 Test files only. For each, break the behavior it names once and watch the case fail.
 
+Added on 2026-11-16, at the [debrief of mission 02's flight 01](../missions/02-sandbox-ownership-on-a-shared-machine/flights/01-owned-sandboxes/flight-debrief.md): the id module added by that flight has a third sweep with the same weakness as the directory case here (its `isFile` check can be removed and every test passes). It is tracked in squawk [0037](0037-tests-pass-with-the-guarded-behavior-broken.md), not here. This squawk's own cases are unchanged; their lines moved.
+
 ## Evidence
 - `test/server.test.ts` — `it("are not waited for by shutdown", …)`: `local.start(); await expect(local.shutdown()).resolves.toBeUndefined();`.
 - `test/server.test.ts` — `it("do not stop each other: a throwing registry sweep is logged and the rest still run", …)`; `src/server.ts`, `App.start`: the env-file sweep is called before the registry temp sweep.

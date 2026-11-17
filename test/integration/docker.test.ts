@@ -6,6 +6,7 @@ import { loadConfig } from "../../src/config.js";
 import { parseRepoRef } from "../../src/forge/repo-ref.js";
 import { Installer } from "../../src/install/installer.js";
 import { McpProxy } from "../../src/proxy/mcp-proxy.js";
+import { loadInstallationId } from "../../src/installation.js";
 import { Registry } from "../../src/registry.js";
 import { Docker, type ExecOptions, type ExecResult } from "../../src/sandbox/docker.js";
 import { App } from "../../src/server.js";
@@ -15,12 +16,86 @@ import { run } from "../../src/util/exec.js";
  * End-to-end against a real Docker daemon and github.com. Opt in with
  * MCPE_DOCKER_TESTS=1 (npm run test:docker). Uses its own name prefix and data
  * directory, so it never touches real installs.
+ *
+ * Finding what an interrupted run left behind. Most cases name their sandboxes
+ * with the suite's prefix, `mcpe-it-<pid>-`. The two-installation cases do not:
+ * they run with the default prefix, so their sandboxes are named
+ * `mcpe-<id>-gron` with an id made for the run, which the run prints
+ * ("two installations: ..."). Find them by owner label, not by name:
+ *
+ *   docker ps -a --filter label=mcp-everything=1 --format '{{.Names}}\t{{.Label "mcp-everything.owner"}}'
+ *   docker volume ls --filter label=mcp-everything=1 --format '{{.Name}}\t{{.Label "mcp-everything.owner"}}'
+ *
+ * An empty owner is a sandbox from before ownership was recorded (an operator's
+ * real one, as likely as not). A test installation's id is also in the file
+ * `installation-id` of its data directory, `mcpe-it-two-*` under the system's
+ * temporary directory, for as long as that directory exists. Remove only what
+ * you have matched to an id this suite printed.
  */
 const enabled = process.env.MCPE_DOCKER_TESTS === "1";
 // The fork-pressure cases are slow, so they are opt-in on their own switch.
 const pressureEnabled = enabled && process.env.MCPE_PRESSURE_TESTS === "1";
 const prefix = `mcpe-it-${process.pid}-`;
 const text = (res: Awaited<ReturnType<App["callTool"]>>) => (res.content[0] as { text: string }).text;
+
+const HEX8 = /^[0-9a-f]{8}$/;
+
+/** Whether `p` lies strictly inside the system's temporary directory. */
+function isUnderTmp(p: string): boolean {
+  if (typeof p !== "string" || !path.isAbsolute(p)) return false;
+  const rel = path.relative(path.resolve(os.tmpdir()), path.resolve(p));
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/**
+ * The one check every removal in this file goes through. A name may be removed
+ * only if it is `mcpe-<id>-gron` for one of the ids given (each of eight
+ * hexadecimal characters), or begins with the suite's own prefix
+ * `mcpe-it-<pid>-` and has something after it. A sandbox of the operator's is
+ * named `mcpe-<slug>` or `mcpe-<their id>-<slug>`: neither passes, because the
+ * ids given are the test installations' and the prefix carries this process's id.
+ */
+function mayRemove(name: string, ids: readonly string[]): boolean {
+  if (typeof name !== "string" || !/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return false;
+  if (ids.some((id) => HEX8.test(id) && name === `mcpe-${id}-gron`)) return true;
+  return name.startsWith(prefix) && name.length > prefix.length;
+}
+
+/** Throws unless `mayRemove`; the removals below call it first, so nothing else removes. */
+function checkedForRemoval(name: string, ids: readonly string[]): string {
+  if (!mayRemove(name, ids)) throw new Error(`refusing to remove ${JSON.stringify(name)}: not a sandbox this suite made`);
+  return name;
+}
+async function removeContainerChecked(name: string, ids: readonly string[]): Promise<void> {
+  await run("docker", ["rm", "-f", checkedForRemoval(name, ids)], { timeoutMs: 120_000 });
+}
+async function removeVolumeChecked(name: string, ids: readonly string[]): Promise<void> {
+  await run("docker", ["volume", "rm", checkedForRemoval(name, ids)], { timeoutMs: 120_000 });
+}
+
+/** The name check's own assertions. They issue no Docker command. */
+function assertNameCheckBehaves(): void {
+  const ids = ["aaaaaaaa", "bbbbbbbb"];
+  expect(mayRemove("mcpe-aaaaaaaa-gron", ids)).toBe(true);
+  expect(mayRemove("mcpe-bbbbbbbb-gron", ids)).toBe(true);
+  expect(mayRemove(`${prefix}before`, [])).toBe(true);
+  expect(mayRemove(`${prefix}before`, ids)).toBe(true);
+  // An operator's sandboxes, from before the change and after it.
+  for (const name of ["mcpe-gron", "mcpe-rea", "mcpe-cowsay", "mcpe-ha_googlehome", "mcpe-12345678-gron"]) {
+    expect(mayRemove(name, ids)).toBe(false);
+    expect(mayRemove(name, [])).toBe(false);
+  }
+  // A third id, the right id with another slug, the empty string, a bare prefix, another process's prefix.
+  for (const name of ["mcpe-cccccccc-gron", "mcpe-aaaaaaaa-rea", "mcpe-aaaaaaaa-gron-2", "mcpe-aaaaaaaa-", "", prefix, "mcpe-it-0-before", "gron", " mcpe-aaaaaaaa-gron"]) {
+    expect(mayRemove(name, ids)).toBe(false);
+  }
+  // An id that is not eight hexadecimal characters never matches, even as its own name.
+  expect(mayRemove("mcpe-AAAAAAAA-gron", ["AAAAAAAA"])).toBe(false);
+  expect(mayRemove("mcpe--gron", [""])).toBe(false);
+  expect(mayRemove("mcpe-aaaaaaaaa-gron", ["aaaaaaaaa"])).toBe(false);
+  // No ids at all removes nothing of the two-installation kind.
+  expect(mayRemove("mcpe-aaaaaaaa-gron", [])).toBe(false);
+}
 
 /**
  * A minimal stdio MCP server in POSIX shell, so the proxy can be tested end to
@@ -70,13 +145,15 @@ done
 
 describe.skipIf(!enabled)("docker integration", () => {
   let dir: string;
+  let cfg: ReturnType<typeof loadConfig>;
   let app: App;
+  /** The first project's sandbox name, as its record gives it: prefix, installation id, slug. */
+  let gron = "";
 
   beforeAll(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-"));
-    app = new App({
-      cfg: loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: prefix, MCPE_TOOL_TIMEOUT: "5" }),
-    });
+    cfg = loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: prefix, MCPE_TOOL_TIMEOUT: "5" });
+    app = new App({ cfg });
   });
 
   afterAll(async () => {
@@ -92,7 +169,8 @@ describe.skipIf(!enabled)("docker integration", () => {
     expect(installed.isError).toBe(false);
 
     const project = app.registry.get("gron")!;
-    expect(project.container).toBe(`${prefix}gron`);
+    expect(project.container).toBe(`${prefix}${app.docker.installationId}-gron`);
+    gron = project.container;
     expect(project.commit).toMatch(/^[0-9a-f]{40}$/);
     const tool = project.tools.find((t) => t.name === "gron__gron")!;
     expect(tool.options.map((o) => o.flag)).toContain("--ungron");
@@ -114,7 +192,7 @@ describe.skipIf(!enabled)("docker integration", () => {
   it("kills commands that exceed their timeout, inside the container", async () => {
     const res = await app.callTool("sandbox_exec", { project: "gron", command: "sleep 60", timeout_seconds: 2 });
     expect(text(res)).toMatch(/^Timed out after 2s/);
-    const ps = await run("docker", ["exec", `${prefix}gron`, "sh", "-c", "ps -eo args | grep -c '[s]leep 60' || true"]);
+    const ps = await run("docker", ["exec", gron, "sh", "-c", "ps -eo args | grep -c '[s]leep 60' || true"]);
     expect(ps.stdout.trim()).toBe("0");
   }, 60_000);
 
@@ -145,7 +223,7 @@ describe.skipIf(!enabled)("docker integration", () => {
     // The command line tool generated earlier is still there next to it.
     expect(text(await app.callTool("gron__gron", { stdin: "[1]" }))).toContain("json[0] = 1;");
 
-    const ps = () => run("docker", ["exec", `${prefix}gron`, "sh", "-c", "ps -eo args | grep -E '[s]h-mcp|[s]leep 300' || true"]);
+    const ps = () => run("docker", ["exec", gron, "sh", "-c", "ps -eo args | grep -E '[s]h-mcp|[s]leep 300' || true"]);
     expect((await ps()).stdout).toContain("sh-mcp.sh");
 
     // A call that never returns: the server and its child are killed in the sandbox.
@@ -271,10 +349,71 @@ describe.skipIf(!enabled)("docker integration", () => {
     }
   }, 120_000);
 
+  it("works on, describes and removes a sandbox made before ownership was recorded", async () => {
+    // Made by hand with the generic label and no owner label, as an earlier version made it.
+    // Named with the suite's prefix, so the one name check below accepts it and no operator's sandbox can match.
+    const name = `${prefix}before`;
+    const slug = "before";
+    expect(mayRemove(name, [])).toBe(true);
+    expect(isUnderTmp(cfg.dataDir)).toBe(true);
+    expect(cfg.dataDir).toBe(dir);
+    const base = app.registry.get("gron")!;
+    expect(base).toBeDefined();
+    try {
+      const vol = await run("docker", ["volume", "create", "--label", "mcp-everything=1", name], { timeoutMs: 30_000 });
+      expect(vol.code).toBe(0);
+      const ctr = await run(
+        "docker",
+        ["run", "-d", "--name", name, "--label", "mcp-everything=1", "-v", `${name}:/workspace`, cfg.docker.images.generic, "sleep", "infinity"],
+        { timeoutMs: 300_000 },
+      );
+      expect(ctr.code).toBe(0);
+      const owner = await run("docker", ["inspect", "--type", "container", "--format", '{{index .Config.Labels "mcp-everything.owner"}}', name], { timeoutMs: 30_000 });
+      expect(owner.stdout.trim()).toBe("");
+
+      app.registry.put({
+        ...base,
+        slug,
+        repo: { ...base.repo, path: "mcpe-it/before", id: "github:mcpe-it/before", name: "before", cloneUrl: "https://github.com/mcpe-it/before" },
+        container: name,
+        volume: name,
+        status: "ready",
+        network: false,
+        error: undefined,
+        errorLog: undefined,
+        warnings: [],
+        commands: [],
+        mcpServers: [],
+        tools: [],
+        published: [],
+        selection: undefined,
+      });
+
+      const ran = await app.callTool("sandbox_exec", { project: slug, command: "echo still-works", cwd: "/workspace" });
+      expect(ran.isError).toBe(false);
+      expect(text(ran)).toContain("still-works");
+
+      const info = await app.callTool("project_info", { project: slug });
+      expect(text(info)).toMatch(/Sandbox owner: container "[^"]+" was made before ownership was recorded/);
+
+      const gone = await app.callTool("uninstall_project", { project: slug });
+      expect(gone.isError).toBe(false);
+      expect(text(gone)).toMatch(/^Removed before .* and its sandbox\.$/);
+      expect(app.registry.get(slug)).toBeUndefined();
+      expect((await run("docker", ["inspect", "--type", "container", name])).code).not.toBe(0);
+      expect((await run("docker", ["volume", "inspect", name])).code).not.toBe(0);
+    } finally {
+      // Whatever state the case left. Exact name, checked.
+      await removeContainerChecked(name, []);
+      await removeVolumeChecked(name, []);
+      app.registry.delete(slug);
+    }
+  }, 300_000);
+
   it("uninstall removes the container and the volume", async () => {
     await app.callTool("uninstall_project", { project: "gron" });
-    const c = await run("docker", ["inspect", `${prefix}gron`]);
-    const v = await run("docker", ["volume", "inspect", `${prefix}gron`]);
+    const c = await run("docker", ["inspect", gron]);
+    const v = await run("docker", ["volume", "inspect", gron]);
     expect(c.code).not.toBe(0);
     expect(v.code).not.toBe(0);
   }, 60_000);
@@ -300,7 +439,7 @@ describe.skipIf(!enabled)("docker integration: rebuilding on another image", () 
   it("replaces the container, cleans the checkout and builds again", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-retry-"));
     const cfg = loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: `${prefix}retry-` });
-    const docker = new FailsFirstBuild(cfg);
+    const docker = new FailsFirstBuild(cfg, loadInstallationId(dir));
     const registry = new Registry(dir);
     // Both "versions" are the same image: what is under test is the mechanics.
     const installer = new Installer(cfg, docker, registry, new McpProxy(cfg, docker), () => ({
@@ -345,7 +484,7 @@ describe.skipIf(!enabled)("docker integration: a failed install", () => {
   it("leaves the sandbox off the network even when network was requested", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-netoff-"));
     const cfg = loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: `${prefix}netoff-` });
-    const docker = new ThrowsInBuild(cfg);
+    const docker = new ThrowsInBuild(cfg, loadInstallationId(dir));
     const registry = new Registry(dir);
     const installer = new Installer(cfg, docker, registry, new McpProxy(cfg, docker));
     try {
@@ -389,7 +528,7 @@ describe.skipIf(!enabled)("docker integration: sandbox idle timeout", () => {
   async function create(d: Docker = docker): Promise<string> {
     const name = `${prefix}idle-${++n}`;
     names.push({ name, volume: name });
-    const vol = await run("docker", ["volume", "create", "--label", "mcp-everything=1", name], { timeoutMs: 30_000 });
+    const vol = await run("docker", ["volume", "create", "--label", "mcp-everything=1", "--label", `mcp-everything.owner=${d.installationId}`, name], { timeoutMs: 30_000 });
     expect(vol.code).toBe(0);
     await d.createContainer({ name, volume: name, image: cfg.docker.images.generic, project: "idle-test" });
     return name;
@@ -413,7 +552,7 @@ describe.skipIf(!enabled)("docker integration: sandbox idle timeout", () => {
       MCPE_NAME_PREFIX: prefix,
       MCPE_SANDBOX_IDLE_TIMEOUT: String(IDLE),
     });
-    docker = new Docker(cfg);
+    docker = new Docker(cfg, loadInstallationId(dir));
   }, 30_000);
 
   afterAll(async () => {
@@ -499,7 +638,7 @@ describe.skipIf(!enabled)("docker integration: sandbox idle timeout", () => {
   }, 90_000);
 
   it("keeps sleep infinity when the timeout is 0", async () => {
-    const off = new Docker(loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: prefix, MCPE_SANDBOX_IDLE_TIMEOUT: "0" }));
+    const off = new Docker(loadConfig({ ...process.env, MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: prefix, MCPE_SANDBOX_IDLE_TIMEOUT: "0" }), loadInstallationId(dir));
     const name = await create(off);
     const before = await startedAt(name);
     await sleep(12_000);
@@ -508,6 +647,218 @@ describe.skipIf(!enabled)("docker integration: sandbox idle timeout", () => {
     expect(await inspect(name, "{{json .Config.Entrypoint}} {{json .Config.Cmd}}")).toBe('["sleep"] ["infinity"]');
     expect(await inspect(name, "{{index .Config.Labels \"mcp-everything.idle-timeout\"}}")).toBe("0");
   }, 60_000);
+});
+
+/**
+ * Two installations on one daemon: two Apps, each on a data directory of its
+ * own, both with the default name prefix, installing the same repository.
+ *
+ * The cases depend on each other and run in the order written: the first two
+ * install, the next three act on the second's record after it has been
+ * pointed at the first's sandbox.
+ *
+ * What makes this safe on a machine that holds real sandboxes. A sandbox name
+ * cannot reach an operator's sandbox: a name made by the code is always prefix,
+ * id, slug. The data directory can: a configuration without MCPE_DATA_DIR falls
+ * back to the real one, whose registry names real sandboxes that the code
+ * treats as this installation's to remove. So:
+ *  - every App here is built by `installationOn`, from a directory this
+ *    describe has just made with mkdtemp under the system's temporary directory;
+ *  - `beforeAll` checks, for each App, that its data directory is that
+ *    directory, that its registry is empty and that its id came from that
+ *    directory's file, and that the two ids differ; only then it sets `safe`;
+ *  - every case starts with `proceed()`, which throws unless `safe` is set,
+ *    before any Docker command is issued;
+ *  - every removal is `removeContainerChecked` or `removeVolumeChecked`, which
+ *    check the name with `mayRemove` first; nothing here removes by a filter.
+ */
+describe.skipIf(!enabled)("docker integration: two installations on one daemon", () => {
+  /** Set by `beforeAll` when every guard has passed, and by nothing else. */
+  let safe = false;
+  /** The two test ids, set together with `safe`; the name check and cleanup use only these. */
+  let testIds: readonly string[] = [];
+  /** Directories this describe made with mkdtemp. */
+  const made: string[] = [];
+  let first: App | undefined;
+  let second: App | undefined;
+  let idA = "";
+  let idB = "";
+  /** Container and volume names of the first and second installation's gron: `mcpe-<id>-gron`. */
+  let nameA = "";
+  let nameB = "";
+  /** The first's container as it was after its own install: id, running state, networks. */
+  let beforeA = "";
+
+  const proceed = (): void => {
+    if (!safe) throw new Error("a guard failed in beforeAll: no Docker command is issued");
+  };
+
+  /** An App on exactly this directory, with the default prefix whatever the ambient environment says. */
+  function installationOn(dataDir: string): { app: App; cfg: ReturnType<typeof loadConfig> } {
+    if (!made.includes(dataDir) || !isUnderTmp(dataDir)) throw new Error("not a directory this describe made under the temporary directory");
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    delete env.MCPE_NAME_PREFIX;
+    env.MCPE_DATA_DIR = dataDir;
+    const cfg = loadConfig(env);
+    return { app: new App({ cfg }), cfg };
+  }
+
+  const inspect = async (name: string, format: string) => {
+    const res = await run("docker", ["inspect", "--type", "container", "--format", format, name], { timeoutMs: 30_000 });
+    expect(res.code, `inspect ${name}: ${res.stderr}`).toBe(0);
+    return res.stdout.trim();
+  };
+  /** The container's id, whether it is running, and the networks it is attached to. */
+  const stateOf = (name: string) =>
+    inspect(name, "{{.Id}} {{.State.Running}} {{range $k, $v := .NetworkSettings.Networks}}{{$k}},{{end}}");
+  const containerOwner = (name: string) => inspect(name, '{{index .Config.Labels "mcp-everything.owner"}}');
+  const volumeOwner = async (name: string) => {
+    const res = await run("docker", ["volume", "inspect", "--format", '{{index .Labels "mcp-everything.owner"}}', name], { timeoutMs: 30_000 });
+    expect(res.code, `volume inspect ${name}: ${res.stderr}`).toBe(0);
+    return res.stdout.trim();
+  };
+  const runsGron = async (app: App) => text(await app.callTool("gron__gron", { stdin: '{"a":[1,2]}' }));
+
+  /** Point the second installation's record for gron at the first's container and volume, through its own registry. */
+  const pointSecondAtFirst = () => {
+    const record = second!.registry.get("gron")!;
+    second!.registry.put({ ...record, container: nameA, volume: nameA });
+    expect(second!.registry.get("gron")).toMatchObject({ container: nameA, volume: nameA });
+  };
+
+  beforeAll(() => {
+    // The name check first: it is what the removals rely on.
+    assertNameCheckBehaves();
+
+    const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-two-a-"));
+    made.push(dirA);
+    const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-two-b-"));
+    made.push(dirB);
+    const a = installationOn(dirA);
+    const b = installationOn(dirB);
+    first = a.app;
+    second = b.app;
+
+    for (const [app, cfg, dataDir] of [
+      [a.app, a.cfg, dirA],
+      [b.app, b.cfg, dirB],
+    ] as const) {
+      expect(isUnderTmp(dataDir)).toBe(true);
+      expect(cfg.dataDir).toBe(dataDir);
+      expect(isUnderTmp(cfg.dataDir)).toBe(true);
+      expect(cfg.docker.namePrefix).toBe("mcpe-");
+      expect(app.registry.list()).toEqual([]);
+      expect(app.docker.installationId).toMatch(HEX8);
+      // The id came from this directory's file, not from anywhere else.
+      expect(fs.readFileSync(path.join(dataDir, "installation-id"), "utf8").trim()).toBe(app.docker.installationId);
+    }
+    expect(a.cfg.dataDir).not.toBe(b.cfg.dataDir);
+    expect(a.app.docker.installationId).not.toBe(b.app.docker.installationId);
+
+    idA = a.app.docker.installationId;
+    idB = b.app.docker.installationId;
+    nameA = `mcpe-${idA}-gron`;
+    nameB = `mcpe-${idB}-gron`;
+    expect(mayRemove(nameA, [idA, idB])).toBe(true);
+    expect(mayRemove(nameB, [idA, idB])).toBe(true);
+    console.log(`two installations: first ${idA} (${dirA}), second ${idB} (${dirB})`);
+    testIds = [idA, idB];
+    safe = true;
+  }, 30_000);
+
+  afterAll(async () => {
+    try {
+      await Promise.allSettled([first?.shutdown(), second?.shutdown()]);
+      // If a guard failed no case ran and nothing was made in Docker; the ids may be unset or not the test's.
+      if (safe) {
+        for (const name of [nameA, nameB]) {
+          await removeContainerChecked(name, testIds);
+          await removeVolumeChecked(name, testIds);
+        }
+        const list = async (args: string[]) => (await run("docker", args, { timeoutMs: 60_000 })).stdout.trim();
+        for (const id of testIds) {
+          expect(await list(["ps", "-a", "-q", "--filter", `label=mcp-everything.owner=${id}`]), `containers of ${id}`).toBe("");
+          expect(await list(["volume", "ls", "-q", "--filter", `label=mcp-everything.owner=${id}`]), `volumes of ${id}`).toBe("");
+        }
+        expect(await list(["ps", "-a", "-q", "--filter", `name=${prefix}`]), "containers with the suite's prefix").toBe("");
+        expect(await list(["volume", "ls", "-q", "--filter", `name=${prefix}`]), "volumes with the suite's prefix").toBe("");
+      }
+    } finally {
+      for (const d of made) if (isUnderTmp(d)) fs.rmSync(d, { recursive: true, force: true });
+    }
+  }, 300_000);
+
+  it("the first installation installs gron under its own names and label", async () => {
+    proceed();
+    const res = await first!.callTool("install_project", { repo: "tomnomnom/gron" });
+    expect(text(res)).toMatch(/gron — github:tomnomnom\/gron \(ready\)/);
+    expect(res.isError).toBe(false);
+    const record = first!.registry.get("gron")!;
+    expect(record).toMatchObject({ container: nameA, volume: nameA });
+    expect(await containerOwner(nameA)).toBe(idA);
+    expect(await volumeOwner(nameA)).toBe(idA);
+    expect(await runsGron(first!)).toContain("json.a[1] = 2;");
+    beforeA = await stateOf(nameA);
+  }, 600_000);
+
+  it("the second installation installs the same repository beside it, and the first's sandbox is unchanged", async () => {
+    proceed();
+    expect(beforeA).not.toBe("");
+    const res = await second!.callTool("install_project", { repo: "tomnomnom/gron" });
+    expect(text(res)).toMatch(/gron — github:tomnomnom\/gron \(ready\)/);
+    expect(res.isError).toBe(false);
+    expect(second!.registry.get("gron")).toMatchObject({ container: nameB, volume: nameB });
+    expect(await containerOwner(nameB)).toBe(idB);
+    expect(await volumeOwner(nameB)).toBe(idB);
+    expect(await runsGron(second!)).toContain("json.a[1] = 2;");
+    // The first's: the same container (same id), and its tool still runs.
+    expect(await stateOf(nameA)).toBe(beforeA);
+    expect(await containerOwner(nameA)).toBe(idA);
+    expect(await runsGron(first!)).toContain("json.a[1] = 2;");
+  }, 600_000);
+
+  it("refuses a tool call, sandbox_exec and the network setting on a record that names the first's sandbox", async () => {
+    proceed();
+    pointSecondAtFirst();
+    const refused = async (what: string, res: Awaited<ReturnType<App["callTool"]>>) => {
+      expect(res.isError, what).toBe(true);
+      expect(text(res), what).toContain(`owner label "${idA}"`);
+      expect(await stateOf(nameA), what).toBe(beforeA);
+    };
+    await refused("generated tool", await second!.callTool("gron__gron", { stdin: "[1]" }));
+    await refused("sandbox_exec", await second!.callTool("sandbox_exec", { project: "gron", command: "echo reached" }));
+    await refused("set_project_network", await second!.callTool("set_project_network", { project: "gron", enabled: true }));
+    // The refused network change was not recorded either.
+    expect(second!.registry.get("gron")!.network).toBe(false);
+  }, 120_000);
+
+  it("reinstalls beside the first's sandbox, under its own names, and says it left the other in place", async () => {
+    proceed();
+    // Still pointed at the first's sandbox, from the case above.
+    expect(second!.registry.get("gron")).toMatchObject({ container: nameA, volume: nameA });
+    const res = await second!.callTool("install_project", { repo: "tomnomnom/gron", reinstall: true });
+    expect(text(res)).toMatch(/\(ready\)/);
+    expect(res.isError).toBe(false);
+    const record = second!.registry.get("gron")!;
+    expect(record).toMatchObject({ status: "ready", container: nameB, volume: nameB });
+    expect(record.warnings.some((w) => w.startsWith("The previous sandbox of this project was left in place, untouched"))).toBe(true);
+    expect(await containerOwner(nameB)).toBe(idB);
+    expect(await runsGron(second!)).toContain("json.a[1] = 2;");
+    expect(await stateOf(nameA)).toBe(beforeA);
+    expect(await runsGron(first!)).toContain("json.a[1] = 2;");
+  }, 600_000);
+
+  it("lets go of the first's sandbox on uninstall, and says it was left", async () => {
+    proceed();
+    pointSecondAtFirst();
+    const res = await second!.callTool("uninstall_project", { project: "gron" });
+    expect(res.isError).toBe(false);
+    expect(text(res)).toContain("Its sandbox was left in place");
+    expect(second!.registry.get("gron")).toBeUndefined();
+    expect(second!.registry.list()).toEqual([]);
+    expect(await stateOf(nameA)).toBe(beforeA);
+    expect(await runsGron(first!)).toContain("json.a[1] = 2;");
+  }, 120_000);
 });
 
 /**
@@ -546,7 +897,7 @@ describe.skipIf(!pressureEnabled)("docker integration: sandbox at its process li
   async function create(image: string): Promise<string> {
     const name = `${prefix}fork-${++n}`;
     names.push({ name, volume: name });
-    const vol = await run("docker", ["volume", "create", "--label", "mcp-everything=1", name], { timeoutMs: 30_000 });
+    const vol = await run("docker", ["volume", "create", "--label", "mcp-everything=1", "--label", `mcp-everything.owner=${docker.installationId}`, name], { timeoutMs: 30_000 });
     expect(vol.code).toBe(0);
     await docker.createContainer({ name, volume: name, image, project: "fork-test" });
     return name;
@@ -605,7 +956,7 @@ describe.skipIf(!pressureEnabled)("docker integration: sandbox at its process li
       MCPE_SANDBOX_IDLE_TIMEOUT: String(IDLE),
       MCPE_PIDS_LIMIT: "24",
     });
-    docker = new Docker(cfg);
+    docker = new Docker(cfg, loadInstallationId(dir));
   }, 30_000);
 
   afterAll(async () => {
