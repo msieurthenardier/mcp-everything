@@ -175,5 +175,5 @@ Filled in at the debrief. During the flight these were recorded only in the Flig
 
 ### 2026-11-16 — after the merge (Flight Director)
 - The operator merged pull request #10 (`661db3e`) with the debrief on it. The check ran on the push to `main` (run 43931795421, success). Mission criterion 2 and this flight's "Code merged" are checked off; the two artifact edits are committed with flight 03.
-- The debrief's recommendation 3 (ownership of a registry record) is logged as [sortie 04](../../../../sorties/04-ownership-on-a-shared-machine/flight.md), at the operator's request, for after this mission.
+- The debrief's recommendation 3 (ownership of a registry record) is logged as [sortie 04](../../../02-sandbox-ownership-on-a-shared-machine/flights/01-owned-sandboxes/flight.md), at the operator's request, for after this mission.
 
