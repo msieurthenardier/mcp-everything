@@ -142,8 +142,8 @@ Real, and either not reproducible from the methodology alone or without an obser
 - The mission was set to `completed` at this debrief with its criteria unticked, because the criteria are ticked when the pull request merges. Mission 01 did the same.
 
 ## Action Items
-- [ ] Operator: merge #16 and then #17, or #17 alone (it carries #16's two commits).
-- [ ] After #17 merges: tick the six criteria here in the mission and "Code merged" in the flight.
+- [x] Operator: merge #16 and then #17, or #17 alone (it carries #16's two commits). *(Done: #16 merged as `ea16e9a` and #17 as `a7eabc0`, both squashed, on 2026-11-17 UTC. The hosted check passed on each push to `main`; run 44012617791 on `a7eabc0`.)*
+- [x] After #17 merges: tick the six criteria here in the mission and "Code merged" in the flight.
 - [ ] Operator, to make the outcome real: upgrade both installations; on the Windows side run `project_info` on an existing project first (read-only; it is the first run of this code on Windows); then reinstall each existing project in each installation. `rea` is in both registries: the first side to reinstall it removes the shared sandbox and the other must then reinstall too.
 - [ ] **A squawk turnaround.** Thirteen are open. The Architect's order, in four groups: housekeeping (0026, 0028, 0039); startup (0040, then 0038, with 0027); words then tests (0041, then 0037, 0029, 0035); failure paths (0030, 0032, 0033, after any split of `Installer.install`, or their lines move again). None needs to be `grounding`. 0040 is worth doing before the Windows side is relied on.
 - [ ] For the next planning conversation in this area, in the Architect's order of importance. None needs a mission.

@@ -177,9 +177,9 @@ All under mission-control 1.2.3. Recorded, not judged. Where an observation repe
 5. **Leave the discovery limit as a recorded limit unless daemon outages become real.** The honest statement is the flight spec's: a command that fails because Docker stopped answering is a plain failure. Closing it needs a second rule that reads Docker's message text.
 
 ## Action Items
-- [ ] Operator: merge #16 and then #17, or #17 alone (it carries #16's two commits).
+- [x] Operator: merge #16 and then #17, or #17 alone (it carries #16's two commits). *(Done: #16 merged as `ea16e9a` and #17 as `a7eabc0`, both squashed, on 2026-11-17 UTC. The hosted check passed on each push to `main`; run 44012617791 on `a7eabc0`.)*
 - [ ] Operator, after merging: upgrade both installations; `project_info` on the Windows side first; reinstall each existing project in each installation.
-- [ ] After #17 merges: tick "Code merged" in the flight and the six criteria in the mission.
+- [x] After #17 merges: tick "Code merged" in the flight and the six criteria in the mission.
 - [x] Logged as squawk [0037](../../../../squawks/0037-tests-pass-with-the-guarded-behavior-broken.md): three tests pass with the guarded behavior broken (the volume `uninstall` names; `connectMcp`'s order; the id module's `isFile` check).
 - [x] Logged as squawk [0038](../../../../squawks/0038-readme-gaps-on-the-installation-id-file.md): README gaps (a refused `installation-id` file and its exact form; a lost id file with the registry kept; `project_info` waiting up to 30 seconds).
 - [x] Logged as squawk [0039](../../../../squawks/0039-ci-floor-comment-states-an-old-count.md): the comment above the hosted floor says 831 tests; the suite has 833.
