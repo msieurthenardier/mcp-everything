@@ -2,10 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { Client, ProtocolError, SdkError, SdkErrorCode, type Transport } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import type { Config } from "../config.js";
 import type { Docker, SandboxRef } from "../sandbox/docker.js";
 import type { McpServerSpec } from "../types.js";
@@ -155,9 +153,18 @@ interface Session {
   inFlight: number;
 }
 
+/**
+ * An error as the proxy writes it into a message. An error a server sent is
+ * `MCP error <code>: <message>`, as the v1 SDK's own message was; an error the
+ * client raised itself is its own text.
+ */
 function describeError(e: unknown): string {
+  if (e instanceof ProtocolError) return `MCP error ${e.code}: ${e.message}`;
   return e instanceof Error ? e.message : String(e);
 }
+
+/** A locally raised failure that means the server's end of the connection is gone. */
+const GONE_CODES: ReadonlySet<string> = new Set([SdkErrorCode.ConnectionClosed, SdkErrorCode.SendFailed, SdkErrorCode.NotConnected]);
 
 export class McpProxy {
   private readonly sessions = new Map<string, Promise<Session>>();
@@ -201,7 +208,7 @@ export class McpProxy {
       await this.kill(launch);
       const stderr = conn.stderr();
       const reason =
-        e instanceof McpError && e.code === ErrorCode.RequestTimeout
+        e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout
           ? `no MCP handshake within ${startupSec}s`
           : describeError(e);
       return {
@@ -334,17 +341,17 @@ export class McpProxy {
     const session = await this.session(container, server);
     session.inFlight++;
     try {
-      return await session.client.callTool({ name: tool, arguments: args }, undefined, { timeout: timeoutSec * 1000 });
+      return await session.client.callTool({ name: tool, arguments: args }, { timeout: timeoutSec * 1000 });
     } catch (e) {
-      // Rewords what the upstream server did, keeping the error's own message; the typed errors were thrown by
-      // `session()` above, outside this try, and rise unchanged.
-      const code = e instanceof McpError ? e.code : undefined;
-      if (code === ErrorCode.RequestTimeout) {
+      // Rewords what happened, in three questions: did the call time out, is the server gone, or did it
+      // answer with an error. The typed errors were thrown by `session()` above, outside this try, and rise unchanged.
+      if (e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout) {
         // A server that stopped answering is restarted on the next call.
         await this.closeSession(session.key);
         throw new Error(`MCP tool "${tool}" timed out after ${timeoutSec}s; the server was stopped and will restart on the next call.`);
       }
-      if (code === ErrorCode.ConnectionClosed || !(e instanceof McpError)) {
+      const neither = !(e instanceof SdkError) && !(e instanceof ProtocolError);
+      if (neither || (e instanceof SdkError && GONE_CODES.has(e.code))) {
         const stderr = session.stderr();
         await this.closeSession(session.key);
         throw new Error(
@@ -352,7 +359,7 @@ export class McpProxy {
             (stderr ? `\n--- server stderr ---\n${stderr.slice(-1500)}` : ""),
         );
       }
-      throw new Error(`MCP server "${server.name}" rejected the call to "${tool}": ${e.message}`);
+      throw new Error(`MCP server "${server.name}" rejected the call to "${tool}": ${describeError(e)}`);
     } finally {
       session.inFlight--;
       session.lastUsed = Date.now();

@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
+import { Server, type Tool } from "@modelcontextprotocol/server";
 import type { Connector, Launch } from "../src/proxy/mcp-proxy.js";
 import type { Config } from "../src/config.js";
 import { Docker, type ExecOptions, type ExecResult, type OwnershipReport, type SandboxRef } from "../src/sandbox/docker.js";
@@ -144,15 +143,15 @@ export function fakeUpstream(): FakeUpstream {
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     if (state.answer && (state.answerIf?.(launch) ?? true)) {
       const upstream = new Server({ name: "upstream", version: "1" }, { capabilities: { tools: {} } });
-      upstream.setRequestHandler(ListToolsRequestSchema, async () => ({
-        tools: [
+      upstream.setRequestHandler("tools/list", async () => ({
+        tools: <Tool[]>[
           { name: "add", description: "Add two numbers", inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } }, required: ["a", "b"] } },
           { name: "whoami", description: "Report which launch this is", inputSchema: { type: "object", properties: {} } },
           { name: "hang", description: "Never answers", inputSchema: { type: "object" } },
           { name: "mixed", description: "Returns many content types", inputSchema: { type: "object" } },
         ],
       }));
-      upstream.setRequestHandler(CallToolRequestSchema, async (req) => {
+      upstream.setRequestHandler("tools/call", async (req) => {
         const args = (req.params.arguments ?? {}) as Record<string, unknown>;
         state.received.push({ name: req.params.name, arguments: args });
         switch (req.params.name) {

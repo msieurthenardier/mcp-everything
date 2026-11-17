@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
 import { App, prepareDataDir } from "./server.js";
-import { SHUTDOWN_DEADLINE_MS, boundedShutdown } from "./shutdown.js";
+import { runEntry, serveApp } from "./entry.js";
+import { SHUTDOWN_DEADLINE_MS } from "./shutdown.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -10,20 +10,15 @@ async function main(): Promise<void> {
   // stdout carries the MCP protocol; diagnostics go to stderr.
   const app = new App({ cfg, log: (line) => process.stderr.write(`[mcp-everything] ${line}\n`) });
   app.start();
-  await app.server.connect(new StdioServerTransport());
-  const shutdown = boundedShutdown({
-    close: async () => {
-      await app.shutdown();
-      await app.server.close();
-    },
+  await runEntry({
+    input: process.stdin,
+    signals: process,
     exit: (code) => process.exit(code),
+    app,
+    serve: async () => serveApp(app),
     deadlineMs: SHUTDOWN_DEADLINE_MS,
     log: (line) => process.stderr.write(`[mcp-everything] ${line}\n`),
   });
-  // The client hanging up (stdin closing) must also stop proxied servers.
-  process.stdin.on("end", shutdown);
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
 }
 
 main().catch((e) => {

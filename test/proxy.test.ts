@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, type Config } from "../src/config.js";
 import { DockerUnavailableError, SandboxRefusedError } from "../src/sandbox/docker.js";
-import { dockerConnector, McpProxy, sweepEnvFiles, validateEnv } from "../src/proxy/mcp-proxy.js";
+import { dockerConnector, McpProxy, sweepEnvFiles, validateEnv, type Connector } from "../src/proxy/mcp-proxy.js";
 import type { SandboxRef } from "../src/sandbox/docker.js";
 import type { McpServerSpec } from "../src/types.js";
 import { FakeDocker, fakeSandboxId, fakeUpstream, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
@@ -135,6 +136,122 @@ describe("McpProxy", () => {
     await proxy.reapIdle(Date.now() + 61_000);
     expect(proxy.size).toBe(1); // the idle one is gone, the busy one survives
     expect(await busy).toBe("timed out");
+  });
+});
+
+/**
+ * A raw upstream: answers `initialize` by hand and hands every other request to `answer`, which returns the
+ * message to send back (or nothing). Counts the launches it served.
+ */
+function rawUpstream(answer: (m: { id: number; method: string }, close: () => void) => object | undefined) {
+  const state = { launches: 0 };
+  const connector: Connector = () => {
+    state.launches++;
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    serverSide.onmessage = (msg) => {
+      const m = msg as unknown as { id?: number; method?: string; params?: { protocolVersion?: string } };
+      if (m.id === undefined || m.method === undefined) return;
+      if (m.method === "initialize") {
+        void serverSide.send({
+          jsonrpc: "2.0",
+          id: m.id,
+          result: { protocolVersion: m.params?.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "raw", version: "1" } },
+        });
+        return;
+      }
+      const reply = answer({ id: m.id, method: m.method }, () => void serverSide.close());
+      if (reply) void serverSide.send({ jsonrpc: "2.0", id: m.id, ...reply } as never);
+    };
+    void serverSide.start();
+    return { transport: clientSide, stderr: () => "raw stderr tail" };
+  };
+  return { state, connector };
+}
+
+describe("McpProxy error classification", () => {
+  const rawProxy = (connector: Connector) => new McpProxy(cfg, docker, connector);
+
+  it("reports a server that goes away during a call as stopped, with its stderr, and drops the session", async () => {
+    const raw = rawUpstream((m, close) => (m.method === "tools/call" ? void close() : undefined));
+    const p = rawProxy(raw.connector);
+    await expect(p.callTool("c1", spec(), "add", {}, 5)).rejects.toThrow(
+      /^MCP server "srv" stopped while running "add": .+\n--- server stderr ---\nraw stderr tail$/s,
+    );
+    // The client's onclose has already retired the session, so no kill was issued; nothing here asserts one.
+    expect(p.size).toBe(0);
+  });
+
+  it("treats an error that is neither of the SDK's classes as the server gone: stops it and launches again on the next call", async () => {
+    const up2 = fakeUpstream();
+    let first = true;
+    const connector: Connector = (launch) => {
+      const conn = up2.connector(launch);
+      if (first) {
+        first = false;
+        const send = conn.transport.send.bind(conn.transport);
+        conn.transport.send = async (msg, opts) => {
+          if ((msg as { method?: string }).method === "tools/call") throw new Error("pipe broke");
+          return send(msg, opts);
+        };
+      }
+      return conn;
+    };
+    const p = rawProxy(connector);
+    await expect(p.callTool("c1", spec(), "add", { a: 1, b: 2 }, 5)).rejects.toThrow(
+      /^MCP server "srv" stopped while running "add": pipe broke\n--- server stderr ---\nupstream stderr tail$/,
+    );
+    expect(p.size).toBe(0);
+    expect(kills()).toEqual([up2.launches[0]!.pidFile]);
+    expect(textOf(await p.callTool("c1", spec(), "add", { a: 1, b: 2 }, 5))).toBe("3");
+    expect(up2.launches).toHaveLength(2);
+    await p.closeAll();
+  });
+
+  it.each([-32000, -32001])("treats a server's own error of code %d as a rejected call and keeps the session", async (code) => {
+    const raw = rawUpstream((m) => (m.method === "tools/call" ? { error: { code, message: "mine" } } : undefined));
+    const p = rawProxy(raw.connector);
+    const expected = `MCP server "srv" rejected the call to "add": MCP error ${code}: mine`;
+    await expect(p.callTool("c1", spec(), "add", {}, 5)).rejects.toThrow(expected);
+    expect(p.size).toBe(1);
+    await expect(p.callTool("c1", spec(), "add", {}, 5)).rejects.toThrow(expected);
+    expect(raw.state.launches).toBe(1);
+    await p.closeAll();
+  });
+
+  it("treats a malformed tools/call result as a rejected call, keeps the session, and reuses the launch", async () => {
+    const raw = rawUpstream((m) => (m.method === "tools/call" ? { result: { content: "bad" } } : undefined));
+    const p = rawProxy(raw.connector);
+    const err = await p.callTool("c1", spec(), "add", {}, 5).catch((e: unknown) => e as Error);
+    expect((err as Error).message).toContain(`MCP server "srv" rejected the call to "add"`);
+    expect((err as Error).message).not.toContain("stopped while running");
+    // describeError carries the client's own words for SdkErrorCode.InvalidResult.
+    expect((err as Error).message).toContain("Invalid result for tools/call");
+    expect(p.size).toBe(1);
+    await expect(p.callTool("c1", spec(), "add", {}, 5)).rejects.toThrow(/rejected the call to "add"/);
+    expect(raw.state.launches).toBe(1);
+    await p.closeAll();
+  });
+
+  it("writes a server's error as `MCP error <code>: <message>` in a rejected call", async () => {
+    await expect(proxy.callTool("c1", spec(), "nope", {}, 5)).rejects.toThrow(
+      new Error('MCP server "srv" rejected the call to "nope": MCP error -32603: no such tool nope'),
+    );
+  });
+
+  it("closes the session and writes a server's error with its prefix when listing tools fails", async () => {
+    const raw = rawUpstream((m) => (m.method === "tools/list" ? { error: { code: -32000, message: "no list" } } : undefined));
+    const p = rawProxy(raw.connector);
+    await expect(p.listTools("c1", spec())).rejects.toThrow(
+      new Error('MCP server "srv" failed to list its tools: MCP error -32000: no list'),
+    );
+    expect(p.size).toBe(0);
+  });
+
+  it("closes the session when a tools/list answer is malformed", async () => {
+    const raw = rawUpstream((m) => (m.method === "tools/list" ? { result: { tools: "bad" } } : undefined));
+    const p = rawProxy(raw.connector);
+    await expect(p.listTools("c1", spec())).rejects.toThrow(/MCP server "srv" failed to list its tools/);
+    expect(p.size).toBe(0);
   });
 });
 
