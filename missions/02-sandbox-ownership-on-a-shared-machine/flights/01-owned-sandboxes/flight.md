@@ -1,6 +1,6 @@
 # Flight: Owned Sandboxes
 
-**Status**: landed
+**Status**: completed
 **Mission**: [Sandbox Ownership on a Shared Machine](../../mission.md)
 
 > **History.** Logged on 2026-11-16 as sortie 04, "Ownership on a Shared Machine", with a draft charter. At pickup the same day it failed three of the four sortie criteria and was escalated; the charter became the starting point of the mission, and the artifact was moved here as the mission's first flight. The [flight log](flight-log.md) has the escalation, the reconnaissance report this design rests on, and what the design review changed.

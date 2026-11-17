@@ -168,6 +168,15 @@ Not done, and why: the spec's one check by hand on the built server (`list_proje
 
 Carried to the debrief: the review's finding 4 (the Docker suite does not reinstall over a sandbox from before the change); the leg list grew from three to five at two design reviews, each time because a leg was too large for one pass; three legs had no second design pass; one leg ran with a gate between writing its Docker cases and running them; the two test ids of the Docker suite's two-installation cases were not captured in either run's saved output.
 
+**After the commit, 2026-11-16.** The flight was committed as `df7fa8d` and pushed; pull request #17 was opened as a draft against `main` and marked ready once its hosted check passed (run 43986471387, 19 s, on `df7fa8d`). Pull request #16 was still open, so #17 also shows its two planning commits.
+
+**Debrief, 2026-11-16.** `/mission-control:flight-debrief`, on the flight branch, pull request #17 not merged. Crew file `.flightops/agent-crews/flight-debrief.md` loaded and well formed: a Developer and an Architect, both on Sonnet. The [debrief](flight-debrief.md) has what they found.
+- The Developer ran typecheck, the build, the unit suite (833 passed, 24 skipped, 1.78 s) and the Docker suite once (22 passed, 2 skipped, 206.3 s), with the whole output saved outside the repository. The two test installations of that run were `0745822e` and `4c99937b`; nothing of theirs remained. The operator's four containers and four volumes were listed before and after and match the ids recorded at "Execution start".
+- It tried twelve source changes against the unit suite. Three survived: `uninstall` given the container's name as its volume; `connectMcp` checking the sandbox after closing proxied servers; the id module's sweep without its `isFile` check. One of its undo steps corrupted `src/installation.ts`; it saw the diff and repaired the file. Checked by the Flight Director afterwards: `git status` prints nothing and the head is `df7fa8d`.
+- The Architect read the code against DD1 to DD10: five held as written, five held with changes, none failed. Its main finding, confirmed by the Flight Director by reading `Docker.exec` and `Installer.discover`: the real Docker layer raises "could not be asked" from a command on a reference only when the container looked stopped and the inspect that follows fails. A daemon that stops answering mid-discovery gives an ordinary failed command, which discovery still reads as "no". So the sentence in leg 4's entry, that "could not be asked" must not become "no commands", holds for less than it says; the flight spec's DD4 wording is the accurate one.
+- Squawk 0031 is fixed by the review fix (the record is deleted when the second container cannot be created); 0027 now covers one more startup error.
+- The operator's decisions at the debrief. Six follow-ups were offered as squawks; five were logged with `/mission-control:squawk`, each checked against the four criteria (one item, no design decision, bounded, verifiable): 0037 (three tests that pass with the guarded behavior broken), 0038 (README gaps on the id file and `project_info`), 0039 (the count in the comment above the hosted floor), 0040 (the id file's reader and cleanup, inferred for Windows, not run), 0041 (one state worded two ways). 0040 holds two faults in one module and 0037 three tests; each was kept as one squawk because one visit to one file clears it. The sixth, a real-Docker case that reinstalls over an old-style sandbox, was not chosen and stays a recommendation. Squawk 0031 was closed as fixed by `df7fa8d`, with the flight's second Reviewer as its sign-off; 0027 and 0035 each got a dated note. Asked how the flight's weight felt for a day-old project with one user, the operator answered "about right". Flight set to `completed` on the operator's confirmation; "Code merged" stays unticked until pull request #17 merges.
+
 ---
 
 ## Leg Progress
@@ -514,6 +523,20 @@ Reasoned, not tried: AC2's "keeps the record" cases fail if `uninstall` deleted 
 - Leg 3: none. `src/sandbox/docker.ts` was not changed. Two existing proxy cases had their `ensureRunning` counter removed because open's own check is now `acquire` (their assertions are unchanged); see the leg's entry.
 
 - Leg 4: none from the acceptance criteria. `test/proxy.test.ts` has no new case: the proxy's behavior did not change (comments only), and AC8's proxy side was already pinned by leg 3. The uninstall text and the `project_info` line are one-liners chosen inside the leg's freedom (Decisions).
+
+- The flight as a whole, written at the debrief from the Flight Director Notes above:
+  - **Five legs, not three.** `ownership-guard` and `refusal-outcomes` were each split at their design review.
+  - **"Not there" is decided from Docker's own "no such" wording on a clean failure**, not by asking whether the daemon answers, as DD4 said.
+  - **A method given a reference raises "could not be asked" from its own inspect, and discovery rethrows it**, where DD4 said a plain failure read as "no commands found". The real class raises it from a command only in a narrow case (see the debrief note above).
+  - **The Docker suite's guard is on the data directory.** DD10's assertion of the id's shape is still made; the guards on the directory, the empty registry and the names about to be removed were added.
+  - **The id file's fallback runs on any link failure except "exists"**, where DD1 said only for a file system that cannot link.
+  - **A reinstall on unchanged names puts the record back when its first removal fails** (leg 3), where leg 1 had kept the old outcome.
+  - **The Docker layer has a method that reports and never refuses** (`ownership`), and the coverage test a third list.
+  - **The baseline was four of the operator's sandboxes**, not the spec's five.
+  - **No second design pass on legs 1, 2 and 4; no separate design pass on legs 3 and 5.**
+  - **A gate before leg 5's first Docker run.**
+  - **The spec's check by hand on the built server was not done.**
+  - **The flight branch was cut from `mission/02-planning`**, since pull request #16 was open; the spec allowed it.
 
 ---
 
