@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
-import { runEntry } from "../src/entry.js";
+import { guardStdout, runEntry } from "../src/entry.js";
 import { loadConfig } from "../src/config.js";
 import { McpProxy } from "../src/proxy/mcp-proxy.js";
 import { App } from "../src/server.js";
@@ -94,7 +94,7 @@ describe.each([
     return serve();
   };
 
-  const wire = () => runEntry({ input, signals, exit, app, serve: serving, deadlineMs: DEADLINE, log });
+  const wire = () => runEntry({ input, signals, exit, app, serve: serving, deadlineMs: DEADLINE, log, console: { ...console } });
   const settle = () => vi.advanceTimersByTimeAsync(0);
 
   it("registers its listeners after serving has started, and one of each", async () => {
@@ -187,5 +187,56 @@ describe.each([
     expect(selfClosedAtCloseAll).toBe(selfClose);
     // The self-close is never counted as a call of the handle's close.
     expect(closeCalls).toBe(1);
+  });
+});
+
+describe("guardStdout", () => {
+  const names = ["debug", "log", "info"] as const;
+  const saved = names.map((n) => console[n]);
+  afterEach(() => {
+    names.forEach((n, i) => {
+      console[n] = saved[i]!;
+    });
+    vi.restoreAllMocks();
+  });
+
+  it("sends console.debug, console.log and console.info to stderr and nothing to stdout", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    // console.error is what Node writes to stderr; the guard must route the three to it.
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    guardStdout();
+    for (const n of names) console[n](`via ${n}`);
+    expect(out).not.toHaveBeenCalled();
+    expect(err.mock.calls.map((c) => c[0])).toEqual(["via debug", "via log", "via info"]);
+  });
+});
+
+describe("runEntry guards stdout before serving", () => {
+  const names = ["debug", "log", "info"] as const;
+  const saved = names.map((n) => console[n]);
+  afterEach(() => {
+    names.forEach((n, i) => {
+      console[n] = saved[i]!;
+    });
+    vi.restoreAllMocks();
+  });
+
+  it("sends console.debug, console.log and console.info to stderr from the moment serving starts", async () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await runEntry({
+      input: new EventEmitter(),
+      signals: new EventEmitter(),
+      exit: () => undefined,
+      app: { shutdown: async () => undefined },
+      serve: async () => {
+        // What a dependency does while serving starts.
+        for (const n of names) console[n](`at serve ${n}`);
+        return { close: async () => undefined };
+      },
+      log: () => undefined,
+    });
+    expect(out).not.toHaveBeenCalled();
+    expect(err.mock.calls.map((c) => c[0])).toEqual(["at serve debug", "at serve log", "at serve info"]);
   });
 });

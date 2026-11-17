@@ -166,6 +166,10 @@ function describeError(e: unknown): string {
 /** A locally raised failure that means the server's end of the connection is gone. */
 const GONE_CODES: ReadonlySet<string> = new Set([SdkErrorCode.ConnectionClosed, SdkErrorCode.SendFailed, SdkErrorCode.NotConnected]);
 
+/** A tool list is read for at most this many pages, and no further once this many tools are in hand (checked per page). */
+const MAX_LIST_PAGES = 10;
+const MAX_LIST_TOOLS = 500;
+
 export class McpProxy {
   private readonly sessions = new Map<string, Promise<Session>>();
   private reaper?: NodeJS.Timeout;
@@ -306,8 +310,14 @@ export class McpProxy {
     try {
       const tools: UpstreamTool[] = [];
       let cursor: string | undefined;
-      for (let page = 0; page < 10; page++) {
-        const res = await session.client.listTools(cursor ? { cursor } : undefined, { timeout: 30_000 });
+      for (let page = 0; page < MAX_LIST_PAGES; page++) {
+        // `request`, not `listTools`: the library's `listTools` answers an empty list, without asking, for a
+        // server that does not advertise the `tools` capability. `request` validates the result like it does, and
+        // answers one page per call, so this loop (not the library's 64-page one) is what bounds the listing.
+        const res = await session.client.request(
+          { method: "tools/list", params: cursor ? { cursor } : undefined },
+          { timeout: 30_000 },
+        );
         for (const t of res.tools) {
           tools.push({
             name: t.name,
@@ -316,7 +326,7 @@ export class McpProxy {
           });
         }
         cursor = res.nextCursor;
-        if (!cursor || tools.length >= 500) break;
+        if (!cursor || tools.length >= MAX_LIST_TOOLS) break;
       }
       return tools;
     } catch (e) {

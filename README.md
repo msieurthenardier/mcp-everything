@@ -41,8 +41,10 @@ Or in any client's MCP configuration:
 }
 ```
 
-The first launch downloads and builds the server, which takes a few seconds;
-later launches reuse npm's cache. This form follows the default branch, so a
+The first launch downloads and builds the server, which takes several seconds;
+later launches reuse npm's cache. A client that gives up waiting before the
+server is up can be served in an older revision; see
+[Protocol revisions](#protocol-revisions). This form follows the default branch, so a
 new commit there is picked up the next time the server starts. To stay on a
 version you have looked at, pin a commit or tag:
 `github:msieurthenardier/mcp-everything#<commit-or-tag>`.
@@ -563,6 +565,22 @@ revision it is served in, in this form:
 
 For a 2025 client it is written when the handshake completes; for a
 `2026-07-28` client, at its first `tools/list` or `tools/call`.
+
+A connection writes no line if that moment never comes: a 2025 client that
+sends `initialize` and never `notifications/initialized` and makes no tool
+request, or a `2026-07-28` client that only sends `server/discover` or only
+subscribes and never lists or calls a tool.
+
+Some clients probe for `2026-07-28` first and fall back to `initialize` when
+the probe gets no answer in time. How long they wait is the client's choice, not
+a rule of the protocol (one client's SDK allows 10 s). On a first `npx` launch
+the server can take several seconds to start. Such a client, if it gives up
+before the server is up, falls back to the 2025 handshake and shows
+`2025-11-25`, although the server supports `2026-07-28`.
+The server has done nothing wrong: it answers the late probe and then serves
+the `initialize` that follows. The `connection:` line shows the revision a
+connection was actually served in. A second launch, which uses npm's warm
+cache, or running from a checkout avoids the delay.
 
 ## Configuration
 
