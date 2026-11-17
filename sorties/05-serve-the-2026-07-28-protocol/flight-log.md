@@ -3,7 +3,7 @@
 **Flight**: [Serve the 2026-07-28 Protocol](flight.md)
 
 ## Summary
-Landed on 2026-11-17, three legs of three. mcp-everything is on the v2 SDK packages and serves each connection in the revision its client opens with; the operator's GleepGlorp client shows it at version `0.5.0` in `2026-07-28`. Pull request #20. Not yet debriefed; the charter's criteria are assessed there.
+Completed on 2026-11-17, three legs of three. mcp-everything is on the v2 SDK packages and serves each connection in the revision its client opens with; the operator's GleepGlorp client shows it at version `0.5.0` in `2026-07-28`. Merged as pull request #20 (`82faddc`) and tagged `v0.5.0`. Debriefed after the merge: see [the debrief](flight-debrief.md), which found a defect in the tagged release (squawk 0043).
 
 ---
 
@@ -225,6 +225,8 @@ All of this is the operator's report unless it says otherwise.
 - HAT, step 4: skipped by the operator. The diagnostics line was **not compared** with GleepGlorp's display in the operator's client. It was seen once with the right revision in each of the pipe check's three cases and in the Flight Director's runs with GleepGlorp's SDK.
 - HAT, steps 5 and 6, and landing. The operator's answer covered the install and the removal and did not say whether the tool list followed without a reconnect; it is recorded as that and not rounded up. The last two steps were put to the operator in one message, not one at a time, after the operator skipped step 4: neither could fail the leg. Leg 3 `completed`; all three legs have log entries; the README was updated in leg 2 and no other document describes the protocol; flight status set to `landed`. `[COMPLETE:flight]`. The artifact updates of the HAT are committed by the Flight Director (artifacts only, no source). Pull request #20 marked ready for review.
 - Open for the operator at merge: the version is `0.5.0` on the branch. It was raised to tell builds apart; it is also a fair number for a release that adds a protocol revision. No tag was made.
+- After landing: the operator merged pull request #20 (`82faddc` on `main`) and asked for a tag; the Flight Director made the annotated tag `v0.5.0` on that commit, in the form of the earlier tags, and pushed it. The debrief had not been run. It was then run on a new branch, `sortie/05-debrief`, at the operator's word.
+- Debrief (2026-11-17). Developer and Architect interviewed (Sonnet); no separate human interview, the log being complete, though one acceptance step is recorded in the debrief as never answered. The Architect found, and the Flight Director confirmed by running it, that a proxied server without the `tools` capability makes the v2 client write a line to stdout and skip the listing: a regression in `v0.5.0`. Six follow-ups logged as squawks with the operator's approval (0043 grounding; 0044 to 0047; 0039 updated in place); a seventh failed the squawk gate and stays a recommendation. Sortie marked `completed` with the operator's approval. Not committed: the operator has not asked for that.
 
 ### 2026-11-16: planning
 
