@@ -242,7 +242,7 @@ No HAT leg, by the operator's choice.
 
 ### Completion Checklist
 - [x] All legs completed
-- [ ] Code merged
+- [x] Code merged
 - [x] Tests passing
 - [x] Documentation updated
 

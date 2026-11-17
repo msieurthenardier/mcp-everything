@@ -4,7 +4,7 @@
 
 > **Agreed with the operator on 2026-11-16.** Escalated the same day from sortie 04, which failed three of the four sortie criteria at pickup and is now this mission's [first flight](flights/01-owned-sandboxes/flight.md). No alignment flight, by the operator's choice. **Reduced to one flight on 2026-11-16**, at flight 1's approval: the operator dropped the second flight, which would have claimed existing sandboxes in place, in favor of reinstalling existing projects once.
 >
-> **Completed on 2026-11-16**, at the [mission debrief](mission-debrief.md), on the operator's confirmation. The six criteria are met by the code in pull request #17 and are ticked when it merges.
+> **Completed on 2026-11-16**, at the [mission debrief](mission-debrief.md), on the operator's confirmation. The six criteria are met by the code in pull request #17, which merged on 2026-11-17 UTC as `a7eabc0`; they were ticked then.
 >
 > **Viability**: checked by the Architect on 2026-11-16 against the code, without running Docker: feasible with caveats. The caveats are folded into criteria 2, 4 and 5, the constraints and the open questions below.
 
@@ -37,12 +37,12 @@ It does **not** take, and each is left as it is today, documented as a limit:
 - **Restructuring `Installer` or `server.ts`, or gathering startup work into one place.** The Architect's reading is that neither is needed: the change sits in the Docker layer and in how an install names its sandbox.
 
 ## Success Criteria
-- [ ] Two installations that share one Docker daemon and install the same repository each end up with their own working sandbox, and neither install changes the other's. *(Observable only against real Docker with two data directories. First marked for a behavior test; at flight 1's design the operator chose a scripted test in the Docker-gated suite, since one script can verify it.)*
-- [ ] An installation acts only on sandboxes it owns. Asked to start, run a command in, hand variables to, reinstall over, change the network of or remove a sandbox it does not own, it refuses and says so; this holds for each of those operations, not only removal. A sandbox made before this change belongs to nobody, and an installation whose registry lists it acts on it as today, until its project is reinstalled.
-- [ ] Both of the above hold for two installations that configured nothing.
-- [ ] A project installed before this change keeps working as it does today until it is reinstalled; one reinstall gives it a sandbox its installation owns, under a name no other installation can produce. *(Changed with the operator on 2026-11-16. It read: keeps working without a reinstall in the installation that claims its sandbox; of two installations listing one sandbox, exactly one keeps it.)*
-- [ ] For every sandbox made after this change, the operator can find out which installation owns it; a sandbox from before the change shows as unowned.
-- [ ] The README says: what an installation is and where its data directory is by default on Linux and on Windows; how sandboxes are named and kept apart; that projects installed before the change should be reinstalled after upgrading, what that does to a sandbox two installations share, and that every installation on the machine should be upgraded; and what the protection does not cover.
+- [x] Two installations that share one Docker daemon and install the same repository each end up with their own working sandbox, and neither install changes the other's. *(Observable only against real Docker with two data directories. First marked for a behavior test; at flight 1's design the operator chose a scripted test in the Docker-gated suite, since one script can verify it.)*
+- [x] An installation acts only on sandboxes it owns. Asked to start, run a command in, hand variables to, reinstall over, change the network of or remove a sandbox it does not own, it refuses and says so; this holds for each of those operations, not only removal. A sandbox made before this change belongs to nobody, and an installation whose registry lists it acts on it as today, until its project is reinstalled.
+- [x] Both of the above hold for two installations that configured nothing.
+- [x] A project installed before this change keeps working as it does today until it is reinstalled; one reinstall gives it a sandbox its installation owns, under a name no other installation can produce. *(Changed with the operator on 2026-11-16. It read: keeps working without a reinstall in the installation that claims its sandbox; of two installations listing one sandbox, exactly one keeps it.)*
+- [x] For every sandbox made after this change, the operator can find out which installation owns it; a sandbox from before the change shows as unowned.
+- [x] The README says: what an installation is and where its data directory is by default on Linux and on Windows; how sandboxes are named and kept apart; that projects installed before the change should be reinstalled after upgrading, what that does to a sandbox two installations share, and that every installation on the machine should be upgraded; and what the protection does not cover.
 
 ## Stakeholders
 The operator, who runs two agentic systems against one Docker daemon; and anyone who runs mcp-everything from more than one client with separate data directories, which the defaults produce whenever the clients run as different users or on different sides of WSL.
