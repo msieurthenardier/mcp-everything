@@ -1,13 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { DockerUnavailableError, parseProbeOutput, SandboxRefusedError } from "../src/sandbox/docker.js";
+import { Registry } from "../src/registry.js";
 import { App } from "../src/server.js";
+import { serveApp } from "../src/entry.js";
 import type { ProjectRecord, ToolDef } from "../src/types.js";
 import { McpProxy } from "../src/proxy/mcp-proxy.js";
 import type { Connector } from "../src/proxy/mcp-proxy.js";
@@ -366,6 +366,25 @@ describe("proxied MCP servers", () => {
     expect(app.registry.get("demo")!.mcpServers![0]!.cwd).toBe("/workspace/repo/packages/server");
   });
 
+  it("connect_mcp_server announces a tool list change once", async () => {
+    let changed = 0;
+    app.announceToolListChanged = () => {
+      changed++;
+    };
+    expect((await connect()).isError).toBe(false);
+    expect(changed).toBe(1);
+  });
+
+  it("disconnect_mcp_server announces a tool list change once", async () => {
+    await connect({ name: "api" });
+    let changed = 0;
+    app.announceToolListChanged = () => {
+      changed++;
+    };
+    expect((await app.callTool("disconnect_mcp_server", { project: "demo", name: "api" })).isError).toBe(false);
+    expect(changed).toBe(1);
+  });
+
   it("disconnect_mcp_server stops the server, forgets its secrets and removes its tools", async () => {
     await connect({ name: "api", env: { API_KEY: "s3cret-value" } });
     await app.callTool("demo__add", { a: 1, b: 1 });
@@ -527,6 +546,18 @@ describe("catalog, search and selection", () => {
     expect(record.published).toEqual(["big__big", "big__open_binary", "big__list_strings", "big__big_scan"]);
   });
 
+  it("select_project_tools announces a tool list change once per change", async () => {
+    seedCatalog();
+    let changed = 0;
+    app.announceToolListChanged = () => {
+      changed++;
+    };
+    await app.callTool("select_project_tools", { project: "big", include: ["open_binary"] });
+    expect(changed).toBe(1);
+    await app.callTool("select_project_tools", { project: "big", reset: true });
+    expect(changed).toBe(2);
+  });
+
   it("select_project_tools records notes for selections that match nothing or too much", async () => {
     seedCatalog();
     const none = body(await app.callTool("select_project_tools", { project: "big", include: ["nope"] }));
@@ -568,11 +599,13 @@ describe("over the MCP protocol", () => {
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "test", version: "0" });
     let changed = 0;
-    client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+    client.setNotificationHandler("notifications/tools/list_changed", () => {
       changed++;
     });
-    await Promise.all([app.server.connect(serverSide), client.connect(clientSide)]);
+    const handle = serveApp(app, serverSide);
+    await client.connect(clientSide);
 
+    expect(client.getNegotiatedProtocolVersion()).toBe("2025-11-25");
     expect(client.getInstructions()).toContain("untrusted");
     const listed = await client.listTools();
     expect(listed.tools.find((t) => t.name === "demo__demo_build")?.inputSchema.properties).toHaveProperty("release");
@@ -586,6 +619,7 @@ describe("over the MCP protocol", () => {
     expect(changed).toBe(1);
     expect((await client.listTools()).tools.map((t) => t.name)).not.toContain("demo__demo_build");
     await client.close();
+    await handle.close();
   });
 });
 
@@ -667,6 +701,18 @@ describe("host environment variables for proxied MCP servers", () => {
     expect(up.launches[0]!.server.env).toEqual({ API_KEY: SECRET_VALUE });
     expect(a.registry.get("demo")!.mcpServers![0]!.env).toEqual({});
     expect(registryBytes()).not.toContain(SECRET_VALUE);
+  });
+
+  it("discover_tools announces a tool list change once", async () => {
+    const a = appWith({});
+    seeded(a, "demo");
+    let changed = 0;
+    a.announceToolListChanged = () => {
+      changed++;
+    };
+    docker.next = { code: 1 };
+    expect((await a.callTool("discover_tools", { project: "demo" })).isError).toBe(false);
+    expect(changed).toBe(1);
   });
 
   it("discoverMcp, registered servers: discover_tools launches the server with the variable", async () => {
@@ -958,7 +1004,7 @@ describe("host environment variables for proxied MCP servers", () => {
       const a = appWith({ demo__API_KEY: SECRET_VALUE });
       seeded(a, "demo");
       let changed = 0;
-      a.server.sendToolListChanged = async () => {
+      a.announceToolListChanged = () => {
         changed++;
       };
       docker.next = { code: 1 };
@@ -1105,6 +1151,7 @@ describe("host environment variables for proxied MCP servers", () => {
       expect(res.isError).toBe(true);
       expect(up.launches[0]!.server.env.API_KEY).toBe(SECRET_VALUE);
       expect(body(res)).toContain(SECRET_VALUE);
+      expect(body(res)).toContain("MCP error -32000: rejected key");
       expect(lines.some((l) => l.includes(SECRET_VALUE))).toBe(true);
       docker.next = { code: 1 };
       await a.callTool("discover_tools", { project: "demo" });
@@ -1115,12 +1162,14 @@ describe("host environment variables for proxied MCP servers", () => {
     it("tells agents the route in the instructions and the descriptions of connect_mcp_server", async () => {
       const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
       const client = new Client({ name: "t", version: "1" });
-      await Promise.all([app.server.connect(serverSide), client.connect(clientSide)]);
+      const handle = serveApp(app, serverSide);
+      await client.connect(clientSide);
       const instructions = client.getInstructions()!;
       expect(instructions).toContain("<slug>__<NAME>");
       expect(instructions).toContain("reconnects mcp-everything, then you call refresh_mcp");
       expect(instructions).toContain("Do not ask the user to paste secrets into the conversation");
       await client.close();
+      await handle.close();
       const connectTool = app.listTools().find((t) => t.name === "connect_mcp_server")!;
       const description = connectTool.description as string;
       expect(description).toContain("part of the conversation and are stored unencrypted");
@@ -1177,6 +1226,31 @@ describe("startup work: sweeps and stale installs", () => {
     local.start();
     expect(local.startup).toBe(first);
     await expect(first).resolves.toBeUndefined();
+  });
+
+  it("announces a tool list change when another process changes the registry, and not when nothing changed", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      let changed = 0;
+      local.announceToolListChanged = () => {
+        changed++;
+      };
+      local.start();
+      await local.startup;
+      vi.advanceTimersByTime(5000);
+      expect(changed).toBe(0);
+      const other = new Registry(dir);
+      other.put({ ...record("elsewhere"), tools: [] });
+      const later = new Date(Date.now() + 5000);
+      fs.utimesSync(path.join(dir, "registry.json"), later, later);
+      vi.advanceTimersByTime(5000);
+      expect(changed).toBe(1);
+      expect(local.registry.get("elsewhere")).toBeDefined();
+      vi.advanceTimersByTime(5000);
+      expect(changed).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   describe("sweeps", () => {

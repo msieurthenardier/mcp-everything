@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { Server, type CallToolResult, type Tool } from "@modelcontextprotocol/server";
 import type { Config } from "./config.js";
 import { parseRepoRef, validateGitRef } from "./forge/repo-ref.js";
 import { searchProjects } from "./forge/search.js";
@@ -346,7 +345,6 @@ export interface AppOptions {
 }
 
 export class App {
-  readonly server: Server;
   readonly registry: Registry;
   readonly docker: Docker;
   readonly installer: Installer;
@@ -354,6 +352,7 @@ export class App {
   private readonly cfg: Config;
   private readonly log: (line: string) => void;
   private readonly jobs = new Map<string, Job>();
+  private readonly live = new Set<Server>();
   private watcher?: NodeJS.Timeout;
   /** Resolves when all startup work is finished (sweeps, then reconciliation of stale installs); never rejects. */
   startup?: Promise<void>;
@@ -365,13 +364,43 @@ export class App {
     this.docker = opts.docker ?? new Docker(this.cfg, loadInstallationId(this.cfg.dataDir));
     this.proxy = opts.proxy ?? new McpProxy(this.cfg, this.docker);
     this.installer = new Installer(this.cfg, this.docker, this.registry, this.proxy, undefined, opts.env);
-    this.server = new Server(
+  }
+
+  /** How many server instances are live: one per connection (a probe that fell back is not counted once it closed). */
+  get connections(): number {
+    return this.live.size;
+  }
+
+  /**
+   * Builds the server instance for one connection and records it as live until it closes. Called by the serving
+   * function's factory; the SDK decides the revision the instance speaks from the client's first message.
+   */
+  createServer(): Server {
+    const server = new Server(
       { name: "mcp-everything", version: VERSION },
       { capabilities: { tools: { listChanged: true } }, instructions: INSTRUCTIONS },
     );
-
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: this.listTools() }));
-    this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    this.live.add(server);
+    server.onclose = () => {
+      this.live.delete(server);
+    };
+    // One line per connection, naming the revision the SDK negotiated (never text the client sent). On a 2025
+    // connection `oninitialized` writes it; on a 2026-07-28 connection that never fires, so the first tool request does.
+    let written = false;
+    const noteConnection = (): void => {
+      if (written) return;
+      const version = server.getNegotiatedProtocolVersion();
+      if (version === undefined) return;
+      written = true;
+      this.log(`connection: MCP protocol ${version}`);
+    };
+    server.oninitialized = noteConnection;
+    server.setRequestHandler("tools/list", async () => {
+      noteConnection();
+      return { tools: this.listTools() as unknown as Tool[] };
+    });
+    server.setRequestHandler("tools/call", async (request, ctx) => {
+      noteConnection();
       const name = request.params.name;
       const args = (request.params.arguments ?? {}) as Args;
       const token = request.params._meta?.progressToken;
@@ -380,8 +409,8 @@ export class App {
         token === undefined
           ? undefined
           : (message: string) => {
-              void extra
-                .sendNotification({
+              void ctx.mcpReq
+                .notify({
                   method: "notifications/progress",
                   params: { progressToken: token, progress: ++ticks, message: message.slice(0, 200) },
                 })
@@ -389,6 +418,15 @@ export class App {
             };
       return this.callTool(name, args, progress);
     });
+    return server;
+  }
+
+  /**
+   * Announces a changed tool list to every live instance. Whether a connection hears it is the SDK's rule (a 2025
+   * connection always; a 2026-07-28 connection only if it subscribed). A failed send is swallowed.
+   */
+  announceToolListChanged(): void {
+    for (const s of [...this.live]) void s.sendToolListChanged().catch(() => {});
   }
 
   /** Begin watching the registry so installs from other sessions show up here. */
@@ -416,7 +454,7 @@ export class App {
     }
     this.watcher = setInterval(() => {
       try {
-        if (this.registry.refresh()) void this.server.sendToolListChanged().catch(() => {});
+        if (this.registry.refresh()) this.announceToolListChanged();
       } catch {
         /* a half-written or corrupt file is reported on the next explicit use */
       }
@@ -730,7 +768,7 @@ export class App {
               )
               .finally(() => {
                 this.jobs.delete(key);
-                void this.server.sendToolListChanged().catch(() => {});
+                this.announceToolListChanged();
               }),
           };
           // The job may outlive this request; never leave its rejection unhandled. `install` itself turns a failure
@@ -850,7 +888,7 @@ export class App {
         }
         if (this.jobs.has(project.repo.id.toLowerCase())) throw new ToolInputError(`${project.slug} is still installing.`);
         const updated = this.installer.reselect(project, reset ? undefined : { include, exclude, maxTools });
-        void this.server.sendToolListChanged().catch(() => {});
+        this.announceToolListChanged();
         return text(this.describe(updated, true));
       }
 
@@ -914,7 +952,7 @@ export class App {
         }
         if (this.jobs.has(project.repo.id.toLowerCase())) throw new ToolInputError(`${project.slug} is still installing.`);
         const updated = await this.installer.rediscover(project, extra as string[]);
-        void this.server.sendToolListChanged().catch(() => {});
+        this.announceToolListChanged();
         return text(this.describe(updated, true));
       }
 
@@ -943,7 +981,7 @@ export class App {
         if (this.jobs.has(project.repo.id.toLowerCase())) throw new ToolInputError(`${project.slug} is still installing.`);
         const spec: McpServerSpec = { name, argv, cwd, env, origin: "registered" };
         const updated = await this.installer.connectMcp(project, spec);
-        void this.server.sendToolListChanged().catch(() => {});
+        this.announceToolListChanged();
         const count = updated.tools.filter((t) => t.mcp?.server === name).length;
         const offline = updated.network ? "" : " The sandbox is offline; enable set_project_network if this server needs the network.";
         return text(`Connected MCP server "${name}" of ${updated.slug}: ${count} tool(s) published.${offline}\n\n${this.describe(updated, true)}`);
@@ -960,7 +998,7 @@ export class App {
         }
         const names = this.installer.hostVariableNames(project);
         const out = await this.installer.refreshMcp(project);
-        void this.server.sendToolListChanged().catch(() => {});
+        this.announceToolListChanged();
         const updated = out.record;
         const servers = updated.mcpServers ?? [];
         const bare = servers.filter((s) => !updated.tools.some((t) => t.mcp?.server === s.name)).length;
@@ -985,7 +1023,7 @@ export class App {
       case "disconnect_mcp_server": {
         const project = this.project(args);
         const updated = await this.installer.disconnectMcp(project, str(args, "name", true));
-        void this.server.sendToolListChanged().catch(() => {});
+        this.announceToolListChanged();
         return text(this.describe(updated, true));
       }
 
@@ -993,7 +1031,7 @@ export class App {
         const project = this.project(args);
         if (this.jobs.has(project.repo.id.toLowerCase())) throw new ToolInputError(`${project.slug} is still installing.`);
         const left = await this.installer.uninstall(project);
-        void this.server.sendToolListChanged().catch(() => {});
+        this.announceToolListChanged();
         if (left.length === 0) return text(`Removed ${project.slug} (${project.repo.id}) and its sandbox.`);
         return text(
           `Removed ${project.slug} (${project.repo.id}) and its tools. Its sandbox was left in place, because it is not this installation's to remove: ${left.map(describeLeftPart).join("; ")}. Nothing was removed from Docker; a part that is not wanted must be removed by hand there.`,

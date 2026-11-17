@@ -199,6 +199,10 @@ evidence, and a command is left alone once one of them answers:
 Launches that do not answer are reported in a warning. A command that is an
 MCP server only when given an argument keeps its command line tools too.
 
+mcp-everything speaks the 2025 handshake to a server in a sandbox, whatever
+revision its own client uses (see [Protocol revisions](#protocol-revisions)). A
+server that refuses that handshake cannot be proxied.
+
 Servers that need arguments or a different entry point are registered by hand:
 
 ```
@@ -533,6 +537,33 @@ by hand with the earlier labels is run in, described and removed. The startup
 reconciliation and the discovery paths are covered by unit tests only. No test
 ran two separate processes, two machines or Windows.
 
+## Protocol revisions
+
+mcp-everything serves two revisions of the MCP protocol: `2026-07-28`, and the
+2025 handshake (`initialize`), which it negotiates up to `2025-11-25`.
+
+The client's opening message decides. A client that opens with `server/discover`
+or sends its requests with the `2026-07-28` envelope is served in `2026-07-28`.
+A client that opens with `initialize` is served in the 2025 handshake, and
+that includes one that asks for `2026-07-28` in it: `2026-07-28` has no
+`initialize`, so it is answered `2025-11-25`.
+
+Two things differ for a `2026-07-28` client. It is told that the tool list
+changed (after an install, an uninstall, a refresh and so on) only if it
+subscribed with `subscriptions/listen`; a 2025 client is told without asking.
+And tool listings are sent as not cacheable (`ttlMs` 0, private), so a client
+that asks again gets the current list.
+
+For each connection, mcp-everything writes one line to stderr naming the
+revision it is served in, in this form:
+
+```
+[mcp-everything] connection: MCP protocol 2026-07-28
+```
+
+For a 2025 client it is written when the handshake completes; for a
+`2026-07-28` client, at its first `tools/list` or `tools/call`.
+
 ## Configuration
 
 Environment variables, all optional:
@@ -577,6 +608,9 @@ Environment variables, all optional:
 - Only the repository root is built. Monorepos with several independent
   projects, Java, .NET, PHP and other ecosystems without a recipe need the
   manual path above.
+- A proxied MCP server is always spoken to in the 2025 handshake, whatever
+  revision your client uses; a server that refuses that handshake cannot be
+  proxied.
 - GUI programs, daemons and anything interactive are out of scope: tools run
   to completion and return their output.
 - Files go in and out as text through `sandbox_write_file` and
