@@ -6,12 +6,12 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
-import { parseProbeOutput } from "../src/sandbox/docker.js";
+import { DockerUnavailableError, parseProbeOutput, SandboxRefusedError } from "../src/sandbox/docker.js";
 import { App } from "../src/server.js";
 import type { ProjectRecord, ToolDef } from "../src/types.js";
 import { McpProxy } from "../src/proxy/mcp-proxy.js";
 import type { Connector } from "../src/proxy/mcp-proxy.js";
-import { FakeDocker, fakeUpstream, record, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
+import { FakeDocker, fakeSandboxId, fakeUpstream, record, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
 
 const tool: ToolDef = {
   name: "demo__demo_build",
@@ -168,10 +168,32 @@ describe("built-in tools", () => {
   });
 
   it("list_projects and project_info describe what is installed", async () => {
-    expect(body(await app.callTool("list_projects", {}))).toMatch(/^demo — github:owner\/demo \(ready\)[\s\S]*tools: 1 published$/);
+    expect(body(await app.callTool("list_projects", {}))).toMatch(/^Installation id: 0123abcd\n\ndemo — github:owner\/demo \(ready\)[\s\S]*tools: 1 published$/);
     const info = body(await app.callTool("project_info", { project: "owner/demo" }));
     expect(info).toContain("demo__demo_build: [sandboxed github:owner/demo] Runs `demo build`.");
     expect(info).toContain("arguments: release");
+  });
+
+  it("states the installation id first, with projects and without, and says so in the tool's description", async () => {
+    expect(body(await app.callTool("list_projects", {})).split("\n").slice(0, 2)).toEqual(["Installation id: 0123abcd", ""]);
+    app.registry.delete("demo");
+    expect(body(await app.callTool("list_projects", {}))).toBe(
+      "Installation id: 0123abcd\n\nNo projects installed. Use search_projects and install_project.",
+    );
+    expect(app.listTools().find((t) => t.name === "list_projects")!.description).toMatch(/installation's id/);
+  });
+
+  it("still reports an unreadable registry from list_projects as its own error", async () => {
+    fs.writeFileSync(path.join(dir, "registry.json"), "{ not json");
+    const res = await app.callTool("list_projects", {});
+    expect(res.isError).toBe(true);
+    expect(body(res)).toMatch(/unreadable/);
+    expect(body(res)).not.toMatch(/Installation id/);
+  });
+
+  it("shows the sandbox's name in the full description only", async () => {
+    expect(body(await app.callTool("project_info", { project: "demo" }))).toContain("  sandbox: mcpe-demo\n");
+    expect(body(await app.callTool("list_projects", {}))).not.toContain("sandbox:");
   });
 
   it("uninstall_project destroys the sandbox and forgets the project", async () => {
@@ -956,7 +978,10 @@ describe("host environment variables for proxied MCP servers", () => {
       expect(lines_[0]).toBe("Refreshed demo: 1 MCP server(s) recorded, 0 with no tool in the catalog, 4 proxied tool(s) in the catalog.");
       expect(lines_[1]).toBe("Variables applied (names only): API_KEY.");
       expect(body(res)).toContain("The sandbox is offline");
-      expect(body(res).endsWith(body(await a.callTool("project_info", { project: "demo" })))).toBe(true);
+      // project_info is the same description plus its one line about the sandbox's owner (leg 4)
+      const info = body(await a.callTool("project_info", { project: "demo" }));
+      expect(info).toMatch(/\n\nSandbox owner: [^\n]*$/);
+      expect(body(res).endsWith(info.replace(/\n\nSandbox owner: [^\n]*$/, ""))).toBe(true);
       expect(body(res)).not.toContain(SECRET_VALUE);
       expect(a.registry.get("demo")!.tools.filter((t) => t.kind === "mcp")).toHaveLength(4);
     });
@@ -1261,6 +1286,272 @@ describe("startup work: sweeps and stale installs", () => {
     it("are not waited for by shutdown", async () => {
       local.start();
       await expect(local.shutdown()).resolves.toBeUndefined();
+    });
+  });
+});
+
+describe("the installation id of an App", () => {
+  it("is loaded from the data directory when no Docker double is injected", async () => {
+    const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: path.join(dir, "fresh") });
+    const real = new App({ cfg });
+    try {
+      const content = fs.readFileSync(path.join(dir, "fresh", "installation-id"), "utf8");
+      expect(content).toMatch(/^[0-9a-f]{8}\n$/);
+      expect(real.docker.installationId).toBe(content.trim());
+    } finally {
+      await real.shutdown();
+    }
+  });
+
+  it("creates no id file when a double is injected", () => {
+    expect(fs.existsSync(path.join(dir, "installation-id"))).toBe(false);
+    expect(app.docker.installationId).toBe("0123abcd");
+  });
+});
+
+describe("one check per operation, and the command runs on what the check returned", () => {
+  const ANOTHER = "ffff0000";
+  const refusal = () =>
+    new SandboxRefusedError([{ kind: "container", sandbox: "mcpe-demo", cls: "another", owner: ANOTHER, project: "github:owner/demo" }], "0123abcd");
+  const unavailable = () => new DockerUnavailableError("Docker could not be asked about the sandbox: the daemon is not answering");
+
+  /** Each tool that runs a command in the sandbox, as a call to make and a way to see that nothing ran. */
+  const operations: Array<[string, () => Promise<Awaited<ReturnType<App["callTool"]>>>]> = [
+    ["a generated command-line tool", () => app.callTool("demo__demo_build", {})],
+    ["call_project_tool", () => app.callTool("call_project_tool", { tool: "demo__demo_build", arguments: {} })],
+    ["sandbox_exec", () => app.callTool("sandbox_exec", { project: "demo", command: "ls" })],
+    ["sandbox_read_file", () => app.callTool("sandbox_read_file", { project: "demo", path: "a.txt" })],
+    ["sandbox_write_file", () => app.callTool("sandbox_write_file", { project: "demo", path: "a.txt", content: "x" })],
+  ];
+
+  it.each(operations)("%s: acquires once and runs its one command on that very reference", async (_n, call) => {
+    await call();
+    expect(docker.ensureCalls).toEqual(["mcpe-demo"]);
+    expect(docker.acquired).toHaveLength(1);
+    expect(docker.calls).toHaveLength(1);
+    expect(docker.calls[0]!.container).toBe("mcpe-demo");
+    expect(docker.calls[0]!.sandbox).toBe(docker.acquired[0]);
+    expect(docker.calls[0]!.sandbox!.id).toBe(fakeSandboxId("mcpe-demo"));
+  });
+
+  it("set_project_network: acquires once, then sets the network on that reference", async () => {
+    await app.callTool("set_project_network", { project: "demo", enabled: true });
+    expect(docker.ensureCalls).toEqual(["mcpe-demo"]);
+    expect(docker.network).toEqual([["mcpe-demo", true]]);
+    expect(docker.networkRefs).toEqual([docker.acquired[0]]);
+    expect(docker.networkRefs[0]).toBeDefined();
+    expect(docker.calls).toEqual([]);
+  });
+
+  it("a proxied tool: the server checks once, and a session that has to be opened checks again by name", async () => {
+    docker.next = { code: 1 };
+    await app.callTool("connect_mcp_server", { project: "demo", command: ["node", "server.js"] });
+    docker.ensureCalls = [];
+    docker.acquired = [];
+    docker.calls = [];
+    expect(body(await app.callTool("demo__add", { a: 1, b: 2 }))).toBe("3");
+    expect(docker.ensureCalls).toEqual(["mcpe-demo"]); // the session was open: the server's one check
+    await app.proxy.closeProject("mcpe-demo");
+    docker.ensureCalls = [];
+    docker.acquired = [];
+    up.launches.length = 0;
+    expect(body(await app.callTool("demo__add", { a: 1, b: 2 }))).toBe("3");
+    expect(docker.ensureCalls).toEqual(["mcpe-demo", "mcpe-demo"]); // the server's, and the session's own
+    expect(up.launches).toHaveLength(1);
+    expect(up.launches[0]!.container).toBe("mcpe-demo");
+    expect(up.launches[0]!.sandbox).toBe(docker.acquired[1]);
+  });
+
+  describe.each([
+    ["another installation's", refusal, new RegExp(`mcpe-demo[^]*${ANOTHER}`)],
+    ["not answering (Docker could not be asked)", unavailable, /Docker could not be asked about the sandbox: the daemon is not answering/],
+  ] as const)("when the sandbox is %s", (_label, make, message) => {
+    it.each([...operations, ["set_project_network", () => app.callTool("set_project_network", { project: "demo", enabled: true })] as const])(
+      "%s returns that error's own message, never the reinstall advice, and runs nothing",
+      async (_n, call) => {
+        docker.acquireError = make();
+        const res = await call();
+        expect(res.isError).toBe(true);
+        expect(body(res)).toBe(`Error: ${docker.acquireError.message}`);
+        expect(body(res)).toMatch(message);
+        expect(body(res)).not.toMatch(/no longer exists|reinstall/);
+        expect(docker.calls).toEqual([]);
+        expect(docker.network).toEqual([]);
+        expect(app.registry.get("demo")!.network).toBe(false);
+      },
+    );
+  });
+
+  it("a sandbox that is not there still gives the reinstall advice, word for word", async () => {
+    docker.exists = false;
+    const res = await app.callTool("sandbox_exec", { project: "demo", command: "ls" });
+    expect(body(res)).toBe(
+      'Error: The sandbox for demo no longer exists. Rebuild it with install_project(repo: "github:owner/demo", reinstall: true).',
+    );
+    expect(docker.calls).toEqual([]);
+  });
+
+  describe("uninstall_project", () => {
+    it("fails with the error and keeps the record when Docker could not be asked", async () => {
+      docker.destroyError = unavailable();
+      const res = await app.callTool("uninstall_project", { project: "demo" });
+      expect(res.isError).toBe(true);
+      expect(body(res)).toBe(`Error: ${docker.destroyError.message}`);
+      expect(app.registry.get("demo")).toBeDefined();
+      expect(app.registry.list().map((p) => p.slug)).toEqual(["demo"]);
+      expect(docker.destroyed).toEqual([]);
+    });
+  });
+});
+
+describe("refusal outcomes: uninstall_project and project_info", () => {
+  const OTHER = "deadbeef";
+  const part = (kind: "container" | "volume", sandbox: string, cls: "mine" | "another" | "before" | "not-ours", owner?: string) => ({ kind, sandbox, cls, owner });
+  const refused = (...facts: ReturnType<typeof part>[]) => new SandboxRefusedError(facts, "0123abcd");
+  const line = (info: string) => info.split("\n").filter((l) => l.startsWith("Sandbox owner:"));
+
+  describe("uninstall_project", () => {
+    it("lets go of a sandbox that is another's and one volume that is this installation's, and says which is which", async () => {
+      docker.destroyError = refused(part("container", "mcpe-demo", "another", OTHER), part("volume", "mcpe-demo", "mine"));
+      const res = await app.callTool("uninstall_project", { project: "demo" });
+      expect(res.isError).toBe(false);
+      const out = body(res);
+      expect(out).toBe(
+        'Removed demo (github:owner/demo) and its tools. Its sandbox was left in place, because it is not this installation\'s to remove: container "mcpe-demo" is another installation\'s (owner label "deadbeef"); volume "mcpe-demo" is this installation\'s. Nothing was removed from Docker; a part that is not wanted must be removed by hand there.',
+      );
+      expect(out).not.toContain("and its sandbox.");
+      expect(app.registry.get("demo")).toBeUndefined();
+      expect(app.listTools().map((t) => t.name)).not.toContain("demo__demo_build");
+      expect(docker.destroyed).toEqual([]);
+    });
+
+    it.each([
+      ["only a container", [part("container", "mcpe-demo", "another", OTHER)], 'container "mcpe-demo" is another installation\'s (owner label "deadbeef")', "volume"],
+      ["a container that is not ours", [part("container", "mcpe-demo", "not-ours")], 'container "mcpe-demo" was not created by mcp-everything', "volume"],
+      ["a volume made before ownership was recorded", [part("container", "mcpe-demo", "not-ours"), part("volume", "mcpe-demo", "before")], 'volume "mcpe-demo" was made before ownership was recorded', undefined],
+    ])("names each part that exists: %s", async (_n, facts, expected, absent) => {
+      docker.destroyError = refused(...facts);
+      const out = body(await app.callTool("uninstall_project", { project: "demo" }));
+      expect(out).toContain(expected);
+      if (absent) expect(out).not.toContain(absent);
+      expect(app.registry.get("demo")).toBeUndefined();
+    });
+
+    it("flattens an owner label to one line and cuts it", async () => {
+      docker.destroyError = refused(part("container", "mcpe-demo", "another", `ab\r\ncd${"x".repeat(500)}`));
+      const out = body(await app.callTool("uninstall_project", { project: "demo" }));
+      expect(out.split("\n")).toHaveLength(1);
+      expect(out).toContain('owner label "ab cdxxxxxxxx');
+      expect(out.length).toBeLessThan(500);
+      expect(out).not.toContain("x".repeat(60));
+    });
+
+    it("is word for word what it was when the sandbox was removed", async () => {
+      expect(body(await app.callTool("uninstall_project", { project: "demo" }))).toBe("Removed demo (github:owner/demo) and its sandbox.");
+    });
+
+    it.each([
+      ["Docker could not be asked", new DockerUnavailableError("Docker could not be asked")],
+      ["a plain error from the removal", new Error("Failed to remove container mcpe-demo: busy")],
+    ])("fails and keeps the record for %s", async (_n, failure) => {
+      docker.destroyError = failure;
+      const res = await app.callTool("uninstall_project", { project: "demo" });
+      expect(res.isError).toBe(true);
+      expect(body(res)).toBe(`Error: ${failure.message}`);
+      expect(app.registry.get("demo")).toBeDefined();
+    });
+
+    it("says in the tool's description what it leaves and when it fails", () => {
+      const d = app.listTools().find((t) => t.name === "uninstall_project")!.description as string;
+      expect(d).toMatch(/another installation's/);
+      expect(d).toMatch(/not created by mcp-everything/);
+      expect(d).toMatch(/left in Docker/);
+      expect(d).toMatch(/Docker cannot be asked|removal fails/);
+    });
+  });
+
+  describe("project_info", () => {
+    it.each([
+      [{ state: "mine" }, 'Sandbox owner: container "mcpe-demo" is this installation\'s (0123abcd).'],
+      [{ state: "before" }, 'Sandbox owner: container "mcpe-demo" was made before ownership was recorded; it is treated as this installation\'s.'],
+      [{ state: "another", owner: "deadbeef" }, 'Sandbox owner: container "mcpe-demo" is another installation\'s (owner label "deadbeef"); this installation will not act on it.'],
+      [{ state: "not-ours" }, 'Sandbox owner: container "mcpe-demo" was not created by mcp-everything; this installation will not act on it.'],
+      [{ state: "missing" }, 'Sandbox owner: container "mcpe-demo" does not exist in Docker.'],
+      [{ state: "unavailable" }, "Sandbox owner: could not be checked, because Docker did not answer."],
+    ] as const)("says %j in one line, after the description, from one question", async (result, expected) => {
+      docker.ownershipResult = { ...result };
+      const info = body(await app.callTool("project_info", { project: "demo" }));
+      expect(line(info)).toEqual([expected]);
+      expect(info).toContain("tools published (1)"); // the description is all there
+      expect(info.indexOf("Sandbox owner:")).toBeGreaterThan(info.indexOf("tools published"));
+      expect(docker.ownershipCalls).toEqual(["mcpe-demo"]);
+      expect(docker.calls).toEqual([]);
+    });
+
+    it("flattens and cuts another installation's owner label", async () => {
+      docker.ownershipResult = { state: "another", owner: `a\nb${"y".repeat(300)}` };
+      const out = line(body(await app.callTool("project_info", { project: "demo" })));
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('owner label "a byyyyyyy');
+      expect(out[0]!.length).toBeLessThan(200);
+    });
+
+    it("never fails because of that question: the inspect fails and the tool still succeeds", async () => {
+      docker.ownershipError = new Error("inspect blew up");
+      const res = await app.callTool("project_info", { project: "demo" });
+      expect(res.isError).toBe(false);
+      expect(line(body(res))).toEqual(["Sandbox owner: could not be checked, because Docker did not answer."]);
+      expect(body(res)).toContain("tools published (1)");
+    });
+
+    it("says the sandbox is being built, and asks nothing, while an install of the project runs here", async () => {
+      let finish!: () => void;
+      const gate = new Promise<void>((r) => (finish = r));
+      (app.installer as unknown as { install: unknown }).install = async () => {
+        await gate;
+        return { ...record("demo"), status: "ready" };
+      };
+      await app.callTool("install_project", { repo: "owner/demo", wait_seconds: 0 });
+      const info = body(await app.callTool("project_info", { project: "demo" }));
+      expect(line(info)).toEqual(["Sandbox owner: the sandbox is being built by an install running here; it was not checked."]);
+      expect(info).toContain("Install in progress");
+      expect(docker.ownershipCalls).toEqual([]);
+      finish();
+      await new Promise((r) => setTimeout(r, 5));
+      expect(line(body(await app.callTool("project_info", { project: "demo" })))).toHaveLength(1);
+      expect(docker.ownershipCalls).toEqual(["mcpe-demo"]);
+    });
+
+    it("asks for a record that says installing when no install is running here (another session's, or a dead one)", async () => {
+      app.registry.put({ ...record("demo"), status: "installing" });
+      docker.ownershipResult = { state: "missing" };
+      const info = body(await app.callTool("project_info", { project: "demo" }));
+      expect(line(info)).toEqual(['Sandbox owner: container "mcpe-demo" does not exist in Docker.']);
+      expect(info).toContain("started by another session or was interrupted");
+      expect(docker.ownershipCalls).toEqual(["mcpe-demo"]);
+    });
+
+    it("speaks of the container only", async () => {
+      docker.ownershipResult = { state: "mine" };
+      expect(line(body(await app.callTool("project_info", { project: "demo" }))).join("")).not.toMatch(/volume/);
+    });
+
+    it("says in the tool's description that it asks Docker about the sandbox's owner", () => {
+      const d = app.listTools().find((t) => t.name === "project_info")!.description as string;
+      expect(d).toMatch(/whose the project's sandbox container is/);
+    });
+  });
+
+  describe("no other tool asks", () => {
+    it("list_projects and the result of an install issue no ownership question and no Docker command", async () => {
+      expect(body(await app.callTool("list_projects", {}))).not.toContain("Sandbox owner");
+      (app.installer as unknown as { install: unknown }).install = async () => ({ ...record("demo"), status: "ready" });
+      const res = await app.callTool("install_project", { repo: "owner/demo" });
+      expect(res.isError).toBe(false);
+      expect(body(res)).not.toContain("Sandbox owner");
+      expect(docker.ownershipCalls).toEqual([]);
+      expect(docker.calls).toEqual([]);
+      expect(docker.ensureCalls).toEqual([]);
     });
   });
 });

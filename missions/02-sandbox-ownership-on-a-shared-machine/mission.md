@@ -78,5 +78,5 @@ N/A
 
 > **Note:** These are tentative suggestions, not commitments. Flights are planned and created one at a time as work progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] Flight 1: [Owned sandboxes](flights/01-owned-sandboxes/flight.md) — an installation has an identity; sandboxes it makes carry it and get names that cannot collide; every operation checks ownership before acting; the README describes the model. Reaches every criterion. Sortie 04, re-homed.
+- [x] Flight 1: [Owned sandboxes](flights/01-owned-sandboxes/flight.md) — an installation has an identity; sandboxes it makes carry it and get names that cannot collide; every operation checks ownership before acting; the README describes the model. Reaches every criterion. Sortie 04, re-homed.
 - ~~Flight 2: Carrying existing sandboxes forward~~ — dropped by the operator on 2026-11-16, before it was designed. Reinstalling a project once gives it an owned sandbox (flight 1, DD5 and DD6). What that flight would have had to solve is in the open questions above, as set aside.

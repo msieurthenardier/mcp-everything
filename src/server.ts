@@ -5,11 +5,12 @@ import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } fr
 import type { Config } from "./config.js";
 import { parseRepoRef, validateGitRef } from "./forge/repo-ref.js";
 import { searchProjects } from "./forge/search.js";
-import { Installer } from "./install/installer.js";
+import { describeLeftPart, Installer } from "./install/installer.js";
 import { McpProxy, sweepEnvFiles, validateEnv } from "./proxy/mcp-proxy.js";
 import { Registry } from "./registry.js";
 import { VERSION } from "./version.js";
-import { Docker, REPO_DIR, WORK_DIR, type ExecResult } from "./sandbox/docker.js";
+import { loadInstallationId } from "./installation.js";
+import { Docker, REPO_DIR, WORK_DIR, type ExecResult, type SandboxRef } from "./sandbox/docker.js";
 import { buildInvocation, resolveCwd, ToolInputError } from "./toolgen/invoke.js";
 import type { Ecosystem, McpServerSpec, ProjectRecord, ToolDef } from "./types.js";
 import { oneLine, stripAnsi } from "./util/text.js";
@@ -85,14 +86,14 @@ const META_TOOLS: MetaTool[] = [
   },
   {
     name: "list_projects",
-    description: "List installed projects with their status and number of generated tools.",
+    description: "List installed projects with their status and number of generated tools, after a line giving this installation's id.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: true },
   },
   {
     name: "project_info",
     description:
-      "Show one installed project: status, build warnings or errors, discovered commands, and every generated tool with its description. Also reports progress of a running install.",
+      "Show one installed project: status, build warnings or errors, discovered commands, and every generated tool with its description. Also reports progress of a running install, and whose the project's sandbox container is according to Docker (asks Docker once, read-only; never fails because of that question).",
     inputSchema: { type: "object", properties: { project: projectProp }, required: ["project"], additionalProperties: false },
     annotations: { readOnlyHint: true },
   },
@@ -252,7 +253,8 @@ const META_TOOLS: MetaTool[] = [
   },
   {
     name: "uninstall_project",
-    description: "Remove a project: deletes its sandbox container, its volume and its generated tools.",
+    description:
+      "Remove a project: deletes its sandbox container, its volume and its generated tools. A sandbox that is another installation's, or was not created by mcp-everything, is never removed: the project's record and tools are removed, the sandbox is left in Docker, and the result says which parts were left and whose they are. If Docker cannot be asked or a removal fails, nothing is removed and the project stays installed.",
     inputSchema: { type: "object", properties: { project: projectProp }, required: ["project"], additionalProperties: false },
     annotations: { destructiveHint: true },
   },
@@ -360,7 +362,7 @@ export class App {
     this.cfg = opts.cfg;
     this.log = opts.log ?? (() => {});
     this.registry = new Registry(this.cfg.dataDir);
-    this.docker = opts.docker ?? new Docker(this.cfg);
+    this.docker = opts.docker ?? new Docker(this.cfg, loadInstallationId(this.cfg.dataDir));
     this.proxy = opts.proxy ?? new McpProxy(this.cfg, this.docker);
     this.installer = new Installer(this.cfg, this.docker, this.registry, this.proxy, undefined, opts.env);
     this.server = new Server(
@@ -408,6 +410,7 @@ export class App {
         .reconcileStale(Date.now(), this.log)
         .then(() => {})
         .catch((e) => {
+          // Startup only: a failure of the reconciliation as a whole is logged, whatever it is, and changes nothing.
           this.log(`reconcile: ${(e as Error).message}`);
         });
     }
@@ -465,6 +468,8 @@ export class App {
       if (META_NAMES.has(name)) return await this.callMeta(name, args, progress);
       return await this.callGenerated(name, args);
     } catch (e) {
+      // The one place every tool's failure becomes a result. A refusal or "could not be asked" keeps its own
+      // message, which says what it is; it is logged here like any other failure.
       const message = e instanceof Error ? e.message : String(e);
       if (!(e instanceof ToolInputError)) this.log(`${name} failed: ${message}`);
       return text(`Error: ${message}`, true);
@@ -481,15 +486,18 @@ export class App {
     return project;
   }
 
-  private async sandbox(project: ProjectRecord): Promise<void> {
+  /** Checks the project's sandbox once and returns the reference every command of the operation then runs on. */
+  private async sandbox(project: ProjectRecord): Promise<SandboxRef> {
     if (project.status === "installing" && this.jobs.has(project.repo.id.toLowerCase())) {
       throw new ToolInputError(`${project.slug} is still installing; check project_info.`);
     }
-    if (!(await this.docker.ensureRunning(project.container))) {
+    const ref = await this.docker.acquire(project.container);
+    if (!ref) {
       throw new Error(
         `The sandbox for ${project.slug} no longer exists. Rebuild it with install_project(repo: "${project.repo.id}", reinstall: true).`,
       );
     }
+    return ref;
   }
 
   private formatExec(res: ExecResult, timeoutSec: number): CallToolResult {
@@ -537,9 +545,9 @@ export class App {
       return this.upstreamResult(res);
     }
     const inv = buildInvocation(tool, args);
-    await this.sandbox(project);
+    const sandbox = await this.sandbox(project);
     const timeoutSec = inv.timeoutSec ?? this.cfg.toolTimeoutSec;
-    const res = await this.docker.exec(project.container, inv.argv, { cwd: inv.cwd, stdin: inv.stdin, timeoutSec });
+    const res = await this.docker.exec(sandbox, inv.argv, { cwd: inv.cwd, stdin: inv.stdin, timeoutSec });
     return this.formatExec(res, timeoutSec);
   }
 
@@ -582,6 +590,37 @@ export class App {
     return { content, isError: r.isError === true };
   }
 
+  /**
+   * The one line of project_info about whose the sandbox's container is: one read-only inspect, except while an
+   * install of the project is running here (the container is being made; nothing is asked). Never throws.
+   * The inspect has a 30 s limit, so a daemon that hangs can delay project_info by that long.
+   */
+  private async ownerLine(p: ProjectRecord, building: boolean): Promise<string> {
+    const head = "Sandbox owner:";
+    if (building) return `${head} the sandbox is being built by an install running here; it was not checked.`;
+    const what = `container "${oneLine(p.container, 80)}"`;
+    try {
+      const r = await this.docker.ownership(p.container);
+      switch (r.state) {
+        case "mine":
+          return `${head} ${what} is this installation's (${this.docker.installationId}).`;
+        case "before":
+          return `${head} ${what} was made before ownership was recorded; it is treated as this installation's.`;
+        case "another":
+          return `${head} ${what} is another installation's (owner label "${oneLine(r.owner ?? "", 40)}"); this installation will not act on it.`;
+        case "not-ours":
+          return `${head} ${what} was not created by mcp-everything; this installation will not act on it.`;
+        case "missing":
+          return `${head} ${what} does not exist in Docker.`;
+        default:
+          return `${head} could not be checked, because Docker did not answer.`;
+      }
+    } catch {
+      // `ownership` does not throw; if a replacement does, the answer is still "could not be checked", never a failed tool.
+      return `${head} could not be checked, because Docker did not answer.`;
+    }
+  }
+
   private describe(p: ProjectRecord, verbose: boolean): string {
     const lines = [
       `${p.slug} — ${p.repo.id} (${p.status})`,
@@ -589,6 +628,7 @@ export class App {
       `  build: ${p.primary}${p.image ? ` in ${p.image}` : ""}; license: ${p.license ?? "not detected"}; network: ${p.network ? "on" : "off"}`,
       ...(p.imageReason ? [`  runtime: ${p.imageReason}`] : []),
     ];
+    if (verbose) lines.push(`  sandbox: ${p.container}`);
     if (p.error) lines.push(`  error: ${p.error}`);
     for (const w of p.warnings) lines.push(`  warning: ${w}`);
     if (p.commands.length > 0) {
@@ -693,7 +733,8 @@ export class App {
                 void this.server.sendToolListChanged().catch(() => {});
               }),
           };
-          // The job may outlive this request; never leave its rejection unhandled.
+          // The job may outlive this request; never leave its rejection unhandled. `install` itself turns a failure
+          // into a failed record, so this logs only what escapes it (a reinstall whose old sandbox could not be removed).
           created.promise.catch((e: unknown) => this.log(`install ${repo.id}: ${String(e)}`));
           this.jobs.set(key, created);
           job = created;
@@ -730,14 +771,16 @@ export class App {
 
       case "list_projects": {
         const projects = this.registry.list();
-        if (projects.length === 0) return text("No projects installed. Use search_projects and install_project.");
-        return text(projects.map((p) => this.describe(p, false)).join("\n\n"));
+        const idLine = `Installation id: ${this.docker.installationId}`;
+        if (projects.length === 0) return text(`${idLine}\n\nNo projects installed. Use search_projects and install_project.`);
+        return text(`${idLine}\n\n${projects.map((p) => this.describe(p, false)).join("\n\n")}`);
       }
 
       case "project_info": {
         const project = this.project(args);
         let body = this.describe(project, true);
         const job = this.jobs.get(project.repo.id.toLowerCase());
+        body += `\n\n${await this.ownerLine(project, job !== undefined)}`;
         if (job) {
           body += `\n\nInstall in progress for ${Math.round((Date.now() - job.startedAt) / 1000)}s. Recent output:\n${job.log.slice(-15).join("\n")}`;
         } else if (project.status === "installing") {
@@ -815,8 +858,8 @@ export class App {
         const project = this.project(args);
         const command = str(args, "command", true);
         const timeoutSec = num(args, "timeout_seconds", this.cfg.toolTimeoutSec, 1, 3600);
-        await this.sandbox(project);
-        const res = await this.docker.exec(project.container, ["sh", "-c", command], {
+        const sandbox = await this.sandbox(project);
+        const res = await this.docker.exec(sandbox, ["sh", "-c", command], {
           cwd: resolveCwd(args.cwd, REPO_DIR),
           stdin: str(args, "stdin"),
           timeoutSec,
@@ -828,8 +871,8 @@ export class App {
         const project = this.project(args);
         const file = path.posix.resolve(WORK_DIR, str(args, "path", true));
         const max = Math.floor(num(args, "max_bytes", 100_000, 1, 2_000_000));
-        await this.sandbox(project);
-        const res = await this.docker.exec(project.container, ["head", "-c", String(max), "--", file], {
+        const sandbox = await this.sandbox(project);
+        const res = await this.docker.exec(sandbox, ["head", "-c", String(max), "--", file], {
           timeoutSec: 30,
           maxBytes: max,
         });
@@ -843,9 +886,9 @@ export class App {
         const content = args.content;
         if (typeof content !== "string") throw new ToolInputError('"content" must be a string');
         if (content.length > 5_000_000) throw new ToolInputError("content is larger than 5 MB");
-        await this.sandbox(project);
+        const sandbox = await this.sandbox(project);
         const res = await this.docker.exec(
-          project.container,
+          sandbox,
           ["sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1"', "write", file],
           { stdin: content, timeoutSec: 30 },
         );
@@ -857,8 +900,8 @@ export class App {
         const project = this.project(args);
         const enabled = bool(args, "enabled");
         if (enabled === undefined) throw new ToolInputError('"enabled" is required');
-        await this.sandbox(project);
-        await this.docker.setNetwork(project.container, enabled);
+        const sandbox = await this.sandbox(project);
+        await this.docker.setNetwork(sandbox, enabled);
         this.registry.put({ ...project, network: enabled });
         return text(`Network for ${project.slug} is now ${enabled ? "ON: its code can reach the internet and your local network" : "off"}.`);
       }
@@ -949,9 +992,12 @@ export class App {
       case "uninstall_project": {
         const project = this.project(args);
         if (this.jobs.has(project.repo.id.toLowerCase())) throw new ToolInputError(`${project.slug} is still installing.`);
-        await this.installer.uninstall(project);
+        const left = await this.installer.uninstall(project);
         void this.server.sendToolListChanged().catch(() => {});
-        return text(`Removed ${project.slug} (${project.repo.id}) and its sandbox.`);
+        if (left.length === 0) return text(`Removed ${project.slug} (${project.repo.id}) and its sandbox.`);
+        return text(
+          `Removed ${project.slug} (${project.repo.id}) and its tools. Its sandbox was left in place, because it is not this installation's to remove: ${left.map(describeLeftPart).join("; ")}. Nothing was removed from Docker; a part that is not wanted must be removed by hand there.`,
+        );
       }
     }
     throw new ToolInputError(`Unknown tool "${name}"`);

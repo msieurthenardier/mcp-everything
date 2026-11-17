@@ -1,9 +1,14 @@
+import { createHash } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Connector, Launch } from "../src/proxy/mcp-proxy.js";
-import { Docker, type ExecOptions, type ExecResult } from "../src/sandbox/docker.js";
+import type { Config } from "../src/config.js";
+import { Docker, type ExecOptions, type ExecResult, type OwnershipReport, type SandboxRef } from "../src/sandbox/docker.js";
 import type { ProjectRecord } from "../src/types.js";
+
+/** The installation id every test double carries unless a test passes another. */
+export const TEST_INSTALLATION_ID = "0123abcd";
 
 /** A minimal ready project record for tests. */
 export function record(slug: string, repoPath = `owner/${slug}`): ProjectRecord {
@@ -25,10 +30,22 @@ export function record(slug: string, repoPath = `owner/${slug}`): ProjectRecord 
   };
 }
 
+/** What the Docker layer takes where a sandbox goes: a name, or a checked reference. */
+export type SandboxTarget = string | SandboxRef;
+
+/** The name of a sandbox, whichever way it was given. */
+export const targetName = (target: SandboxTarget): string => (typeof target === "string" ? target : target.name);
+
+/** The id a double gives a sandbox: 64 hex characters derived from its name, so the same name always has the same id. */
+export const fakeSandboxId = (name: string): string => createHash("sha256").update(name).digest("hex");
+
 export interface ExecCall {
+  /** The sandbox's name, whether the call gave a name or a reference. */
   container: string;
   argv: string[];
   opts: ExecOptions;
+  /** The reference the call was given; undefined when it was given a name. */
+  sandbox?: SandboxRef;
 }
 
 /** Docker double: records what would run and replays canned results. */
@@ -40,27 +57,61 @@ export class FakeDocker extends Docker {
   destroyed: string[] = [];
   /** What `state` reports; a failed handshake consults it. */
   stateResult: "running" | "stopped" | "missing" = "running";
+  /** The name of every `acquire` and `ensureRunning`, in order. */
   ensureCalls: string[] = [];
+  /** The references `acquire` handed out, in order. */
+  acquired: SandboxRef[] = [];
+  /** The reference of each `network` entry, in step with it; undefined where a name was given. */
+  networkRefs: Array<SandboxRef | undefined> = [];
+  /** When set, `acquire` throws it (a `SandboxRefusedError` or a `DockerUnavailableError`). */
+  acquireError?: Error;
+  /** When set, `destroy` throws it. */
+  destroyError?: Error;
+  /** What `ownership` reports. */
+  ownershipResult: OwnershipReport = { state: "mine" };
+  /** When set, `ownership` throws it (the real method never does; a test of the server's own guard uses this). */
+  ownershipError?: Error;
+  /** The name of every `ownership` question, in order. */
+  ownershipCalls: string[] = [];
+
+  constructor(cfg: Config, installationId: string = TEST_INSTALLATION_ID) {
+    super(cfg, installationId);
+  }
 
   /** Nothing here may reach the real docker binary. */
   protected override docker(args: string[]): never {
     throw new Error(`FakeDocker reached the docker binary: ${args.join(" ")}`);
   }
-  override async exec(container: string, argv: string[], opts: ExecOptions): Promise<ExecResult> {
-    this.calls.push({ container, argv, opts });
+  override async acquire(name: string): Promise<SandboxRef | undefined> {
+    this.ensureCalls.push(name);
+    if (this.acquireError) throw this.acquireError;
+    if (!this.exists) return undefined;
+    const ref = Object.freeze({ id: fakeSandboxId(name), name });
+    this.acquired.push(ref);
+    return ref;
+  }
+  override async ownership(name: string): Promise<OwnershipReport> {
+    this.ownershipCalls.push(name);
+    if (this.ownershipError) throw this.ownershipError;
+    return this.ownershipResult;
+  }
+  override async exec(target: SandboxTarget, argv: string[], opts: ExecOptions): Promise<ExecResult> {
+    this.calls.push({ container: targetName(target), argv, opts, sandbox: typeof target === "string" ? undefined : target });
     return { code: 0, stdout: "", stderr: "", timedOut: false, truncated: false, ...this.next };
   }
-  override async ensureRunning(container: string): Promise<boolean> {
-    this.ensureCalls.push(container);
+  override async ensureRunning(target: SandboxTarget): Promise<boolean> {
+    this.ensureCalls.push(targetName(target));
     return this.exists;
   }
   override async state(): Promise<"running" | "stopped" | "missing"> {
     return this.stateResult;
   }
-  override async setNetwork(container: string, enabled: boolean): Promise<void> {
-    this.network.push([container, enabled]);
+  override async setNetwork(target: SandboxTarget, enabled: boolean): Promise<void> {
+    this.network.push([targetName(target), enabled]);
+    this.networkRefs.push(typeof target === "string" ? undefined : target);
   }
   override async destroy(container: string): Promise<void> {
+    if (this.destroyError) throw this.destroyError;
     this.destroyed.push(container);
   }
   override async removeContainer(container: string): Promise<void> {
