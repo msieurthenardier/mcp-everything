@@ -570,7 +570,10 @@ describe("sweepEnvFiles", () => {
     fs.utimesSync(target, old, old);
     const link = path.join(tmpDir(), "env-fedcba9876543210");
     fs.symlinkSync(target, link);
-    expect(sweepEnvFiles(cfg, NOW)).toBe(0);
+    const log: string[] = [];
+    expect(sweepEnvFiles(cfg, NOW, (l) => log.push(l))).toBe(0);
+    // Skipped, not attempted: unlink on the directory would fail and be logged.
+    expect(log).toEqual([]);
     expect(fs.statSync(sub).isDirectory()).toBe(true);
     expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
     expect(fs.readFileSync(target, "utf8")).toBe("keep");

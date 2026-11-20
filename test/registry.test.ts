@@ -409,7 +409,10 @@ describe("Registry.sweepTemps", () => {
     const target = put("elsewhere", 10 * HOUR, "keep");
     const link = path.join(dir, "registry.json.2.tmp");
     fs.symlinkSync(target, link);
-    expect(new Registry(dir).sweepTemps(NOW)).toBe(0);
+    const log: string[] = [];
+    expect(new Registry(dir).sweepTemps(NOW, (l) => log.push(l))).toBe(0);
+    // Skipped, not attempted: unlink on the directory would fail and be logged.
+    expect(log).toEqual([]);
     expect(fs.statSync(sub).isDirectory()).toBe(true);
     expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
     expect(fs.readFileSync(target, "utf8")).toBe("keep");

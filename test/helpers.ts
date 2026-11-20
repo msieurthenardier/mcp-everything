@@ -54,6 +54,8 @@ export class FakeDocker extends Docker {
   exists = true;
   network: Array<[string, boolean]> = [];
   destroyed: string[] = [];
+  /** The volume each `destroy` was asked to remove, in step with `destroyed` (undefined where none was given). */
+  destroyedVolumes: Array<string | undefined> = [];
   /** What `state` reports; a failed handshake consults it. */
   stateResult: "running" | "stopped" | "missing" = "running";
   /** The name of every `acquire` and `ensureRunning`, in order. */
@@ -109,9 +111,10 @@ export class FakeDocker extends Docker {
     this.network.push([targetName(target), enabled]);
     this.networkRefs.push(typeof target === "string" ? undefined : target);
   }
-  override async destroy(container: string): Promise<void> {
+  override async destroy(container: string, volume?: string): Promise<void> {
     if (this.destroyError) throw this.destroyError;
     this.destroyed.push(container);
+    this.destroyedVolumes.push(volume);
   }
   override async removeContainer(container: string): Promise<void> {
     this.destroyed.push(`container:${container}`);

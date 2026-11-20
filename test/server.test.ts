@@ -196,6 +196,13 @@ describe("built-in tools", () => {
     expect(body(await app.callTool("list_projects", {}))).not.toContain("sandbox:");
   });
 
+  it("uninstall_project removes the volume the record names, which can differ from the container's name", async () => {
+    seed({ ...record("split"), volume: "mcpe-split-data" });
+    await app.callTool("uninstall_project", { project: "split" });
+    expect(docker.destroyed).toEqual(["mcpe-split"]);
+    expect(docker.destroyedVolumes).toEqual(["mcpe-split-data"]);
+  });
+
   it("uninstall_project destroys the sandbox and forgets the project", async () => {
     await app.callTool("uninstall_project", { project: "demo" });
     expect(docker.destroyed).toEqual(["mcpe-demo"]);
@@ -1000,6 +1007,17 @@ describe("host environment variables for proxied MCP servers", () => {
       expect(a.proxy.size).toBe(1);
     });
 
+    it("connect_mcp_server stops nothing when the sandbox no longer exists", async () => {
+      const a = appWith({});
+      seeded(a, "demo");
+      await a.callTool("demo__whoami", {});
+      docker.exists = false;
+      const res = await connect(a);
+      expect(res.isError).toBe(true);
+      expect(body(res)).toMatch(/no longer exists/);
+      expect(a.proxy.size).toBe(1);
+    });
+
     it("stops the sessions, discovers again, launches a server that had one, and says what it did", async () => {
       const a = appWith({ demo__API_KEY: SECRET_VALUE });
       seeded(a, "demo");
@@ -1268,8 +1286,9 @@ describe("startup work: sweeps and stale installs", () => {
       }
       return { envFile, regTmp };
     };
+    let cfg: ReturnType<typeof loadConfig>;
     const logged = (log: string[]) => {
-      const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir });
+      cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir });
       fake = new Reachable(cfg);
       local = new App({ cfg, docker: fake, proxy: new McpProxy(cfg, fake, up.connector), log: (l) => log.push(l) });
     };
@@ -1326,6 +1345,26 @@ describe("startup work: sweeps and stale installs", () => {
       expect(local.registry.get("stale")).toMatchObject({ status: "failed" });
     });
 
+    it("do not stop each other: a failing env file sweep is logged and the registry sweep and the reconciliation still run", async () => {
+      const log: string[] = [];
+      logged(log);
+      // sweepEnvFiles is a module export and cannot be spied on; it reads this setting first, so a failing read makes it throw.
+      Object.defineProperty(cfg, "mcpStartupTimeoutSec", {
+        get() {
+          throw new Error("no timeout");
+        },
+      });
+      const old = leftovers(HEX, 2 * 3600);
+      local.registry.put({ ...record("stale"), status: "installing", network: true });
+      local.start();
+      await local.startup;
+      expect(log).toContain("startup: env file sweep failed: no timeout");
+      expect(fs.existsSync(old.envFile)).toBe(true);
+      expect(fs.existsSync(old.regTmp)).toBe(false);
+      expect(log).toContain("startup: removed 1 leftover registry temp file");
+      expect(local.registry.get("stale")).toMatchObject({ status: "failed" });
+    });
+
     it("run when the registry file is corrupt", async () => {
       const log: string[] = [];
       logged(log);
@@ -1358,8 +1397,16 @@ describe("startup work: sweeps and stale installs", () => {
     });
 
     it("are not waited for by shutdown", async () => {
+      // A reconciliation that never finishes: shutdown has to complete anyway.
+      let finish!: () => void;
+      const reconcile = vi.spyOn(local.installer, "reconcileStale").mockReturnValue(new Promise<string[]>((resolve) => (finish = () => resolve([]))));
       local.start();
-      await expect(local.shutdown()).resolves.toBeUndefined();
+      expect(reconcile).toHaveBeenCalledTimes(1);
+      try {
+        await expect(local.shutdown()).resolves.toBeUndefined();
+      } finally {
+        finish(); // the afterEach above awaits startup
+      }
     });
   });
 });
