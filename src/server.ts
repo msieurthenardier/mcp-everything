@@ -9,7 +9,7 @@ import { McpProxy, sweepEnvFiles, validateEnv } from "./proxy/mcp-proxy.js";
 import { Registry } from "./registry.js";
 import { VERSION } from "./version.js";
 import { loadInstallationId } from "./installation.js";
-import { Docker, REPO_DIR, WORK_DIR, type ExecResult, type SandboxRef } from "./sandbox/docker.js";
+import { Docker, OWNER_SHOWN, REPO_DIR, WORK_DIR, type ExecResult, type SandboxRef } from "./sandbox/docker.js";
 import { buildInvocation, resolveCwd, ToolInputError } from "./toolgen/invoke.js";
 import type { Ecosystem, McpServerSpec, ProjectRecord, ToolDef } from "./types.js";
 import { oneLine, stripAnsi } from "./util/text.js";
@@ -645,7 +645,7 @@ export class App {
         case "before":
           return `${head} ${what} was made before ownership was recorded; it is treated as this installation's.`;
         case "another":
-          return `${head} ${what} is another installation's (owner label "${oneLine(r.owner ?? "", 40)}"); this installation will not act on it.`;
+          return `${head} ${what} is another installation's (owner label "${oneLine(r.owner ?? "", OWNER_SHOWN)}"); this installation will not act on it.`;
         case "not-ours":
           return `${head} ${what} was not created by mcp-everything; this installation will not act on it.`;
         case "missing":

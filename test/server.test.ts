@@ -4,7 +4,7 @@ import path from "node:path";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
-import { DockerUnavailableError, parseProbeOutput, SandboxRefusedError } from "../src/sandbox/docker.js";
+import { DockerUnavailableError, OWNER_SHOWN, parseProbeOutput, SandboxRefusedError } from "../src/sandbox/docker.js";
 import { Registry } from "../src/registry.js";
 import { App } from "../src/server.js";
 import { serveApp } from "../src/entry.js";
@@ -1615,6 +1615,12 @@ describe("refusal outcomes: uninstall_project and project_info", () => {
       expect(out).toHaveLength(1);
       expect(out[0]).toContain('owner label "a byyyyyyy');
       expect(out[0]!.length).toBeLessThan(200);
+    });
+
+    it("cuts an owner label to the same length as the Docker layer and the installer", async () => {
+      docker.ownershipResult = { state: "another", owner: "x".repeat(300) };
+      const out = line(body(await app.callTool("project_info", { project: "demo" })));
+      expect(out[0]).toContain(`owner label "${"x".repeat(OWNER_SHOWN - 1)}…"`);
     });
 
     it("never fails because of that question: the inspect fails and the tool still succeeds", async () => {

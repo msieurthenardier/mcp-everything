@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ConfigError } from "../src/errors.js";
 import { INSTALLATION_ID_PATTERN, loadInstallationId } from "../src/installation.js";
 import { Registry } from "../src/registry.js";
 
@@ -51,6 +52,18 @@ describe("loadInstallationId: creating", () => {
     expect(loadInstallationId(dir)).toBe("0a1b2c3d");
     fs.writeFileSync(FILE(), "0a1b2c3d\n");
     expect(loadInstallationId(dir)).toBe("0a1b2c3d");
+  });
+
+  it.each([
+    ["a Windows line ending", "0a1b2c3d\r\n"],
+    ["a byte-order mark", "\uFEFF0a1b2c3d"],
+    ["a byte-order mark and a line feed", "\uFEFF0a1b2c3d\n"],
+    ["a byte-order mark and a Windows line ending", "\uFEFF0a1b2c3d\r\n"],
+  ])("accepts %s, returning the id and leaving the file untouched", (_n, content) => {
+    fs.writeFileSync(FILE(), content);
+    expect(loadInstallationId(dir)).toBe("0a1b2c3d");
+    expect(fs.readFileSync(FILE(), "utf8")).toBe(content);
+    expect(names()).toEqual(["installation-id"]);
   });
 
   it("returns what the file holds when another load completes between the temporary write and the link", () => {
@@ -147,6 +160,24 @@ describe("loadInstallationId: an invalid file", () => {
     expect(names()).toEqual(["installation-id"]);
   });
 
+  it.each([
+    ["a lone carriage return", "0123abcd\r"],
+    ["a carriage return and line feed twice", "0123abcd\r\n\r\n"],
+    ["a line feed then a carriage return and line feed", "0123abcd\n\r\n"],
+    ["a carriage return before the id", "\r0123abcd\n"],
+    ["two byte-order marks", "\uFEFF\uFEFF0123abcd\n"],
+    ["a byte-order mark after the id", "0123abcd\uFEFF"],
+    ["a trailing space", "0123abcd \n"],
+    ["an uppercase id with a Windows line ending", "0123ABCD\r\n"],
+  ])("throws at once for %s, changing nothing", (_n, content) => {
+    fs.writeFileSync(FILE(), content);
+    const wait = vi.fn();
+    expect(() => loadInstallationId(dir, { wait })).toThrow(/delete/);
+    expect(wait).not.toHaveBeenCalled();
+    expect(fs.readFileSync(FILE(), "utf8")).toBe(content);
+    expect(names()).toEqual(["installation-id"]);
+  });
+
   it("treats an empty file the same way", () => {
     fs.writeFileSync(FILE(), "");
     expect(() => loadInstallationId(dir, { wait: noWait })).toThrow(/delete/);
@@ -205,6 +236,45 @@ describe("loadInstallationId: temporary files", () => {
   });
 });
 
+describe("loadInstallationId: a failed removal of the temporary file", () => {
+  const failTempRemoval = () => {
+    const real = fs.rmSync;
+    return vi.spyOn(fs, "rmSync").mockImplementation(((p: fs.PathLike, o?: fs.RmOptions) => {
+      if (/installation-id\..*\.tmp$/.test(String(p))) throw Object.assign(new Error("busy"), { code: "EBUSY" });
+      return real(p, o);
+    }) as typeof fs.rmSync);
+  };
+
+  it("does not fail a creation that succeeded; the id is persisted and a later load returns it", () => {
+    const spy = failTempRemoval();
+    let id: string;
+    try {
+      id = loadInstallationId(dir);
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(id).toMatch(INSTALLATION_ID_PATTERN);
+    expect(fs.readFileSync(FILE(), "utf8")).toBe(`${id}\n`);
+    expect(loadInstallationId(dir)).toBe(id);
+  });
+
+  it("still reports the original error when the creation failed before the id file existed", () => {
+    const realOpen = fs.openSync;
+    const open = vi.spyOn(fs, "openSync").mockImplementation(((p: fs.PathLike, f: fs.OpenMode, m?: fs.Mode) => {
+      if (String(p).endsWith(".tmp")) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return realOpen(p, f, m);
+    }) as typeof fs.openSync);
+    const rm = failTempRemoval();
+    try {
+      expect(() => loadInstallationId(dir)).toThrow(/Cannot create the installation id file .*denied/);
+    } finally {
+      open.mockRestore();
+      rm.mockRestore();
+    }
+  });
+});
+
 describe("loadInstallationId: failures", () => {
   it("throws, naming the file, when a directory stands in its place", () => {
     fs.mkdirSync(FILE());
@@ -243,5 +313,16 @@ describe("loadInstallationId: failures", () => {
       spy.mockRestore();
     }
     expect(names()).toEqual([]); // nothing was created
+  });
+});
+
+describe("loadInstallationId: errors are ConfigError", () => {
+  it("for an invalid id file", () => {
+    fs.writeFileSync(FILE(), "0123ABCD");
+    expect(() => loadInstallationId(dir, { wait: noWait })).toThrow(ConfigError);
+  });
+  it("for a data directory that cannot be made", () => {
+    fs.writeFileSync(path.join(dir, "file"), "x");
+    expect(() => loadInstallationId(path.join(dir, "file", "sub"))).toThrow(ConfigError);
   });
 });

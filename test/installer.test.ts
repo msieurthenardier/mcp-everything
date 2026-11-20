@@ -15,6 +15,7 @@ import {
   SandboxRefusedError,
   type ExecOptions,
   type ExecResult,
+  OWNER_SHOWN,
   type ProbeData,
   type SandboxFacts,
   type SandboxRef,
@@ -721,6 +722,35 @@ describe("install failure paths", () => {
       expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
     });
 
+    describe("a throw after discovery opened proxy sessions", () => {
+      const spec = { name: "tool", argv: ["tool"], cwd: "/workspace/repo", env: {}, origin: "detected" as const };
+      const openThenThrow = () => {
+        docker.repoFiles = { "package.json": pkg({}) };
+        up.answer = true;
+        (installer as unknown as { discover: () => Promise<void> }).discover = async () => {
+          await proxy.listTools(WIDGET, spec);
+          expect(proxy.size).toBe(1);
+          throw new Error("registry write failed");
+        };
+      };
+
+      it("closes the project's sessions and reports the original error", async () => {
+        openThenThrow();
+        const record = await install();
+        expect(record).toMatchObject({ status: "failed", error: "registry write failed" });
+        expect(proxy.size).toBe(0);
+      });
+
+      it("does not let a failing close mask the original error", async () => {
+        openThenThrow();
+        // The first call is the install's own, before the sandbox exists; only the one in the catch fails.
+        vi.spyOn(proxy, "closeProject").mockResolvedValueOnce(undefined).mockRejectedValue(new Error("close failed"));
+        const record = await install({ network: true });
+        expect(record).toMatchObject({ status: "failed", network: false, error: "registry write failed" });
+        expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
+      });
+    });
+
     it("keeps the thrown error when applying the policy fails, then records the sandbox off", async () => {
       docker.repoFiles = { "package.json": pkg({}) };
       docker.setNetworkFails = [1];
@@ -736,7 +766,7 @@ describe("install failure paths", () => {
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: true, error: "Install recipe for node exited with code 1." });
       expect(record.warnings.filter((w) => w.includes("set_project_network"))).toHaveLength(1);
-      expect(record.warnings.join("\n")).toContain("could not be taken off the network");
+      expect(record.warnings.join("\n")).toContain("could not be taken off the network after the failed install (");
       expect(registry.get("widget")).toMatchObject({ status: "failed", network: true });
     });
 
@@ -887,6 +917,8 @@ describe("stale installs at startup", () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]).toMatchObject({ status: "failed", network: true });
     expect(failed[0]!.warnings.filter((w) => w.includes("set_project_network"))).toHaveLength(1);
+    expect(failed[0]!.warnings.join("\n")).toContain("after the interrupted install (");
+    expect(failed[0]!.warnings.join("\n")).not.toContain("failed install");
     const ok = registry.list().find((p) => !p.network)!;
     expect(ok).toMatchObject({ status: "failed", network: false, warnings: [] });
   });
@@ -1166,6 +1198,11 @@ describe("sandbox names and reinstall order", () => {
         "an owner label with a line break and excessive length",
         refusal(part("container", OLD, "another", `ab\ncd${"x".repeat(200)}`)),
         'owner label "ab cdxxxxxxxx',
+      ],
+      [
+        "an owner label cut to the length every message uses",
+        refusal(part("container", OLD, "another", "x".repeat(300))),
+        `owner label "${"x".repeat(OWNER_SHOWN - 1)}…"`,
       ],
     ])("words the warning from the facts: %s", async (_n, refused, expected) => {
       seedOld();

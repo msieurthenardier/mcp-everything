@@ -112,35 +112,48 @@ export function dockerConnector(cfg: Config): Connector {
   return ({ sandbox, server, pidFile }) => {
     const args = ["exec", "-i", "-w", server.cwd];
     let envFile: string | undefined;
-    if (Object.keys(server.env).length > 0) {
-      // Secrets travel in a private file, not in argv (visible to `ps`) and not
-      // set under their own names in the docker CLI's environment (where they
-      // could influence the client itself). The client still inherits
-      // mcp-everything's whole environment, prefixed variables included (below).
-      const dir = path.join(cfg.dataDir, "tmp");
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      envFile = path.join(dir, newEnvFileName());
-      const lines = Object.entries(validateEnv(server.env)).map(([k, v]) => `${k}=${v}\n`);
-      fs.writeFileSync(envFile, lines.join(""), { mode: 0o600 });
-      args.push("--env-file", envFile);
-    }
-    args.push(sandbox.id, "sh", "-c", LAUNCH_SCRIPT, pidFile, ...server.argv);
-
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
-    const transport = new StdioClientTransport({ command: cfg.docker.bin, args, env, stderr: "pipe" });
-
-    let tail = "";
-    (transport.stderr as Readable | null)?.on("data", (chunk: Buffer) => {
-      tail = (tail + chunk.toString("utf8")).slice(-4000);
-    });
-    return {
-      transport,
-      stderr: () => cleanTerminalText(tail).trim(),
-      cleanup: () => {
-        if (envFile) fs.rmSync(envFile, { force: true });
-      },
+    const removeEnvFile = () => {
+      if (envFile) fs.rmSync(envFile, { force: true });
     };
+    try {
+      if (Object.keys(server.env).length > 0) {
+        // Secrets travel in a private file, not in argv (visible to `ps`) and not
+        // set under their own names in the docker CLI's environment (where they
+        // could influence the client itself). The client still inherits
+        // mcp-everything's whole environment, prefixed variables included (below).
+        const dir = path.join(cfg.dataDir, "tmp");
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        const lines = Object.entries(validateEnv(server.env)).map(([k, v]) => `${k}=${v}\n`);
+        // Named before the write: a write that fails part-way can leave the file.
+        envFile = path.join(dir, newEnvFileName());
+        fs.writeFileSync(envFile, lines.join(""), { mode: 0o600 });
+        args.push("--env-file", envFile);
+      }
+      args.push(sandbox.id, "sh", "-c", LAUNCH_SCRIPT, pidFile, ...server.argv);
+
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+      const transport = new StdioClientTransport({ command: cfg.docker.bin, args, env, stderr: "pipe" });
+
+      let tail = "";
+      (transport.stderr as Readable | null)?.on("data", (chunk: Buffer) => {
+        tail = (tail + chunk.toString("utf8")).slice(-4000);
+      });
+      return {
+        transport,
+        stderr: () => cleanTerminalText(tail).trim(),
+        cleanup: removeEnvFile,
+      };
+    } catch (e) {
+      // The caller never sees a cleanup for a connector that threw, so the file
+      // (it holds values) goes here. Best effort: never mask the original error.
+      try {
+        removeEnvFile();
+      } catch {
+        /* the original error is the one to report */
+      }
+      throw e;
+    }
   };
 }
 

@@ -7,6 +7,7 @@ import {
   Docker,
   DockerUnavailableError,
   REPO_DIR,
+  OWNER_SHOWN,
   SandboxRefusedError,
   VENV_DIR,
   WORK_DIR,
@@ -49,9 +50,6 @@ export interface InstallParams {
 /** Added to a record when a reinstall could not remove the sandbox the record names. Carries no part of the error. */
 const OLD_SANDBOX_WARNING =
   "A reinstall could not remove this project's old sandbox, which may be partly removed; reinstall again to retry.";
-
-/** How much of an owner label is shown: it is text from Docker, so it is flattened to one line and cut. */
-const OWNER_SHOWN = 40;
 
 /** One part of a sandbox that was left alone, and whose it is. Built from facts, never from a message. */
 export function describeLeftPart(f: SandboxFacts): string {
@@ -386,7 +384,7 @@ export class Installer {
           ? `Install timed out after ${timeoutSec}s.`
           : `Install recipe for ${record.primary} exited with code ${res.code}.`;
         record.errorLog = tail.toString().slice(-2500);
-        await this.takeOffline(record, sandbox);
+        await this.takeOffline(record, "failed", sandbox);
         this.registry.put(record);
         return record;
       }
@@ -428,7 +426,10 @@ export class Installer {
       record.status = "failed";
       record.error = e instanceof Error ? e.message : String(e);
       if (sandboxCreated) {
-        await this.takeOffline(record, sandbox);
+        // Discovery may have opened sessions to the project's MCP servers before the throw; the caller is told the
+        // install failed, so none may stay open. Best effort: the original error is what is reported.
+        await this.proxy.closeProject(container).catch(() => {});
+        await this.takeOffline(record, "failed", sandbox);
         this.registry.put(record);
       } else {
         // Nothing usable exists (bad repository, clone or image failure):
@@ -473,7 +474,7 @@ export class Installer {
         // Docker round trip) cannot be closed. Its own final write and
         // setNetwork restore the record and the policy.
         const copy: ProjectRecord = { ...current, warnings: [...current.warnings] };
-        await this.takeOffline(copy);
+        await this.takeOffline(copy, "interrupted");
         const added = copy.warnings.slice(current.warnings.length);
         // A detach that already ran is not undone if this write is skipped:
         // the record then still says installing and the sandbox is offline,
@@ -508,7 +509,7 @@ export class Installer {
    * passes the reference it holds, so that it cannot meet a refusal; the startup
    * reconciliation resolves the record's name, and can.
    */
-  private async takeOffline(record: ProjectRecord, sandbox?: SandboxRef): Promise<void> {
+  private async takeOffline(record: ProjectRecord, occasion: "failed" | "interrupted", sandbox?: SandboxRef): Promise<void> {
     try {
       await this.docker.setNetwork(sandbox ?? record.container, false);
       record.network = false;
@@ -525,7 +526,7 @@ export class Installer {
       const reason = (e instanceof Error ? e.message : String(e)).split("\n")[0];
       record.network = true;
       record.warnings.push(
-        `The sandbox could not be taken off the network after the failed install (${reason}); it may still be online. Turn it off with set_project_network.`,
+        `The sandbox could not be taken off the network after the ${occasion === "interrupted" ? "interrupted" : "failed"} install (${reason}); it may still be online. Turn it off with set_project_network.`,
       );
     }
   }
