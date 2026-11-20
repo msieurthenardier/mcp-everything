@@ -458,6 +458,30 @@ describe("dockerConnector", () => {
     expect(fs.readdirSync(path.join(dir, "tmp"))).toEqual([]);
   });
 
+  it("removes the env file and rethrows when the connector throws after writing it", () => {
+    // argv is spread after the file is written; a non-iterable one makes that throw.
+    const bad = spec({ env: { API_KEY: "s3cret" } });
+    (bad as unknown as { argv: unknown }).argv = undefined;
+    expect(() => dockerConnector(cfg)({ container: "mcpe-x", sandbox: refOf("mcpe-x"), server: bad, pidFile: "/tmp/p.pid" })).toThrow(TypeError);
+    expect(fs.readdirSync(path.join(dir, "tmp"))).toEqual([]);
+  });
+
+  it("removes a partially written env file when the write itself throws", () => {
+    const real = fs.writeFileSync;
+    const spy = vi.spyOn(fs, "writeFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: unknown, opts: unknown) => {
+      real(file, "API_", opts as fs.WriteFileOptions);
+      throw new Error("ENOSPC: no space left on device");
+    }) as typeof fs.writeFileSync);
+    try {
+      expect(() =>
+        dockerConnector(cfg)({ container: "mcpe-x", sandbox: refOf("mcpe-x"), server: spec({ env: { API_KEY: "s3cret" } }), pidFile: "/tmp/p.pid" }),
+      ).toThrow(/ENOSPC/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.readdirSync(path.join(dir, "tmp"))).toEqual([]);
+  });
+
   it("creates no env file when there is no environment", () => {
     const conn = dockerConnector(cfg)({ container: "mcpe-x", sandbox: refOf("mcpe-x"), server: spec(), pidFile: "/tmp/p.pid" });
     const params = (conn.transport as unknown as { _serverParams: { args: string[] } })._serverParams;

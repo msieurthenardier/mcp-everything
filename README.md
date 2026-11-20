@@ -18,6 +18,11 @@ ruff__ruff_check({ args: ["."], output_format: "json" })
 - Node.js 22.12+
 - Docker (the daemon must be reachable by the user running the server)
 
+The Node floor follows the toolchain the project is built and tested with:
+vitest needs `^22.12.0 || ^24.0.0 || >=26.0.0`, and the hosted check runs the
+current Node 22 (from `.nvmrc`). Node 20 is no longer supported; on it, npm
+prints an `engines` warning. `@types/node` is pinned to the 22 line to match.
+
 ## Setup
 
 No checkout is needed: `npx` can run the server straight from GitHub. For
@@ -434,6 +439,15 @@ and they need two data directories. Where the directory is by default:
   no Windows-specific default; it is the home directory plus `.local\share`.
 - `MCPE_DATA_DIR` replaces either.
 
+**The id file.** The file holds the id and one line ending (`\n` or `\r\n`) after it, which may
+be left off; one UTF-8 byte-order mark before the id is also accepted.
+Anything else (whitespace, capitals, another length, a second line ending)
+makes the file invalid, and an invalid file stops startup: the server prints
+one line naming the file and exits with status 1. It does not replace the
+file. Restore the file from a backup, and the installation keeps its
+sandboxes. Delete it, and the next start makes a new id that owns none of them
+(see "What this does not cover" below).
+
 **Names and labels.** A sandbox made by this version is named
 `<MCPE_NAME_PREFIX><id>-<slug>` (with nothing configured, `mcpe-1a2b3c4d-gron`),
 for its container and its volume alike. Both carry the labels
@@ -489,7 +503,9 @@ it is started, used, reinstalled over and removed as it was before.
 Docker at that moment: `Sandbox owner: ...` says it is this installation's, was
 made before ownership was recorded, is another installation's (with the owner
 label), was not created by mcp-everything, does not exist, or could not be
-checked because Docker did not answer. It never fails because of that question.
+checked because Docker did not answer. It never fails because of that question,
+but it can wait for the answer: when the daemon hangs, `project_info` can take
+up to 30 seconds.
 `list_projects` and the results of an install ask Docker nothing.
 
 **On upgrading.**
@@ -518,6 +534,12 @@ checked because Docker did not answer. It never fails because of that question.
   apart and protect nothing from each other. Copying `registry.json` alone,
   without `installation-id`, gives the copy an id of its own; its records then
   name sandboxes that are the other installation's, and are refused as above.
+- An `installation-id` file that is deleted or lost while `registry.json` stays
+  has the same result as a copied registry without its id file: a new id is
+  made at the next start, and every project made since ownership was recorded
+  is refused as above. An uninstall leaves its sandbox and a reinstall builds
+  beside it. The two commands above find the sandboxes left behind. Restoring
+  the old file before the next start avoids all of it.
 - A deleted data directory leaves sandboxes whose owner is gone. Find them with
   the two commands above (the owner label is an id no installation has) and
   remove them by hand.

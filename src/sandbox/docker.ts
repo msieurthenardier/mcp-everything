@@ -199,7 +199,7 @@ export const PROJECT_LABEL = "mcp-everything.project";
  * Whose a container or volume is, judged from its labels alone: "mine" (the owner
  * label is this installation's id), "another" (an owner label with any other
  * value, empty or malformed included), "before" (the generic label `1` and no
- * owner label: made before sandboxes had owners) or "not-ours".
+ * owner label: made before ownership was recorded) or "not-ours".
  */
 export type SandboxClass = "mine" | "another" | "before" | "not-ours";
 
@@ -238,6 +238,12 @@ export interface SandboxFacts {
 }
 
 const LABEL_MAX = 64;
+
+/**
+ * How much of an owner label is shown anywhere an operator reads it (a refusal, an install warning, project_info).
+ * Imported by those other places so the cut cannot drift. LABEL_MAX still bounds every other text from Docker.
+ */
+export const OWNER_SHOWN = 64;
 const clean = (v: string) => oneLine(v, LABEL_MAX);
 
 function describeFacts(f: SandboxFacts): string {
@@ -245,11 +251,11 @@ function describeFacts(f: SandboxFacts): string {
   const project = f.kind === "container" ? `, project label ${f.project === undefined ? "(none)" : `"${clean(f.project)}"`}` : "";
   switch (f.cls) {
     case "another":
-      return `${what} is another installation's (owner label "${clean(f.owner ?? "")}"${project})`;
+      return `${what} is another installation's (owner label "${oneLine(f.owner ?? "", OWNER_SHOWN)}"${project})`;
     case "not-ours":
       return `${what} was not created by mcp-everything${project}`;
     case "before":
-      return `${what} is from before sandboxes had owners (treated as this installation's${project})`;
+      return `${what} was made before ownership was recorded (treated as this installation's${project})`;
     default:
       return `${what} is this installation's${project}`;
   }
@@ -517,7 +523,7 @@ export class Docker {
     if (!vol) throw new Error(`Volume ${clean(opts.volume)} does not exist; it must be created first`);
     const facts = this.volumeFacts(opts.volume, vol.labels);
     this.refuseUnless([facts]);
-    if (facts.cls !== "mine") throw new Error(`Volume ${clean(opts.volume)} is from before sandboxes had owners; it cannot hold a new container`);
+    if (facts.cls !== "mine") throw new Error(`Volume ${clean(opts.volume)} was made before ownership was recorded; it cannot hold a new container`);
     await this.ensureImage(opts.image);
     const basePath = await this.imagePath(opts.image);
     const path = [BIN_DIR, `${VENV_DIR}/bin`, "/root/.cargo/bin", "/usr/local/go/bin", basePath].join(":");

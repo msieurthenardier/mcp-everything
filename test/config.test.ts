@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
+import { ConfigError } from "../src/errors.js";
 
 describe("sandboxIdleSec", () => {
   const idle = (v?: string) => loadConfig(v === undefined ? {} : { MCPE_SANDBOX_IDLE_TIMEOUT: v }).sandboxIdleSec;
@@ -70,5 +71,15 @@ describe("memory and cpus limits", () => {
     }
     expect(mem(zeros)).toBe("4g");
     expect(cpus(zeros)).toBe("2");
+  });
+});
+
+describe("configuration errors are ConfigError", () => {
+  it.each([
+    ["MCPE_NAME_PREFIX", { MCPE_NAME_PREFIX: "Bad-" }],
+    ["MCPE_EXTRA_HOSTS host", { MCPE_EXTRA_HOSTS: "not a host=github" }],
+    ["MCPE_EXTRA_HOSTS forge", { MCPE_EXTRA_HOSTS: "git.example.com=svn" }],
+  ])("%s", (_n, env) => {
+    expect(() => loadConfig(env)).toThrow(ConfigError);
   });
 });

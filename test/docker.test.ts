@@ -7,6 +7,7 @@ import {
   Docker,
   DockerUnavailableError,
   isStoppedExecFailure,
+  OWNER_SHOWN,
   SandboxRefusedError,
   watchdogPollSec,
   type ExecResult,
@@ -463,6 +464,13 @@ describe("the two error types", () => {
     expect(r.message.length).toBeLessThan(500);
   });
 
+  it("cuts a long owner label to OWNER_SHOWN characters, the same cut the installer and project_info make", async () => {
+    const d = mk();
+    d.containers.set(N, { id: idFor(N), running: true, labels: { "mcp-everything.owner": "x".repeat(300) }, networks: [] });
+    const r = (await d.state(N).then(() => null, (x: unknown) => x)) as SandboxRefusedError;
+    expect(r.message).toContain(`owner label "${"x".repeat(OWNER_SHOWN - 1)}…"`);
+  });
+
   it("flattens a line break on its own", async () => {
     const d = mk();
     d.containers.set(N, { id: idFor(N), running: true, labels: { "mcp-everything.owner": "one\ntwo\n\nthree" }, networks: [] });
@@ -773,7 +781,7 @@ describe("destroy classifies both before it removes either", () => {
       const r = e as SandboxRefusedError;
       expect(r.message).toContain(N);
       expect(r.message).toContain(V);
-      expect(r.message).toContain(c === "mine" ? "this installation's" : c === "before" ? "from before" : c === "another" ? "another installation's" : "not created by mcp-everything");
+      expect(r.message).toContain(c === "mine" ? "this installation's" : c === "before" ? "before ownership was recorded" : c === "another" ? "another installation's" : "not created by mcp-everything");
       expect(r.sandboxes.map((f) => [f.kind, f.cls])).toEqual([["container", c], ["volume", v]]);
       expect(d.count("rm") + d.count("volume rm")).toBe(0);
       expect(d.containers.has(N)).toBe(true);
@@ -881,7 +889,7 @@ describe("createContainer's volume and result", () => {
     d.putVolume(V, "before");
     const e = await settle(create(d));
     expect(e).not.toBeInstanceOf(SandboxRefusedError);
-    expect((e as Error).message).toMatch(/from before/);
+    expect((e as Error).message).toMatch(/was made before ownership was recorded; it cannot hold/);
     expect(d.count("run")).toBe(0);
   });
 

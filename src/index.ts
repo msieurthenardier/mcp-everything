@@ -2,6 +2,7 @@
 import { loadConfig } from "./config.js";
 import { App, prepareDataDir } from "./server.js";
 import { runEntry, serveApp } from "./entry.js";
+import { formatFatal } from "./errors.js";
 import { SHUTDOWN_DEADLINE_MS } from "./shutdown.js";
 
 async function main(): Promise<void> {
@@ -22,6 +23,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  process.stderr.write(`[mcp-everything] fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`);
+  process.stderr.write(formatFatal(e));
   process.exit(1);
 });

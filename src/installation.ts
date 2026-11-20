@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { ConfigError } from "./errors.js";
 
 /** An installation id: eight lowercase hexadecimal characters. */
 export const INSTALLATION_ID_PATTERN = /^[0-9a-f]{8}$/;
@@ -29,9 +30,14 @@ export const isInstallationId = (value: unknown): value is string => typeof valu
 
 const code = (e: unknown) => (e as NodeJS.ErrnoException | undefined)?.code;
 
-/** Valid content: the id, with at most one trailing newline removed. */
+/**
+ * Valid content: the id, optionally preceded by one UTF-8 byte-order mark and followed by
+ * one line ending (`\n` or `\r\n`). A lone `\r`, a second line ending or any other
+ * character makes the file invalid.
+ */
 function parse(content: string): string | undefined {
-  const body = content.endsWith("\n") ? content.slice(0, -1) : content;
+  const unmarked = content.startsWith("\uFEFF") ? content.slice(1) : content;
+  const body = unmarked.endsWith("\r\n") ? unmarked.slice(0, -2) : unmarked.endsWith("\n") ? unmarked.slice(0, -1) : unmarked;
   return INSTALLATION_ID_PATTERN.test(body) ? body : undefined;
 }
 
@@ -45,10 +51,10 @@ export function loadInstallationId(dataDir: string, hooks: InstallationHooks = {
   const link = hooks.link ?? ((temp: string, final: string) => fs.linkSync(temp, final));
   const wait = hooks.wait ?? defaultWait;
   const fail = (what: string, e: unknown): never => {
-    throw new Error(`Cannot ${what} the installation id file ${file}: ${e instanceof Error ? e.message : String(e)}`);
+    throw new ConfigError(`Cannot ${what} the installation id file ${file}: ${e instanceof Error ? e.message : String(e)}`);
   };
   const invalid = () =>
-    new Error(
+    new ConfigError(
       `The installation id file ${file} does not hold a valid id (eight lowercase hexadecimal characters). ` +
         `Restore it from a backup or, if no sandbox belongs to this data directory, delete it so a new one is made.`,
     );
@@ -107,7 +113,13 @@ export function loadInstallationId(dataDir: string, hooks: InstallationHooks = {
       if (code(e) !== "EEXIST") createInPlace(file, content, fail);
     }
   } finally {
-    fs.rmSync(temp, { force: true });
+    // Best effort: a failed removal (another program briefly holding the file) must not
+    // fail a load that succeeded, and must not mask an earlier error. The sweep removes it later.
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {
+      // left for sweepTemps
+    }
   }
 
   const final = readFinal();

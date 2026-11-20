@@ -34,7 +34,7 @@
     "smol-toml": "^1.9.1"
   },
   "devDependencies": {
-    "@types/node": "^26.6.6",
+    "@types/node": "^22.20.5",
     "@types/semver": "^7.8.0",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0"

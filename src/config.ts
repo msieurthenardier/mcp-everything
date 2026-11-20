@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import type { Ecosystem } from "./types.js";
+import { ConfigError } from "./errors.js";
 
 export interface Config {
   dataDir: string;
@@ -74,10 +75,10 @@ export function parseHosts(spec: string | undefined): Config["hosts"] {
   for (const entry of (spec ?? "").split(",")) {
     const [rawHost, rawKind] = entry.trim().toLowerCase().split("=");
     if (!rawHost) continue;
-    if (!HOSTNAME.test(rawHost)) throw new Error(`MCPE_EXTRA_HOSTS: invalid host "${rawHost}"`);
+    if (!HOSTNAME.test(rawHost)) throw new ConfigError(`MCPE_EXTRA_HOSTS: invalid host "${rawHost}"`);
     const kind = rawKind ?? "gitlab";
     if (kind !== "github" && kind !== "gitlab") {
-      throw new Error(`MCPE_EXTRA_HOSTS: "${rawHost}" must be =github or =gitlab`);
+      throw new ConfigError(`MCPE_EXTRA_HOSTS: "${rawHost}" must be =github or =gitlab`);
     }
     hosts[rawHost] = kind;
   }
@@ -143,7 +144,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 function parseNamePrefix(raw: string | undefined): string {
   if (!raw) return "mcpe-";
   if (!/^[a-z0-9][a-z0-9_.-]{0,30}$/.test(raw)) {
-    throw new Error(
+    throw new ConfigError(
       `MCPE_NAME_PREFIX=${JSON.stringify(raw)} is not valid: use 1-31 characters from [a-z0-9_.-], starting with a letter or digit.`,
     );
   }
