@@ -115,7 +115,7 @@ class ScriptedDocker extends FakeDocker {
     this.fail("destroy", this.destroyFails);
     const refused = this.destroyErrors[container];
     if (refused) throw refused;
-    return super.destroy(container);
+    return super.destroy(container, volume);
   }
 
   override async assertAvailable(): Promise<void> {
@@ -774,6 +774,20 @@ describe("install failure paths", () => {
       await expect(installer.uninstall(registry.get("widget")!)).rejects.toThrow(/destroy failed/);
       expect(registry.get("widget")).toBeDefined();
     });
+
+    it("removes the volume the record names, not the container's name", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      await install();
+      const record = { ...registry.get("widget")!, volume: "mcpe-widget-data" };
+      registry.put(record);
+      docker.destroyed = [];
+      docker.destroyedVolumes = [];
+      docker.trace = [];
+      await installer.uninstall(record);
+      expect(docker.trace.filter((t) => t.call === "destroy").map((t) => t.args)).toEqual([[WIDGET, "mcpe-widget-data"]]);
+      expect(docker.destroyed).toEqual([WIDGET]);
+      expect(docker.destroyedVolumes).toEqual(["mcpe-widget-data"]);
+    });
   });
 });
 
@@ -856,7 +870,7 @@ describe("stale installs at startup", () => {
     const log: string[] = [];
     expect(await installer.reconcileStale(NOW, (l) => log.push(l))).toEqual([]);
     expect(log).toHaveLength(1);
-    expect(log[0]).toContain("2");
+    expect(log[0]).toMatch(/^2 interrupted install\(s\) not reconciled, Docker is not reachable/);
     expect(docker.network).toEqual([]);
     expect(mtime()).toBe(before);
     expect(registry.get("a")?.status).toBe("installing");
@@ -916,12 +930,15 @@ describe("stale installs at startup", () => {
   it("writes nothing when the record was replaced during the detach", async () => {
     seed("x");
     const newer = { ...seedRecord("x"), status: "installing" as const, network: true, installedAt: ago(1000) };
-    docker.onSetNetwork = () => other().put(newer);
+    let written = 0;
+    docker.onSetNetwork = () => {
+      other().put(newer);
+      written = mtime();
+    };
     const log: string[] = [];
     expect(await installer.reconcileStale(NOW, (l) => log.push(l))).toEqual([]);
     expect(registry.get("x")).toEqual(newer);
-    const written = mtime();
-    expect(other().refresh()).toBe(true);
+    expect(written).toBeGreaterThan(0);
     expect(mtime()).toBe(written);
   });
 

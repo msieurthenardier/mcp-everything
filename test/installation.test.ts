@@ -179,6 +179,21 @@ describe("loadInstallationId: temporary files", () => {
     expect(names()).toEqual(["installation-id", "installation-id.2-bb.tmp"]);
   });
 
+  it("leaves a directory with a stale temporary name alone, without trying to remove it", () => {
+    const sub = path.join(dir, "installation-id.3-dd.tmp");
+    fs.mkdirSync(sub);
+    const t = new Date(Date.now() - 2 * 3600_000);
+    fs.utimesSync(sub, t, t);
+    const unlink = vi.spyOn(fs, "unlinkSync");
+    try {
+      loadInstallationId(dir);
+      expect(unlink.mock.calls.map((c) => String(c[0]))).not.toContain(sub);
+    } finally {
+      unlink.mockRestore();
+    }
+    expect(fs.statSync(sub).isDirectory()).toBe(true);
+  });
+
   it("does not sweep the registry's temporary names, and the registry does not sweep its own", () => {
     old("registry.json.123.tmp");
     loadInstallationId(dir);
