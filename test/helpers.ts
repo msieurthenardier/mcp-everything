@@ -119,6 +119,14 @@ export class FakeDocker extends Docker {
   override async removeContainer(container: string): Promise<void> {
     this.destroyed.push(`container:${container}`);
   }
+  /** The `maxAgeSec` of every startup sweep of check leftovers, in order. */
+  sweepCalls: number[] = [];
+  /** What the sweep reports; a function result is awaited, a thrown error is a rejection. */
+  sweepResult: () => Promise<{ removed: string[]; failures: number }> = async () => ({ removed: [], failures: 0 });
+  override async sweepCheckLeftovers(maxAgeSec: number): Promise<{ removed: string[]; failures: number }> {
+    this.sweepCalls.push(maxAgeSec);
+    return this.sweepResult();
+  }
 }
 
 export interface FakeUpstream {

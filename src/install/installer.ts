@@ -13,6 +13,7 @@ import {
   WORK_DIR,
   WORKSPACE,
   type ExecResult,
+  type ProbeData,
   type SandboxFacts,
   type SandboxRef,
 } from "../sandbox/docker.js";
@@ -31,9 +32,21 @@ import type {
   ToolSelection,
 } from "../types.js";
 import { cleanTerminalText, oneLine } from "../util/text.js";
+import { analyzeBuildHooks } from "../scan/build-hooks.js";
+import { decide } from "../scan/policy.js";
+import { runScanners } from "../scan/run.js";
+import { emptyCounts } from "../scan/sarif.js";
+import type { CheckOutcome, ScanReport } from "../scan/types.js";
 import { detect } from "./detect.js";
 import { NODE_DISCOVERY, PYTHON_DISCOVERY, recipeFor } from "./recipes.js";
 import { chooseToolchain, type ToolchainChoice } from "./toolchain.js";
+
+/** Where an install is, for its failure branch. A later state before "old" can be added as a member. */
+type InstallState =
+  /** A reinstall whose old sandbox has not been retired yet; `before` is the record to put back. */
+  | { phase: "old"; before: ProjectRecord }
+  /** The old sandbox is gone (or there was none); `sandbox` once this install made a container. */
+  | { phase: "new"; sandbox?: SandboxRef };
 
 export interface InstallParams {
   repo: RepoRef;
@@ -182,6 +195,25 @@ function routeHint(slug: string): string {
   return `If it needs environment variables, set ${slug}__NAME in the environment of mcp-everything, reconnect it, and call refresh_mcp.`;
 }
 
+/** What an install that checks first came to. `kept` is the repository's existing record, whatever its status. */
+export type InstallOutcome =
+  | { kind: "installed"; record: ProjectRecord }
+  | { kind: "blocked"; report: ScanReport; kept?: ProjectRecord }
+  | { kind: "check-failed"; reason: string; kept?: ProjectRecord };
+
+/** What a check on its own came to. */
+export type CheckResult = { kind: "checked"; report: ScanReport } | { kind: "check-failed"; reason: string };
+
+/** Called as an install that checks first moves from one stage to the next. */
+export interface InstallHooks {
+  onChecking?: () => void;
+  onBuilding?: () => void;
+}
+
+/** What a warning about a blocked reinstall begins with; a later block replaces an earlier one. */
+const BLOCKED_WARNING = "A reinstall at commit";
+const CHECK_REASON_MAX = 300;
+
 export class Installer {
   constructor(
     private readonly cfg: Config,
@@ -227,6 +259,178 @@ export class Installer {
     const existing = this.registry.findByRepo(params.repo.id);
     if (existing && existing.status === "ready" && !params.reinstall) return existing;
 
+    const { record, slug, container, volume, before, renamed, state } = this.openInstall(params, existing);
+
+    try {
+      await this.retireOldSandbox(before, renamed, record, container, volume, state);
+
+      log(`Cloning ${params.repo.cloneUrl}${params.ref ? ` @ ${params.ref}` : ""}…`);
+      const probe = await this.docker.probe(params.repo, volume, {
+        ref: params.ref,
+        submodules: params.submodules,
+        onOutput: (c) => log(c.trimEnd()),
+      });
+      return await this.finishInstall(params, record, probe, container, volume, state, log);
+    } catch (e) {
+      return this.settleFailure(e, record, slug, container, volume, state);
+    }
+  }
+
+  /**
+   * The checking stage, shared by `installChecked` and the check tool: clones the repository into a new staging
+   * volume (never into an installed project's), runs the built-in check and the operator's scanners over the
+   * clone, and decides. It touches no registry record and no installed sandbox. Returns the staging volume (the
+   * caller removes it), the clone's data and the report. On any failure it removes the staging volume (best
+   * effort) and throws an Error whose message is a cleaned, bounded one-line reason.
+   */
+  private async checkClone(params: InstallParams, log: Logger): Promise<{ staging: string; probe: ProbeData; report: ScanReport }> {
+    const staging = this.docker.stagingName();
+    try {
+      log(`Cloning ${params.repo.cloneUrl}${params.ref ? ` @ ${params.ref}` : ""} to check it…`);
+      const probe = await this.docker.probe(params.repo, staging, {
+        ref: params.ref,
+        submodules: params.submodules,
+        onOutput: (c) => log(c.trimEnd()),
+        volumeRole: "staging",
+      });
+      const primary = params.ecosystem ?? detect(probe).primary;
+      let builtin: CheckOutcome;
+      try {
+        builtin = analyzeBuildHooks(primary, probe.walk);
+      } catch {
+        // Never the exception's text: it may carry repository content.
+        builtin = {
+          name: "build-hooks", kind: "builtin", status: "failed", counts: emptyCounts(), findings: [], omitted: 0, notes: [],
+          error: "the built-in check could not analyze this repository",
+        };
+      }
+      log("Running the scanners…");
+      const scanned = await runScanners(this.docker, staging, this.cfg.scan.scanners, {
+        totalTimeoutSec: this.cfg.scan.timeoutSec,
+        dataDir: this.cfg.dataDir,
+      });
+      const checks = [builtin, ...scanned];
+      const decision = decide(this.cfg.scan.mode, this.cfg.scan.blockAt, checks);
+      return { staging, probe, report: { commit: probe.commit, checks, decision, at: new Date().toISOString() } };
+    } catch (e) {
+      await this.dropStaging(staging);
+      throw new Error(oneLine(e instanceof Error ? e.message : String(e), CHECK_REASON_MAX));
+    }
+  }
+
+  /** Removes a staging volume; best effort, never throws. */
+  private async dropStaging(staging: string): Promise<void> {
+    try {
+      await this.docker.removeStagingVolume(staging);
+    } catch {
+      // The startup sweep removes what is left.
+    }
+  }
+
+  /**
+   * Clones and checks a repository without building or running anything from it, whatever the scan mode is: the
+   * built-in check and every configured scanner run, and the report's decision uses the configured mode. It reads
+   * and writes no registry record, touches no installed sandbox, and always removes its staging volume. Throws
+   * only what `install` throws before it begins (Docker not answering).
+   */
+  async check(params: InstallParams, log: Logger = () => {}): Promise<CheckResult> {
+    await this.docker.assertAvailable();
+    let checked: { staging: string; probe: ProbeData; report: ScanReport };
+    try {
+      checked = await this.checkClone(params, log);
+    } catch (e) {
+      return { kind: "check-failed", reason: (e as Error).message };
+    }
+    await this.dropStaging(checked.staging);
+    return { kind: "checked", report: checked.report };
+  }
+
+  /** The record for the repository as the registry holds it now, as a copy; absent when there is none. */
+  private currentRecord(repoId: string): ProjectRecord | undefined {
+    this.registry.refresh();
+    const r = this.registry.findByRepo(repoId);
+    return r ? structuredClone(r) : undefined;
+  }
+
+  /**
+   * Installs after checking: the repository is cloned into a staging volume and checked first, and nothing of an
+   * installed project is touched (no registry write, no proxy close, no removal, no network change) until the
+   * policy has allowed the build. Then it opens the install as `install` does, retires the old sandbox, copies
+   * exactly the checked bytes into the new sandbox's volume and builds from them (the clone is not repeated).
+   *
+   * Outcomes: `installed` (a build ran, or a ready record already existed), `blocked` (the policy refused; the
+   * existing record, if any, gets one warning and is otherwise unchanged) or `check-failed` (the check could
+   * not be made; nothing was changed). Throws what `install` throws before it opens (Docker not answering), and
+   * the existing "could not reinstall" errors of the failure branch of a reinstall.
+   */
+  async installChecked(params: InstallParams, log: Logger = () => {}, hooks?: InstallHooks): Promise<InstallOutcome> {
+    await this.docker.assertAvailable();
+    this.registry.refresh();
+    const existing = this.registry.findByRepo(params.repo.id);
+    if (existing && existing.status === "ready" && !params.reinstall) return { kind: "installed", record: existing };
+
+    hooks?.onChecking?.();
+    let checked: { staging: string; probe: ProbeData; report: ScanReport };
+    try {
+      checked = await this.checkClone(params, log);
+    } catch (e) {
+      return { kind: "check-failed", reason: (e as Error).message, kept: this.currentRecord(params.repo.id) };
+    }
+    const { staging, probe, report } = checked;
+    let stagingGone = false;
+    const dropOnce = async () => {
+      if (stagingGone) return;
+      stagingGone = true;
+      await this.dropStaging(staging);
+    };
+
+    try {
+      if (report.decision.verdict === "block") {
+        await dropOnce();
+        let kept: ProjectRecord | undefined;
+        if (existing) {
+          const warning = `${BLOCKED_WARNING} ${report.commit.slice(0, 12)} was blocked by the scan policy on ${report.at.slice(0, 10)}; the project is unchanged.`;
+          this.registry.update(existing.slug, (cur) => {
+            if (!cur) return undefined;
+            kept = { ...cur, warnings: [...cur.warnings.filter((w) => !w.startsWith(BLOCKED_WARNING)), warning] };
+            return kept;
+          });
+        }
+        return { kind: "blocked", report, kept: kept ? structuredClone(kept) : undefined };
+      }
+
+      // Allowed. Another session may have written the registry while the check ran.
+      this.registry.refresh();
+      const fresh = this.registry.findByRepo(params.repo.id);
+      if (fresh && fresh.status === "ready" && !params.reinstall) {
+        await dropOnce();
+        return { kind: "installed", record: fresh };
+      }
+
+      hooks?.onBuilding?.();
+      const { record, slug, container, volume, before, renamed, state } = this.openInstall(params, fresh);
+      record.scan = report;
+      try {
+        await this.retireOldSandbox(before, renamed, record, container, volume, state);
+        await this.docker.createSandboxVolume(volume);
+        await this.docker.copyVolume(staging, volume);
+        await dropOnce();
+        return { kind: "installed", record: await this.finishInstall(params, record, probe, container, volume, state, log) };
+      } catch (e) {
+        return { kind: "installed", record: await this.settleFailure(e, record, slug, container, volume, state) };
+      }
+    } finally {
+      await dropOnce();
+    }
+  }
+
+  /**
+   * The opening of an install, shared by `install` and `installChecked`: the slug and names, a copy of the record
+   * being replaced, the record for the new install (`installedAt` is now; `selection` is carried from `existing`),
+   * the state holder, and the first registry write (the renamed copy that keeps the old names, or the record).
+   * `existing` is the registry's record for the repository, read by the caller just before.
+   */
+  private openInstall(params: InstallParams, existing: ProjectRecord | undefined) {
     const owner = params.repo.path.split("/")[0] ?? "";
     const slug = existing?.slug ?? makeSlug(params.repo.name, owner, (s) => this.registry.get(s) !== undefined);
     const container = this.docker.sandboxName(slug);
@@ -260,7 +464,7 @@ export class Installer {
     // the removal that opens it (the previous sandbox's if the names changed, the
     // one at these names if not) has succeeded and the record holds the new
     // names; "new" from then on, and always for a first install.
-    let phase: "old" | "new" = before ? "old" : "new";
+    const state: { current: InstallState } = { current: before ? { phase: "old", before } : { phase: "new" } };
     if (before && renamed) {
       // The registry keeps the object it is given, so the record that carries the
       // old names is a separate one: the new names go on `record` only after the
@@ -270,178 +474,242 @@ export class Installer {
       this.registry.put(record);
     }
 
-    let sandboxCreated = false;
-    // The reference of the container this install made, once there is one: its own failure branches take that container offline through it.
-    let sandbox: SandboxRef | undefined;
-    try {
-      if (before && renamed) {
-        await this.proxy.closeProject(before.container);
-        try {
-          await this.docker.destroy(before.container, before.volume);
-        } catch (e) {
-          // Only a refusal: the old sandbox is another installation's or not ours, so it is left exactly as it is
-          // and the reinstall goes on beside it. Any other failure (Docker did not answer, a failed removal) rises
-          // with `phase` still "old" and the old record is put back.
-          if (!(e instanceof SandboxRefusedError)) throw e;
-          record.warnings.push(leftInPlaceWarning(e.sandboxes));
-        }
-        this.registry.put(record);
-        phase = "new";
-      }
-      await this.proxy.closeProject(container);
-      await this.docker.destroy(container, volume);
-      phase = "new";
+    return { record, slug, container, volume, before, renamed, state };
+  }
 
-      log(`Cloning ${params.repo.cloneUrl}${params.ref ? ` @ ${params.ref}` : ""}…`);
-      const probe = await this.docker.probe(params.repo, volume, {
-        ref: params.ref,
-        submodules: params.submodules,
-        onOutput: (c) => log(c.trimEnd()),
-      });
-      record.commit = probe.commit;
+  /**
+   * Everything of an install after the clone, shared by `install` and `installChecked`: detection, the image, the
+   * build, the network policy, discovery and the final write. Every rejection must reach the caller's
+   * `settleFailure`, so a caller awaits this inside its `try`.
+   */
+  private async finishInstall(
+    params: InstallParams,
+    record: ProjectRecord,
+    probe: ProbeData,
+    container: string,
+    volume: string,
+    state: { current: InstallState },
+    log: Logger,
+  ): Promise<ProjectRecord> {
+    record.commit = probe.commit;
 
-      const detection = detect(probe);
-      record.ecosystems = detection.ecosystems;
-      record.primary = params.ecosystem ?? detection.primary;
-      record.license = detection.license;
-      record.warnings.push(...detection.notes);
-      if (!detection.license) {
-        record.warnings.push("No license was detected in the repository root; verify that this project is open source.");
-      }
-      record.meta.npmScripts = detection.npmScripts;
-      record.meta.makeTargets = detection.makeTargets;
-      record.meta.mcpHint = detection.mcpHint || /(^|[^a-z])mcp([^a-z]|$)/i.test(params.repo.name);
+    const detection = detect(probe);
+    record.ecosystems = detection.ecosystems;
+    record.primary = params.ecosystem ?? detection.primary;
+    record.license = detection.license;
+    record.warnings.push(...detection.notes);
+    if (!detection.license) {
+      record.warnings.push("No license was detected in the repository root; verify that this project is open source.");
+    }
+    record.meta.npmScripts = detection.npmScripts;
+    record.meta.makeTargets = detection.makeTargets;
+    record.meta.mcpHint = detection.mcpHint || /(^|[^a-z])mcp([^a-z]|$)/i.test(params.repo.name);
 
-      const defaultImage = this.cfg.docker.images[record.primary];
-      const choice: ToolchainChoice = params.image
-        ? { image: params.image, fallbacks: [], reason: "image chosen by the caller" }
-        : this.choose(record.primary, probe, defaultImage, this.cfg.docker.imageOverridden[record.primary]);
-      // One retry at most: each attempt is a full build.
-      const attempts = [choice.image, ...choice.fallbacks.slice(0, 1)];
-      record.imageReason = choice.reason;
-      log(`Detected ${detection.ecosystems.join(", ")}; building as ${record.primary}.`);
+    const defaultImage = this.cfg.docker.images[record.primary];
+    const choice: ToolchainChoice = params.image
+      ? { image: params.image, fallbacks: [], reason: "image chosen by the caller" }
+      : this.choose(record.primary, probe, defaultImage, this.cfg.docker.imageOverridden[record.primary]);
+    // One retry at most: each attempt is a full build.
+    const attempts = [choice.image, ...choice.fallbacks.slice(0, 1)];
+    record.imageReason = choice.reason;
+    log(`Detected ${detection.ecosystems.join(", ")}; building as ${record.primary}.`);
 
-      const timeoutSec = params.timeoutSec ?? this.cfg.installTimeoutSec;
-      let res!: ExecResult;
-      let tail!: Tail;
-      for (let i = 0; i < attempts.length; i++) {
-        let image = attempts[i]!;
-        log(`Using ${image}: ${record.imageReason}.`);
-        try {
-          await this.docker.ensureImage(image, (c) => log(c.trimEnd()));
-        } catch (e) {
-          // A version tag that does not exist must not sink the install.
-          if (image === defaultImage || params.image) throw e;
-          record.warnings.push(`Image ${image} could not be pulled; used the default ${defaultImage} instead.`);
-          record.imageReason = `default image, because ${image} (${choice.reason}) could not be pulled`;
-          image = defaultImage;
-          await this.docker.ensureImage(image, (c) => log(c.trimEnd()));
-        }
-        record.image = image;
-        if (i > 0) {
-          await this.docker.removeContainer(container);
-          sandbox = undefined;
-          sandboxCreated = false;
-          // The first attempt's container is gone: until `createContainer` returns the next one, this install holds none.
-        }
-        // The reference this attempt's container was made with; a rebuild replaces it.
-        const made = await this.docker.createContainer({ name: container, volume, image, project: params.repo.id });
-        sandbox = made;
-        sandboxCreated = true;
-        if (i > 0) await this.docker.exec(made, ["sh", "-c", CLEAN_SCRIPT], { timeoutSec: 300 });
+    const timeoutSec = params.timeoutSec ?? this.cfg.installTimeoutSec;
+    const { res, tail, sandbox } = await this.buildAttempts(
+      record, attempts, choice, defaultImage, params, container, volume, timeoutSec, log, state,
+    );
 
-        tail = new Tail(6000);
-        const output = tail;
-        res = await this.docker.exec(made, ["sh", "-c", recipeFor(record.primary)], {
-          cwd: REPO_DIR,
-          timeoutSec,
-          maxBytes: 4_000_000,
-          onOutput: (chunk) => {
-            output.push(chunk);
-            for (const line of chunk.split("\n")) if (line.trim()) log(line.trimEnd());
-          },
-        });
-        const text = `${res.stdout}\n${res.stderr}`;
-        const warnings = [...text.matchAll(/^MCPE_WARN (.+)$/gm)].map((m) => cleanTerminalText(m[1]!).slice(0, 300));
-        const dropped = warnings.length - MAX_BUILD_WARNINGS;
-        if (dropped > 0) warnings.splice(MAX_BUILD_WARNINGS, dropped, `${dropped} more build warnings were dropped.`);
-        const unhealthy = (res.code !== 0 && !res.timedOut) || /^MCPE_SOFT_FAIL$/m.test(text);
-        const next = attempts[i + 1];
-        if (unhealthy && next) {
-          const why = warnings[0] ?? `the ${record.primary} recipe exited with code ${res.code}`;
-          record.warnings.push(`The build did not succeed on ${image} (${why}); it was rebuilt on ${next}.`);
-          record.imageReason = `${next} after the build failed on ${image}; the project's declared range allows both`;
-          log(`Build failed on ${image}; retrying on ${next}…`);
-          continue;
-        }
-        record.warnings.push(...warnings);
-        break;
-      }
-
-      if (res.code !== 0) {
-        record.status = "failed";
-        record.error = res.timedOut
-          ? `Install timed out after ${timeoutSec}s.`
-          : `Install recipe for ${record.primary} exited with code ${res.code}.`;
-        record.errorLog = tail.toString().slice(-2500);
-        await this.takeOffline(record, "failed", sandbox);
-        this.registry.put(record);
-        return record;
-      }
-
-      // From here on the project's code only runs with the network policy the
-      // caller asked for (off unless requested).
-      const wantNetwork = params.network === true;
-      await this.docker.setNetwork(sandbox!, wantNetwork);
-      record.network = wantNetwork;
-
-      log("Discovering commands and generating tools…");
-      await this.discover(record, sandbox!, []);
-      record.status = "ready";
+    if (res.code !== 0) {
+      record.status = "failed";
+      record.error = res.timedOut
+        ? `Install timed out after ${timeoutSec}s.`
+        : `Install recipe for ${record.primary} exited with code ${res.code}.`;
+      record.errorLog = tail.toString().slice(-2500);
+      await this.takeOffline(record, "failed", sandbox);
       this.registry.put(record);
       return record;
-    } catch (e) {
-      if (phase === "old" && before) {
-        // The old sandbox may still exist and no build has started: put the record
-        // back as it was, with a note, and report the failure rather than a failed build.
-        const why = e instanceof Error ? e.message : String(e);
-        // A refusal at the very names this install needs: the sandbox there is not this installation's, and "reinstall
-        // again" can never succeed, so it gets its own words. Any other failure keeps the original warning and error.
-        const held = e instanceof SandboxRefusedError;
-        const warning = held ? nameHeldWarning(e.sandboxes) : OLD_SANDBOX_WARNING;
-        this.registry.put({
-          ...before,
-          warnings: before.warnings.includes(warning) ? before.warnings : [...before.warnings, warning],
-        });
-        if (held) {
-          throw new Error(
-            `Could not reinstall ${before.slug}: the name of its sandbox is held by a sandbox that is not this installation's (${describeLeft(e.sandboxes)}). It was not touched and must be removed or renamed by hand in Docker. The project was left as it was; nothing new was built.`,
-          );
-        }
+    }
+
+    // From here on the project's code only runs with the network policy the
+    // caller asked for (off unless requested).
+    const wantNetwork = params.network === true;
+    await this.docker.setNetwork(sandbox, wantNetwork);
+    record.network = wantNetwork;
+
+    log("Discovering commands and generating tools…");
+    await this.discover(record, sandbox, []);
+    record.status = "ready";
+    this.registry.put(record);
+    return record;
+  }
+
+  /**
+   * Opens a (re)install: for a reinstall under new names, closes the proxied servers and removes the previous
+   * sandbox (a refusal is only a warning on `record`), then removes whatever sits at the install's own names.
+   * Sets `state` to "new" once the old sandbox is gone, and keeps it "old" until then.
+   * Throws: Docker not answering or a failed removal of the previous or the own sandbox (a refusal at the own
+   * names included). Leaves behind: on a throw in the renamed branch the state is still "old" and the old
+   * sandbox may exist; a throw after it leaves the state "new", with the old sandbox gone.
+   */
+  private async retireOldSandbox(
+    before: ProjectRecord | undefined,
+    renamed: boolean,
+    record: ProjectRecord,
+    container: string,
+    volume: string,
+    state: { current: InstallState },
+  ): Promise<void> {
+    if (before && renamed) {
+      await this.proxy.closeProject(before.container);
+      try {
+        await this.docker.destroy(before.container, before.volume);
+      } catch (e) {
+        // Only a refusal: the old sandbox is another installation's or not ours, so it is left exactly as it is
+        // and the reinstall goes on beside it. Any other failure (Docker did not answer, a failed removal) rises
+        // with the state still "old" and the old record is put back.
+        if (!(e instanceof SandboxRefusedError)) throw e;
+        record.warnings.push(leftInPlaceWarning(e.sandboxes));
+      }
+      this.registry.put(record);
+      state.current = { phase: "new" };
+    }
+    await this.proxy.closeProject(container);
+    await this.docker.destroy(container, volume);
+    state.current = { phase: "new" };
+  }
+
+  /**
+   * Builds the project in the install's sandbox: pulls the image (a version tag that cannot be pulled falls back
+   * to the default), creates the container, runs the ecosystem recipe, and on an unhealthy build rebuilds once on
+   * the fallback image. Returns the last attempt's result, its output tail and the sandbox it ran in.
+   * Throws: the caller's own image that cannot be pulled, any Docker failure (create, exec, remove). Leaves
+   * behind: whatever container exists, named by `state` as it happens (no sandbox between removing the first
+   * attempt's container and creating the next), so the failure branch always knows what to take offline.
+   */
+  private async buildAttempts(
+    record: ProjectRecord,
+    attempts: string[],
+    choice: ToolchainChoice,
+    defaultImage: string,
+    params: InstallParams,
+    container: string,
+    volume: string,
+    timeoutSec: number,
+    log: Logger,
+    state: { current: InstallState },
+  ): Promise<{ res: ExecResult; tail: Tail; sandbox: SandboxRef }> {
+    // `attempts` always holds `choice.image`, so it is never empty and the last attempt always returns below.
+    for (let i = 0; ; i++) {
+      let image = attempts[i]!;
+      log(`Using ${image}: ${record.imageReason}.`);
+      try {
+        await this.docker.ensureImage(image, (c) => log(c.trimEnd()));
+      } catch (e) {
+        // A version tag that does not exist must not sink the install.
+        if (image === defaultImage || params.image) throw e;
+        record.warnings.push(`Image ${image} could not be pulled; used the default ${defaultImage} instead.`);
+        record.imageReason = `default image, because ${image} (${choice.reason}) could not be pulled`;
+        image = defaultImage;
+        await this.docker.ensureImage(image, (c) => log(c.trimEnd()));
+      }
+      record.image = image;
+      if (i > 0) {
+        await this.docker.removeContainer(container);
+        state.current = { phase: "new" };
+        // The first attempt's container is gone: until `createContainer` returns the next one, this install holds none.
+      }
+      // The reference this attempt's container was made with; a rebuild replaces it.
+      const made = await this.docker.createContainer({ name: container, volume, image, project: params.repo.id });
+      state.current = { phase: "new", sandbox: made };
+      if (i > 0) await this.docker.exec(made, ["sh", "-c", CLEAN_SCRIPT], { timeoutSec: 300 });
+
+      const tail = new Tail(6000);
+      const res = await this.docker.exec(made, ["sh", "-c", recipeFor(record.primary)], {
+        cwd: REPO_DIR,
+        timeoutSec,
+        maxBytes: 4_000_000,
+        onOutput: (chunk) => {
+          tail.push(chunk);
+          for (const line of chunk.split("\n")) if (line.trim()) log(line.trimEnd());
+        },
+      });
+      const text = `${res.stdout}\n${res.stderr}`;
+      const warnings = [...text.matchAll(/^MCPE_WARN (.+)$/gm)].map((m) => cleanTerminalText(m[1]!).slice(0, 300));
+      const dropped = warnings.length - MAX_BUILD_WARNINGS;
+      if (dropped > 0) warnings.splice(MAX_BUILD_WARNINGS, dropped, `${dropped} more build warnings were dropped.`);
+      const unhealthy = (res.code !== 0 && !res.timedOut) || /^MCPE_SOFT_FAIL$/m.test(text);
+      const next = attempts[i + 1];
+      if (unhealthy && next) {
+        const why = warnings[0] ?? `the ${record.primary} recipe exited with code ${res.code}`;
+        record.warnings.push(`The build did not succeed on ${image} (${why}); it was rebuilt on ${next}.`);
+        record.imageReason = `${next} after the build failed on ${image}; the project's declared range allows both`;
+        log(`Build failed on ${image}; retrying on ${next}…`);
+        continue;
+      }
+      record.warnings.push(...warnings);
+      return { res, tail, sandbox: made };
+    }
+  }
+
+  /**
+   * Settles an install that threw. For a reinstall still "old" (the old sandbox may exist and no build has
+   * started) it puts the old record back with a warning and throws. Otherwise the record becomes the failed one
+   * and is returned: its sandbox taken offline when this install made one, else the install's new names rolled
+   * back and the record deleted.
+   * Throws: only in the "old" case, an Error whose message names the project and why (two forms: the name held
+   * by a sandbox that is not this installation's, or the old sandbox could not be removed). Leaves behind: the
+   * old record, unchanged but for a warning ("old"); the offline sandbox with a failed record, or nothing.
+   */
+  private async settleFailure(
+    e: unknown,
+    record: ProjectRecord,
+    slug: string,
+    container: string,
+    volume: string,
+    state: { current: InstallState },
+  ): Promise<ProjectRecord> {
+    const at = state.current;
+    if (at.phase === "old") {
+      const before = at.before;
+      // The old sandbox may still exist and no build has started: put the record
+      // back as it was, with a note, and report the failure rather than a failed build.
+      const why = e instanceof Error ? e.message : String(e);
+      // A refusal at the very names this install needs: the sandbox there is not this installation's, and "reinstall
+      // again" can never succeed, so it gets its own words. Any other failure keeps the original warning and error.
+      const held = e instanceof SandboxRefusedError;
+      const warning = held ? nameHeldWarning(e.sandboxes) : OLD_SANDBOX_WARNING;
+      this.registry.put({
+        ...before,
+        warnings: before.warnings.includes(warning) ? before.warnings : [...before.warnings, warning],
+      });
+      if (held) {
         throw new Error(
-          `Could not reinstall ${before.slug}: the old sandbox could not be removed (${why}). The project was left as it was; nothing new was built.`,
+          `Could not reinstall ${before.slug}: the name of its sandbox is held by a sandbox that is not this installation's (${describeLeft(e.sandboxes)}). It was not touched and must be removed or renamed by hand in Docker. The project was left as it was; nothing new was built.`,
         );
       }
-      // Any failure of the build, a typed error included, becomes the failed record's error with its own message.
-      record.status = "failed";
-      record.error = e instanceof Error ? e.message : String(e);
-      if (sandboxCreated) {
-        // Discovery may have opened sessions to the project's MCP servers before the throw; the caller is told the
-        // install failed, so none may stay open. Best effort: the original error is what is reported.
-        await this.proxy.closeProject(container).catch(() => {});
-        await this.takeOffline(record, "failed", sandbox);
-        this.registry.put(record);
-      } else {
-        // Nothing usable exists (bad repository, clone or image failure):
-        // leave no half-project behind. This rollback of the install's own new names
-        // swallows every error on purpose, a refusal and "could not be asked" included:
-        // a refusal means the thing at these names is not ours, so there is nothing of
-        // this install to remove, and the record that names them is deleted just below.
-        await this.docker.destroy(container, volume).catch(() => {});
-        this.registry.delete(slug);
-      }
-      return record;
+      throw new Error(
+        `Could not reinstall ${before.slug}: the old sandbox could not be removed (${why}). The project was left as it was; nothing new was built.`,
+      );
     }
+    // Any failure of the build, a typed error included, becomes the failed record's error with its own message.
+    record.status = "failed";
+    record.error = e instanceof Error ? e.message : String(e);
+    if (at.phase === "new" && at.sandbox) {
+      // Discovery may have opened sessions to the project's MCP servers before the throw; the caller is told the
+      // install failed, so none may stay open. Best effort: the original error is what is reported.
+      await this.proxy.closeProject(container).catch(() => {});
+      await this.takeOffline(record, "failed", at.sandbox);
+      this.registry.put(record);
+    } else {
+      // Nothing usable exists (bad repository, clone or image failure):
+      // leave no half-project behind. This rollback of the install's own new names
+      // swallows every error on purpose, a refusal and "could not be asked" included:
+      // a refusal means the thing at these names is not ours, so there is nothing of
+      // this install to remove, and the record that names them is deleted just below.
+      await this.docker.destroy(container, volume).catch(() => {});
+      this.registry.delete(slug);
+    }
+    return record;
   }
 
   /**

@@ -1,5 +1,7 @@
 /** Shared data model. Everything in here is persisted to the registry as JSON. */
 
+import type { ScanReport } from "./scan/types.js";
+
 export type Forge = "github" | "gitlab";
 
 export type Ecosystem =
@@ -144,6 +146,8 @@ export interface ProjectRecord {
   /** Facts gathered at install time that tool generation reuses. */
   meta: ProjectMeta;
   installedAt: string;
+  /** What the check of the repository found before this install built it; absent when none was made. */
+  scan?: ScanReport;
 }
 
 export interface ProjectMeta {

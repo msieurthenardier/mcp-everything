@@ -70,8 +70,8 @@ const KILL_SCRIPT =
   'p=$(cat "$1" 2>/dev/null) || exit 0; rm -f "$1"; pkill -TERM -P "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; exit 0';
 
 /** The one shape of an env file's name; the writer and the sweep both use it. */
-const ENV_FILE_NAME = /^env-[0-9a-f]{16}$/;
-const newEnvFileName = (): string => `env-${randomBytes(8).toString("hex")}`;
+export const ENV_FILE_NAME = /^env-[0-9a-f]{16}$/;
+export const newEnvFileName = (): string => `env-${randomBytes(8).toString("hex")}`;
 
 /**
  * Removes env files a crash left in `<dataDir>/tmp`. A live file lasts at most

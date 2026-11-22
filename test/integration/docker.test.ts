@@ -8,8 +8,11 @@ import { Installer } from "../../src/install/installer.js";
 import { McpProxy } from "../../src/proxy/mcp-proxy.js";
 import { loadInstallationId } from "../../src/installation.js";
 import { Registry } from "../../src/registry.js";
-import { Docker, type ExecOptions, type ExecResult } from "../../src/sandbox/docker.js";
+import { Docker, MANIFESTS, parseProbeOutput, WALK_SCRIPT, walkArguments, type ExecOptions, type ExecResult, type OneShotSpec } from "../../src/sandbox/docker.js";
+import { randomBytes } from "node:crypto";
 import { App } from "../../src/server.js";
+import { runScanners } from "../../src/scan/run.js";
+import type { ScannerSpec } from "../../src/scan/types.js";
 import { run } from "../../src/util/exec.js";
 
 /**
@@ -39,6 +42,13 @@ const prefix = `mcpe-it-${process.pid}-`;
 const text = (res: Awaited<ReturnType<App["callTool"]>>) => (res.content[0] as { text: string }).text;
 
 const HEX8 = /^[0-9a-f]{8}$/;
+
+/**
+ * `alpine`, for the test scanner of later legs, pinned by the index digest with the tag it was read under
+ * (Docker Hub, 2026-11-22: `latest` = `3.24.4`; `docker buildx imagetools inspect alpine:latest`).
+ * To bump, read both again the same way.
+ */
+export const ALPINE = "alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf";
 
 /** Whether `p` lies strictly inside the system's temporary directory. */
 function isUnderTmp(p: string): boolean {
@@ -979,4 +989,559 @@ describe.skipIf(!pressureEnabled)("docker integration: sandbox at its process li
       `for k in 1 2 3 4 5 6; do awk 'BEGIN{e=systime()+8; while(systime()<e) system("sleep 1 &")}' >/dev/null 2>&1 & done; wait`,
     ]);
   });
+});
+
+/** The one-shot method is protected; a test subclass reaches it. */
+class OneShotDocker extends Docker {
+  /** The stdout of the last one-shot command, whoever ran it (`probe` included). */
+  lastStdout = "";
+  once(spec: OneShotSpec) {
+    return this.runOnce(spec);
+  }
+  protected override async runOnce(spec: OneShotSpec) {
+    const res = await super.runOnce(spec);
+    this.lastStdout = res.stdout;
+    return res;
+  }
+}
+
+describe.skipIf(!enabled)("docker integration: the owned one-shot container", () => {
+  /** An installation id made for this describe alone: every container it makes carries it, so none is the operator's. */
+  const id = randomBytes(4).toString("hex");
+  const cfg = loadConfig({ ...process.env, MCPE_NAME_PREFIX: prefix });
+  const own = ["ps", "-a", "--filter", `label=mcp-everything.owner=${id}`, "--format", '{{.Names}}\t{{.Label "mcp-everything.role"}}'];
+  const left = async () => (await run("docker", own, { timeoutMs: 30_000 })).stdout.trim();
+  /** Removes whatever this describe's id left, each name through the checked removal. Run after each case. */
+  const sweepOwn = async () => {
+    for (const line of (await left()).split("\n").filter(Boolean)) await removeContainerChecked(line.split("\t")[0]!, []);
+  };
+  const gone = async (): Promise<string> => {
+    const until = Date.now() + 10_000;
+    let now = await left();
+    while (now !== "" && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 500));
+      now = await left();
+    }
+    return now;
+  };
+
+  it("clones into a staging volume, returns a commit and leaves no container with role clone", async () => {
+    assertNameCheckBehaves();
+    const docker = new OneShotDocker(cfg, id);
+    const volume = `${prefix}clone-${randomBytes(4).toString("hex")}`;
+    expect(mayRemove(volume, [])).toBe(true);
+    try {
+      const data = await docker.probe(parseRepoRef("tomnomnom/gron", cfg.hosts), volume, { volumeRole: "staging" });
+      expect(data.commit).toMatch(/^[0-9a-f]{40}$/);
+      // The walk reports no gap (gron, a Go project, has none of the walked files, so `files` may be empty).
+      expect(data.walk.incomplete).toBeUndefined();
+      // The raw stdout shows the separator split: each FILE name at most once, none outside MANIFESTS, well under the cap.
+      const names = docker.lastStdout.split("\n").filter((l) => l.startsWith("FILE ")).map((l) => l.split(" ")[1]!);
+      expect(new Set(names).size).toBe(names.length);
+      for (const n of names) expect(MANIFESTS).toContain(n);
+      expect(docker.lastStdout.length).toBeLessThan(1_000_000);
+      const labels = await run("docker", ["volume", "inspect", "--format", "{{json .Labels}}", volume], { timeoutMs: 30_000 });
+      expect(JSON.parse(labels.stdout)).toEqual({ "mcp-everything": "1", "mcp-everything.owner": id, "mcp-everything.role": "staging" });
+      expect(await gone()).toBe("");
+    } finally {
+      await sweepOwn();
+      await removeVolumeChecked(volume, []);
+    }
+  }, 300_000);
+
+  it("walks a fixture in the pinned clone image: reads, prunes, links, truncation and the three gaps", async () => {
+    const docker = new OneShotDocker(cfg, id);
+    const volume = `${prefix}walk-${randomBytes(4).toString("hex")}`;
+    expect(mayRemove(volume, [])).toBe(true);
+    const fixture = [
+      "set -e",
+      "mkdir -p /workspace/repo && cd /workspace/repo",
+      "echo '{\"root\":1}' > package.json",
+      "mkdir -p sub node_modules/x",
+      "echo '{\"sub\":1}' > sub/package.json",
+      "echo '{\"pruned\":1}' > node_modules/x/package.json",
+      "ln -s /etc/passwd setup.py",
+      "head -c 70000 /dev/zero | tr '\\0' a > configure",
+      "nl=$(printf 'a\\nb'); mkdir -p \"$nl\"; echo '{}' > \"$nl/package.json\"",
+      "mkdir -p l1/l2/l3/l4/l5/l6/l7/l8/l9; echo all: > l1/l2/l3/l4/l5/l6/l7/l8/l9/Makefile",
+      "mkdir -p cm; i=0; while [ $i -lt 41 ]; do echo x > cm/f$i.cmake; i=$((i+1)); done",
+    ].join("\n");
+    await docker.ensureImage(ALPINE);
+    await docker.ensureImage(cfg.docker.probeImage);
+    try {
+      const made = await run("docker", ["volume", "create", "--label", "mcp-everything=1", "--label", `mcp-everything.owner=${id}`, volume], { timeoutMs: 30_000 });
+      expect(made.code).toBe(0);
+      const built = await docker.once({ role: "clone", image: ALPINE, network: "none", mounts: [`${volume}:/workspace`], entrypoint: "sh", args: ["-c", fixture], timeoutMs: 120_000, maxBytes: 1_000_000 });
+      expect(built.code).toBe(0);
+      const res = await docker.once({
+        role: "clone", image: cfg.docker.probeImage, network: "none", mounts: [`${volume}:/workspace`], entrypoint: "sh",
+        args: ["-c", WALK_SCRIPT, "walk", ...walkArguments()], timeoutMs: 120_000, maxBytes: 16_000_000,
+      });
+      expect(res.code).toBe(0);
+      const lines = res.stdout.split("\n");
+      const b = (s: string) => Buffer.from(s).toString("base64");
+      expect(lines).toContain("INCOMPLETE newline");
+      expect(lines).toContain("INCOMPLETE depth");
+      expect(lines).toContain("INCOMPLETE pattern");
+      expect(lines).toContain(`LINK ${b("setup.py")}`);
+      const w = parseProbeOutput(`HEAD ${"a".repeat(40)}\n${res.stdout}`).walk;
+      const paths = w.files.map((f) => f.path);
+      expect(paths).toContain("package.json");
+      expect(paths).toContain("sub/package.json");
+      expect(paths.some((p) => p.includes("node_modules"))).toBe(false);
+      expect(paths.some((p) => p.includes("l9"))).toBe(false);
+      expect(paths.some((p) => p.includes("\n"))).toBe(false);
+      expect(paths).not.toContain("setup.py");
+      expect(w.skippedLinks).toEqual(["setup.py"]);
+      const cfgFile = w.files.find((f) => f.path === "configure")!;
+      expect(cfgFile.truncated).toBe(true);
+      expect(cfgFile.content).toHaveLength(65_536);
+      expect(w.files.filter((f) => f.path.endsWith(".cmake"))).toHaveLength(40);
+      expect(await gone()).toBe("");
+    } finally {
+      await sweepOwn();
+      await removeVolumeChecked(volume, []);
+    }
+  }, 300_000);
+
+  it("times out a one-shot command, reports it and leaves no container", async () => {
+    const docker = new OneShotDocker(cfg, id);
+    await docker.ensureImage(ALPINE);
+    try {
+      const res = await docker.once({ role: "clone", image: ALPINE, network: "none", args: ["sleep", "30"], timeoutMs: 2000, maxBytes: 1_000_000 });
+      expect(res.timedOut).toBe(true);
+      expect(await gone()).toBe("");
+    } finally {
+      await sweepOwn();
+    }
+  }, 120_000);
+});
+
+/**
+ * Scanners, the copy and the leftovers sweep (leg 6). Every container and volume these cases make carries the
+ * describe's own installation id (cases a to d) or the sweep case's own (case e, over a fresh temporary data
+ * directory), and a name under the suite's prefix; every removal goes through the checked helpers.
+ */
+describe.skipIf(!enabled)("docker integration: scanners, the copy and the sweep", () => {
+  /** An installation id made for this describe alone. */
+  const id = randomBytes(4).toString("hex");
+  const cfg = loadConfig({ ...process.env, MCPE_NAME_PREFIX: prefix });
+  const docker = new OneShotDocker(cfg, id);
+  const own = ["ps", "-a", "--filter", `label=mcp-everything.owner=${id}`, "--format", '{{.Names}}\t{{.Label "mcp-everything.role"}}'];
+  const left = async () => (await run("docker", own, { timeoutMs: 30_000 })).stdout.trim();
+  const sweepOwn = async () => {
+    for (const line of (await left()).split("\n").filter(Boolean)) await removeContainerChecked(line.split("\t")[0]!, []);
+  };
+  const gone = async (): Promise<string> => {
+    const until = Date.now() + 10_000;
+    let now = await left();
+    while (now !== "" && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 500));
+      now = await left();
+    }
+    return now;
+  };
+  const hex = () => randomBytes(4).toString("hex");
+  const staging = `${prefix}scanstage-${hex()}`;
+  let dataDir: string;
+  let commit = "";
+  const scanner = (name: string, script: string, over: Partial<ScannerSpec> = {}): ScannerSpec => ({
+    name, image: ALPINE, command: ["sh", "-c", script], network: false, timeoutSec: 60, env: [], ...over,
+  });
+  const SARIF = JSON.stringify({
+    version: "2.1.0",
+    runs: [{ tool: { driver: { name: "fake" } }, results: [{ level: "error", ruleId: "E1", message: { text: "bad" } }, { level: "note", ruleId: "N1", message: { text: "fyi" } }] }],
+  });
+  /** A throwaway container over volumes, through the checked one-shot method (role clone). */
+  const over = (image: string, mounts: string[], script: string, caps: OneShotSpec["caps"] = []) =>
+    docker.once({ role: "clone", image, network: "none", mounts, entrypoint: "sh", caps, args: ["-c", script], timeoutMs: 120_000, maxBytes: 1_000_000 });
+
+  beforeAll(async () => {
+    expect(mayRemove(staging, [])).toBe(true);
+    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-scan-"));
+    await docker.ensureImage(ALPINE);
+    const data = await docker.probe(parseRepoRef("tomnomnom/gron", cfg.hosts), staging, { volumeRole: "staging" });
+    commit = data.commit;
+  }, 300_000);
+
+  afterAll(async () => {
+    await sweepOwn();
+    await removeVolumeChecked(staging, []).catch(() => undefined);
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }, 120_000);
+
+  it("(a) turns a scanner's SARIF into counts, and a scanner cannot write to the checkout", async () => {
+    try {
+      const out = await runScanners(docker, staging, [scanner("fake", `printf '%s' '${SARIF}'`), scanner("writer", "touch /scan/repo/x; echo \"touch exit $?\" >&2")], { totalTimeoutSec: 300, dataDir });
+      expect(out[0]).toMatchObject({ name: "fake", kind: "scanner", status: "ran", counts: { error: 1, warning: 0, note: 1 } });
+      expect(out[1]!.status).toBe("failed");
+      expect(out[1]!.error).toMatch(/Read-only file system/i);
+      const check = await over(ALPINE, [`${staging}:/w:ro`], "test ! -e /w/repo/x && test -d /w/repo/.git");
+      expect(check.code).toBe(0);
+      expect(await gone()).toBe("");
+    } finally {
+      await sweepOwn();
+    }
+  }, 300_000);
+
+  it("(b) fails a scanner that prints garbage, passes it a credential through a file that is gone afterwards, and redacts the value", async () => {
+    try {
+      const token = `tok-${hex()}-${hex()}`;
+      const out = await runScanners(docker, staging, [scanner("garbage", "echo not-sarif"), scanner("creds", 'echo "got $MCPE_IT_SCAN_TOKEN" >&2; echo nope', { env: ["MCPE_IT_SCAN_TOKEN"] })], {
+        totalTimeoutSec: 300, dataDir, env: { MCPE_IT_SCAN_TOKEN: token },
+      });
+      expect(out[0]).toMatchObject({ status: "failed", error: expect.stringContaining("output is not valid JSON") });
+      expect(out[1]!.status).toBe("failed");
+      expect(out[1]!.error).toContain("got [redacted]");
+      expect(JSON.stringify(out)).not.toContain(token);
+      const tmp = path.join(dataDir, "tmp");
+      expect(fs.existsSync(tmp) ? fs.readdirSync(tmp) : []).toEqual([]);
+      expect(await gone()).toBe("");
+    } finally {
+      await sweepOwn();
+    }
+  }, 300_000);
+
+  it("(c) times out a sleeping scanner within its budget and leaves no container", async () => {
+    try {
+      const t0 = Date.now();
+      const res = await docker.runScanner(staging, scanner("sleeper", "sleep 60"), { timeoutMs: 5000 });
+      expect(res.timedOut).toBe(true);
+      expect(Date.now() - t0).toBeLessThan(40_000);
+      expect(await gone()).toBe("");
+    } finally {
+      await sweepOwn();
+    }
+  }, 120_000);
+
+  it("(d) copies a staging volume exactly: an owner other than root's, a mode-000 directory, a link, an executable, and the checkout's HEAD", async () => {
+    const target = `${prefix}scancopy-${hex()}`;
+    expect(mayRemove(target, [])).toBe(true);
+    try {
+      // The container that adds the files is one-shot too; it needs CHOWN to give a file to uid 1234 and DAC_OVERRIDE to fill the directory it then locks.
+      await docker.ensureImage(cfg.docker.probeImage);
+      const add = await over(
+        ALPINE,
+        [`${staging}:/w`],
+        "set -e; cd /w/repo; echo owned > f1234; chown 1234:1234 f1234; mkdir noaccess; echo hidden > noaccess/inner; chmod 000 noaccess; ln -s no-such-target lnk; printf '#!/bin/sh\\n' > exe.sh; chmod 755 exe.sh",
+        ["CHOWN", "FOWNER", "DAC_OVERRIDE", "FSETID"],
+      );
+      expect(add.code).toBe(0);
+      await docker.createSandboxVolume(target);
+      await docker.copyVolume(staging, target);
+      const seen = await over(ALPINE, [`${target}:/w:ro`], "cd /w/repo; stat -c '%n %u:%g %a' f1234 noaccess exe.sh lnk; readlink lnk; cat noaccess/inner", ["DAC_OVERRIDE"]);
+      expect(seen.code, seen.stderr).toBe(0);
+      expect(seen.stdout.split("\n")).toEqual(["f1234 1234:1234 644", "noaccess 0:0 0", "exe.sh 0:0 755", "lnk 0:0 777", "no-such-target", "hidden", ""]);
+      const head = await docker.once({
+        role: "clone", image: cfg.docker.probeImage, network: "none", mounts: [`${target}:/w:ro`], entrypoint: "git",
+        args: ["-c", "safe.directory=*", "-C", "/w/repo", "rev-parse", "HEAD"], timeoutMs: 120_000, maxBytes: 1_000_000,
+      });
+      expect(head.stdout.trim()).toBe(commit);
+      // The target is a sandbox volume: owned, and with no role.
+      const labels = await run("docker", ["volume", "inspect", "--format", "{{json .Labels}}", target], { timeoutMs: 30_000 });
+      expect(JSON.parse(labels.stdout)).toEqual({ "mcp-everything": "1", "mcp-everything.owner": id });
+      expect(await gone()).toBe("");
+    } finally {
+      await sweepOwn();
+      await removeVolumeChecked(target, []).catch(() => undefined);
+    }
+  }, 300_000);
+
+  it("(e) sweeps this installation's old staging volume and scan container, and leaves another owner's volume and container", async () => {
+    // Its own data directory, so its own installation id: never the operator's default, whose live staging a maxAgeSec of 0 would sweep.
+    const sweepDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-sweep-"));
+    const sid = loadInstallationId(sweepDir);
+    const other = sid === "deadbeef" ? "feedface" : "deadbeef";
+    const sweeper = new Docker(loadConfig({ ...process.env, MCPE_DATA_DIR: sweepDir, MCPE_NAME_PREFIX: prefix }), sid);
+    const n = (what: string) => `${prefix}sweep-${what}-${hex()}`;
+    const mineStaging = n("stage");
+    const mineScan = n("scan");
+    const mineSandboxVol = n("sbvol");
+    const otherVol = n("othervol");
+    const otherScan = n("otherscan");
+    const labels = (owner: string, role?: string) => ["--label", "mcp-everything=1", "--label", `mcp-everything.owner=${owner}`, ...(role ? ["--label", `mcp-everything.role=${role}`] : [])];
+    const volume = (name: string, owner: string, role?: string) => run("docker", ["volume", "create", ...labels(owner, role), name], { timeoutMs: 30_000 });
+    const container = async (name: string, owner: string, role: string) => (await run("docker", ["create", "--name", name, ...labels(owner, role), ALPINE, "true"], { timeoutMs: 60_000 })).stdout.trim();
+    const names = [mineStaging, mineScan, mineSandboxVol, otherVol, otherScan];
+    for (const name of names) expect(mayRemove(name, [])).toBe(true);
+    const listed = async (owner: string) => ({
+      containers: (await run("docker", ["ps", "-a", "--filter", `label=mcp-everything.owner=${owner}`, "--format", "{{.Names}}"], { timeoutMs: 30_000 })).stdout.split("\n").filter(Boolean).sort(),
+      volumes: (await run("docker", ["volume", "ls", "--filter", `label=mcp-everything.owner=${owner}`, "--format", "{{.Name}}"], { timeoutMs: 30_000 })).stdout.split("\n").filter(Boolean).sort(),
+    });
+    try {
+      expect((await listed(sid)).containers).toEqual([]);
+      expect((await listed(sid)).volumes).toEqual([]);
+      for (const r of [await volume(mineStaging, sid, "staging"), await volume(mineSandboxVol, sid), await volume(otherVol, other, "staging")]) expect(r.code).toBe(0);
+      const mineScanId = await container(mineScan, sid, "scan");
+      expect(mineScanId).toMatch(/^[0-9a-f]{64}$/);
+      expect(await container(otherScan, other, "scan")).toMatch(/^[0-9a-f]{64}$/);
+      // Before sweeping, what this installation's id owns is exactly what this case made, and nothing else.
+      expect(await listed(sid)).toEqual({ containers: [mineScan], volumes: [mineSandboxVol, mineStaging].sort() });
+      await new Promise((r) => setTimeout(r, 1100));
+
+      const r = await sweeper.sweepCheckLeftovers(0);
+      expect(r.failures).toBe(0);
+      expect([...r.removed].sort()).toEqual([mineScanId, mineStaging].sort());
+      expect(await listed(sid)).toEqual({ containers: [], volumes: [mineSandboxVol] });
+      expect(await listed(other)).toEqual({ containers: [otherScan], volumes: [otherVol] });
+    } finally {
+      for (const name of [mineScan, otherScan]) await removeContainerChecked(name, []).catch(() => undefined);
+      for (const name of [mineStaging, mineSandboxVol, otherVol]) await removeVolumeChecked(name, []).catch(() => undefined);
+      fs.rmSync(sweepDir, { recursive: true, force: true });
+    }
+  }, 120_000);
+});
+
+describe.skipIf(!enabled)("docker integration: the checked install through the server", () => {
+  /** Set by `beforeAll` when every guard has passed, and by nothing else. */
+  let safe = false;
+  let dir = "";
+  let id = "";
+  const apps: App[] = [];
+  let blocking: App;
+  let scanOff: App;
+  let warning: App;
+  const proceed = (): void => {
+    if (!safe) throw new Error("a guard failed in beforeAll: no Docker command is issued");
+  };
+  /** One fake scanner from the pinned alpine that always prints one `error` result. */
+  const SARIF = JSON.stringify({ version: "2.1.0", runs: [{ tool: { driver: { name: "fake" } }, results: [{ level: "error", ruleId: "FAKE1", message: { text: "always an error" } }] }] });
+
+  /** An App on this describe's own directory, with a name prefix under the suite's, whatever the ambient environment says. */
+  function appOn(mode: "off" | "warn" | "block"): App {
+    if (!isUnderTmp(dir) || !dir.includes("mcpe-it-chk-")) throw new Error("not the directory this describe made");
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of ["MCPE_SCAN_BLOCK_AT", "MCPE_SCAN_TIMEOUT", "MCPE_SCANNERS"]) delete env[k];
+    Object.assign(env, {
+      MCPE_DATA_DIR: dir,
+      MCPE_NAME_PREFIX: `${prefix}chk-`,
+      MCPE_SCAN: mode,
+      MCPE_SCANNERS: path.join(dir, "scanners.json"),
+      MCPE_TOOL_TIMEOUT: "20",
+    });
+    const cfg = loadConfig(env);
+    expect(cfg.dataDir).toBe(dir);
+    expect(cfg.docker.namePrefix.startsWith(prefix)).toBe(true);
+    const made = new App({ cfg });
+    apps.push(made);
+    return made;
+  }
+
+  /** This installation's containers and volumes: name and role, by owner label. */
+  const objects = async () => {
+    const list = async (args: string[]) => (await run("docker", args, { timeoutMs: 60_000 })).stdout.split("\n").filter(Boolean);
+    const format = '{{.Names}}\t{{.Label "mcp-everything.role"}}';
+    const vformat = '{{.Name}}\t{{.Label "mcp-everything.role"}}';
+    return {
+      containers: await list(["ps", "-a", "--filter", `label=mcp-everything.owner=${id}`, "--format", format]),
+      volumes: await list(["volume", "ls", "--filter", `label=mcp-everything.owner=${id}`, "--format", vformat]),
+    };
+  };
+  const roleLabelled = async () => {
+    const o = await objects();
+    return [...o.containers, ...o.volumes].filter((l) => (l.split("\t")[1] ?? "") !== "");
+  };
+  const noRoleLeft = async (): Promise<string[]> => {
+    const until = Date.now() + 10_000;
+    let now = await roleLabelled();
+    while (now.length > 0 && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 500));
+      now = await roleLabelled();
+    }
+    return now;
+  };
+  const containerId = async (name: string) => {
+    const res = await run("docker", ["inspect", "--type", "container", "--format", "{{.Id}}", name], { timeoutMs: 30_000 });
+    expect(res.code, `inspect ${name}: ${res.stderr}`).toBe(0);
+    return res.stdout.trim();
+  };
+
+  beforeAll(() => {
+    assertNameCheckBehaves();
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-chk-"));
+    expect(isUnderTmp(dir)).toBe(true);
+    // Never the operator's default data directory or registry.
+    expect(dir).not.toBe(loadConfig({ ...process.env, MCPE_SCAN: "off", MCPE_SCANNERS: "" }).dataDir);
+    fs.writeFileSync(
+      path.join(dir, "scanners.json"),
+      JSON.stringify({ scanners: [{ name: "fake", image: ALPINE, command: ["sh", "-c", `printf '%s' '${SARIF}'`], timeout_seconds: 60 }] }),
+    );
+    blocking = appOn("block");
+    scanOff = appOn("off");
+    warning = appOn("warn");
+    id = blocking.docker.installationId;
+    expect(id).toMatch(HEX8);
+    // Its own installation: the id came from this directory's file, and all three Apps share it.
+    expect(fs.readFileSync(path.join(dir, "installation-id"), "utf8").trim()).toBe(id);
+    expect(scanOff.docker.installationId).toBe(id);
+    expect(warning.docker.installationId).toBe(id);
+    expect(blocking.registry.list()).toEqual([]);
+    console.log(`checked install: installation ${id} (${dir})`);
+    safe = true;
+  }, 30_000);
+
+  afterAll(async () => {
+    try {
+      await Promise.allSettled(apps.map((a) => a.shutdown()));
+      if (safe) {
+        warning.registry.refresh();
+        for (const p of warning.registry.list()) await warning.installer.uninstall(p).catch(() => undefined);
+        // Anything left that carries this installation's label (names are under the suite's prefix, which the checked helpers insist on).
+        const left = await objects();
+        for (const l of left.containers) await removeContainerChecked(l.split("\t")[0]!, []);
+        for (const l of left.volumes) await removeVolumeChecked(l.split("\t")[0]!, []);
+        const after = await objects();
+        expect(after.containers, `containers of ${id}`).toEqual([]);
+        expect(after.volumes, `volumes of ${id}`).toEqual([]);
+      }
+    } finally {
+      if (isUnderTmp(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 300_000);
+
+  it("(a) a blocked first install leaves no record and no role-labelled container or volume of this installation", async () => {
+    proceed();
+    const res = await blocking.callTool("install_project", { repo: "tomnomnom/gron" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/^Blocked by the scan policy: blocked: 1 finding at error or above, from fake\. Nothing was installed\./);
+    expect(text(res)).toContain("[error] FAKE1: always an error");
+    expect(text(res)).not.toMatch(/Generated tools are callable/);
+    blocking.registry.refresh();
+    expect(blocking.registry.list()).toEqual([]);
+    expect(await noRoleLeft()).toEqual([]);
+    expect(await objects()).toEqual({ containers: [], volumes: [] });
+  }, 900_000);
+
+  it("(b) a blocked reinstall leaves the project as it was: its tool still runs, and the warning names the commit", async () => {
+    proceed();
+    const first = await scanOff.callTool("install_project", { repo: "tomnomnom/gron" });
+    expect(first.isError).toBe(false);
+    expect(text(first)).toMatch(/gron — github:tomnomnom\/gron \(ready\)/);
+    const before = scanOff.registry.get("gron")!;
+    expect(before.scan).toBeUndefined();
+    const containerBefore = await containerId(before.container);
+
+    const res = await blocking.callTool("install_project", { repo: "tomnomnom/gron", reinstall: true });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/^Blocked by the scan policy: /);
+    expect(text(res)).toContain(`gron was left as it was, at commit ${before.commit!.slice(0, 12)}.`);
+
+    const run1 = await blocking.callTool("call_project_tool", { tool: "gron__gron", arguments: { stdin: '{"a":[1,2]}' } });
+    expect(text(run1)).toContain("json.a[1] = 2;");
+    expect(await containerId(before.container)).toBe(containerBefore);
+
+    blocking.registry.refresh();
+    const after = blocking.registry.get("gron")!;
+    expect(after.status).toBe("ready");
+    expect(after.container).toBe(before.container);
+    expect(after.warnings.some((w) => w.includes(after.commit!.slice(0, 12)) || /blocked by the scan policy/.test(w))).toBe(true);
+    // The warning names the scanned commit, which a blocked reinstall of an unchanged head shares with the record's.
+    expect(after.warnings.join("\n")).toMatch(/A reinstall at commit [0-9a-f]{12} was blocked by the scan policy on \d{4}-\d{2}-\d{2}/);
+    expect(await noRoleLeft()).toEqual([]);
+  }, 900_000);
+
+  it("(c) in warn mode a reinstall builds, records the scan, and its checkout is the scanned commit", async () => {
+    proceed();
+    const res = await warning.callTool("install_project", { repo: "tomnomnom/gron", reinstall: true });
+    expect(res.isError).toBe(false);
+    expect(text(res)).toMatch(/gron — github:tomnomnom\/gron \(ready\)/);
+    warning.registry.refresh();
+    const rec = warning.registry.get("gron")!;
+    expect(rec.status).toBe("ready");
+    expect(rec.scan).toBeDefined();
+    const fake = rec.scan!.checks.find((c) => c.name === "fake")!;
+    expect(fake.status).toBe("ran");
+    expect(fake.counts.error).toBe(1);
+    expect(rec.scan!.decision.verdict).toBe("build");
+    expect(rec.scan!.decision.mode).toBe("warn");
+    const head = await warning.callTool("sandbox_exec", { project: "gron", command: "git -c safe.directory='*' -C /workspace/repo rev-parse HEAD" });
+    expect(text(head)).toContain(rec.scan!.commit);
+    expect(rec.commit).toBe(rec.scan!.commit);
+    const out = await warning.callTool("gron__gron", { stdin: '{"a":[1,2]}' });
+    expect(text(out)).toContain("json.a[1] = 2;");
+    expect(await noRoleLeft()).toEqual([]);
+  }, 900_000);
+});
+
+describe.skipIf(!enabled)("docker integration: the check tool", () => {
+  /** Set by `beforeAll` when every guard has passed, and by nothing else. */
+  let safe = false;
+  let dir = "";
+  let id = "";
+  let checker: App;
+  const proceed = (): void => {
+    if (!safe) throw new Error("a guard failed in beforeAll: no Docker command is issued");
+  };
+
+  /** This installation's containers and volumes: name and role, by owner label. */
+  const objects = async () => {
+    const list = async (args: string[]) => (await run("docker", args, { timeoutMs: 60_000 })).stdout.split("\n").filter(Boolean);
+    return {
+      containers: await list(["ps", "-a", "--filter", `label=mcp-everything.owner=${id}`, "--format", '{{.Names}}\t{{.Label "mcp-everything.role"}}']),
+      volumes: await list(["volume", "ls", "--filter", `label=mcp-everything.owner=${id}`, "--format", '{{.Name}}\t{{.Label "mcp-everything.role"}}']),
+    };
+  };
+  const roleLabelled = async () => {
+    const o = await objects();
+    return [...o.containers, ...o.volumes].filter((l) => (l.split("\t")[1] ?? "") !== "");
+  };
+
+  beforeAll(() => {
+    assertNameCheckBehaves();
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-ckt-"));
+    expect(isUnderTmp(dir)).toBe(true);
+    // Never the operator's default data directory or registry.
+    expect(dir).not.toBe(loadConfig({ ...process.env, MCPE_SCAN: "off", MCPE_SCANNERS: "" }).dataDir);
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of ["MCPE_SCAN_BLOCK_AT", "MCPE_SCAN_TIMEOUT", "MCPE_SCANNERS"]) delete env[k];
+    Object.assign(env, { MCPE_DATA_DIR: dir, MCPE_NAME_PREFIX: `${prefix}ckt-`, MCPE_SCAN: "off" });
+    const cfg = loadConfig(env);
+    expect(cfg.dataDir).toBe(dir);
+    expect(cfg.docker.namePrefix.startsWith(prefix)).toBe(true);
+    expect(cfg.scan.scanners).toEqual([]);
+    checker = new App({ cfg });
+    id = checker.docker.installationId;
+    expect(id).toMatch(HEX8);
+    expect(fs.readFileSync(path.join(dir, "installation-id"), "utf8").trim()).toBe(id);
+    expect(checker.registry.list()).toEqual([]);
+    console.log(`check tool: installation ${id} (${dir})`);
+    safe = true;
+  }, 30_000);
+
+  afterAll(async () => {
+    try {
+      await checker?.shutdown();
+      if (safe) {
+        const left = await objects();
+        for (const l of left.containers) await removeContainerChecked(l.split("\t")[0]!, []);
+        for (const l of left.volumes) await removeVolumeChecked(l.split("\t")[0]!, []);
+        const after = await objects();
+        expect(after.containers, `containers of ${id}`).toEqual([]);
+        expect(after.volumes, `volumes of ${id}`).toEqual([]);
+      }
+    } finally {
+      if (isUnderTmp(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("(d) with scanning off, check_project of gron reports the commit and a build-hooks check, and leaves nothing behind", async () => {
+    proceed();
+    const res = await checker.callTool("check_project", { repo: "tomnomnom/gron" });
+    expect(res.isError).toBe(false);
+    const t = text(res);
+    expect(t).toMatch(/Checked github:tomnomnom\/gron at commit [0-9a-f]{40}\./);
+    expect(t).toMatch(/- build-hooks: ran;/);
+    expect(t).toMatch(/`go install` runs nothing from the repository/);
+    expect(t).toContain("Installs are not scanned at present");
+    checker.registry.refresh();
+    expect(checker.registry.list()).toEqual([]);
+    const until = Date.now() + 10_000;
+    let left = await roleLabelled();
+    while (left.length > 0 && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 500));
+      left = await roleLabelled();
+    }
+    expect(left).toEqual([]);
+    expect(await objects()).toEqual({ containers: [], volumes: [] });
+  }, 900_000);
 });

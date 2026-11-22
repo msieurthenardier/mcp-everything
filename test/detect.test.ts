@@ -11,6 +11,7 @@ function probe(files: Record<string, string>, extra: string[] = [], dirs: string
       ...dirs.map((name) => ({ name, dir: true })),
     ],
     files,
+    walk: { files: [] },
   };
 }
 

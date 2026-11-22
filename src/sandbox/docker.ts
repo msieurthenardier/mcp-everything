@@ -1,8 +1,12 @@
+import { randomBytes } from "node:crypto";
 import type { Config } from "../config.js";
 import { isInstallationId } from "../installation.js";
 import type { RepoRef } from "../types.js";
 import { run, type RunResult } from "../util/exec.js";
+import { BUILD_FILE_PATTERNS, PRUNE_DIRS } from "../scan/build-hooks.js";
+import type { BuildFile, BuildWalk } from "../scan/types.js";
 import { oneLine } from "../util/text.js";
+import type { ScannerSpec } from "../scan/types.js";
 
 /** Paths inside every sandbox. */
 export const WORKSPACE = "/workspace";
@@ -20,6 +24,8 @@ export interface ProbeData {
   entries: Array<{ name: string; dir: boolean }>;
   /** Contents of well-known manifest files, keyed by file name. */
   files: Record<string, string>;
+  /** The build files the walk of the clone read (see WALK_SCRIPT). Always present. */
+  walk: BuildWalk;
 }
 
 export interface ExecOptions {
@@ -40,7 +46,7 @@ export interface ExecResult extends RunResult {
   timedOut: boolean;
 }
 
-const MANIFESTS = [
+export const MANIFESTS = [
   "package.json",
   "pnpm-lock.yaml",
   "pyproject.toml",
@@ -66,7 +72,7 @@ const MANIFESTS = [
 // Runs in the probe image (busybox sh). Every untrusted value is a positional
 // parameter; all file names and contents come back base64-encoded so repository
 // content cannot forge protocol lines.
-const PROBE_SCRIPT = `
+const CLONE_SCRIPT = `
 set -eu
 url="$1"; ref="$2"; submodules="$3"; shift 3
 export GIT_TERMINAL_PROMPT=0
@@ -91,12 +97,126 @@ ls -1A | head -n 500 | while IFS= read -r f; do
   kind=f; [ -d "$f" ] && kind=d
   printf 'ENTRY %s %s\\n' "$kind" "$(printf %s "$f" | base64 | tr -d '\\n')"
 done
-for f in "$@"; do
+while [ $# -gt 0 ] && [ "$1" != "--walk--" ]; do
+  f="$1"; shift
   if [ -f "$f" ] && [ ! -L "$f" ]; then
     printf 'FILE %s %s\\n' "$f" "$(head -c 300000 "$f" | base64 | tr -d '\\n')"
   fi
 done
+if [ $# -gt 0 ]; then shift; fi
 `;
+
+/** The marker argument that ends the manifest names and begins the walk's arguments. */
+export const WALK_SEPARATOR = "--walk--";
+
+/**
+ * The walk's arguments, after the separator: the number of pruned directory names, those names, then one
+ * quadruple per pattern: `kind pattern rootOnly presenceOnly` (flags `1` or `0`). They are data: the script
+ * only ever uses them quoted, as `find` operands. None holds a shell-special character other than the glob `*`
+ * (which is only ever an operand of `-name`).
+ */
+export function walkArguments(): string[] {
+  return [
+    String(PRUNE_DIRS.length),
+    ...PRUNE_DIRS,
+    ...BUILD_FILE_PATTERNS.flatMap((e) => [e.kind, e.pattern, e.rootOnly ? "1" : "0", e.presenceOnly ? "1" : "0"]),
+  ];
+}
+
+// Appended to CLONE_SCRIPT (and run alone by the tests, which is why it enters the checkout itself). Its
+// arguments are those of walkArguments(). It reads the build files named by the patterns, within budgets (200
+// files, 64 KB each, 2 MB in all, 40 per pattern), and says what it could not read: every `INCOMPLETE` line
+// names a reason, and a link is reported, never read. Nothing here may make the script fail once the clone
+// has succeeded, so `-eu` is turned off first and the script ends with `exit 0`. All names and contents are
+// base64, so repository text cannot forge a line. The arguments are used only quoted, never `eval`ed.
+export const WALK_SCRIPT = `
+set +eu
+cd ${REPO_DIR}
+b64() { printf %s "$1" | base64 | tr -d '\\n'; }
+np="$1"; shift
+prune=""; i=0
+while [ "$i" -lt "$np" ]; do prune="$prune $1"; shift; i=$((i + 1)); done
+# wfind <depth option> <depth> <-name|-path> <pattern>: files and links under the checkout, pruning .git and the prune names.
+wfind() {
+  d1="$1"; d2="$2"; t="$3"; pat="$4"
+  set -- \\( -name .git
+  set -f
+  for p in $prune; do set -- "$@" -o -name "$p"; done
+  set +f
+  find . "$d1" "$d2" "$@" \\) -prune -o \\( -type f -o -type l \\) "$t" "$pat" -print
+}
+walkfind() { { wfind "$@" || echo '#WALKFAIL'; }; }
+verdict() {
+  case "$1" in
+    '#WALKFAIL'*) echo 'INCOMPLETE walk' ;;
+    ?*) echo "INCOMPLETE $2" ;;
+  esac
+}
+nlpat=$(printf '*\\n*')
+verdict "$(walkfind -mindepth 0 -path "$nlpat" | head -n 1)" newline
+all=""
+rootlist=""
+while [ "$#" -ge 4 ]; do
+  kind="$1"; pat="$2"; root="$3"; presence="$4"; shift 4
+  case "$kind" in
+    name|glob) t=-name ;;
+    path) t=-path ;;
+    *) continue ;;
+  esac
+  if [ "$root" = 1 ] && [ "$kind" != glob ]; then
+    if [ "$presence" = 1 ]; then
+      if [ -L "./$pat" ]; then echo "LINK $(b64 "$pat")"
+      elif [ -f "./$pat" ]; then echo "BUILD $(b64 "$pat") 0 "
+      fi
+    elif [ -L "./$pat" ] || [ -f "./$pat" ]; then
+      rootlist="$rootlist
+./$pat"
+    fi
+    continue
+  fi
+  if [ "$root" = 1 ]; then maxd=1; else maxd=8; fi
+  if [ "$kind" = path ]; then pat="*/$pat"; fi
+  # Root-level matches (and the failure marker) sort first, so the cap never drops them for nested files.
+  out=$(walkfind -maxdepth "$maxd" "$t" "$pat" | sed -E 's,^(\\./[^/]*|#WALKFAIL)$,0&,;ta;s,^,1,;:a' | sort | head -n 41 | cut -c2-)
+  if [ -n "$out" ] && [ "$(printf '%s\\n' "$out" | wc -l)" -ge 41 ]; then
+    echo 'INCOMPLETE pattern'
+    out=$(printf '%s\\n' "$out" | head -n 40)
+  fi
+  all="$all
+$out"
+  if [ "$root" != 1 ]; then
+    verdict "$(walkfind -mindepth 9 "$t" "$pat" | head -n 1)" depth
+  fi
+done
+found=$(printf '%s\\n' "$all" | sort -u)
+near=$(printf '%s\\n' "$found" | grep -E '^(\\./[^/]*|#WALKFAIL)$')
+far=$(printf '%s\\n' "$found" | grep -vE '^(\\./[^/]*|#WALKFAIL)$')
+files=0; bytes=0
+printf '%s\\n%s\\n%s\\n' "$rootlist" "$near" "$far" | {
+  while IFS= read -r line; do
+    case "$line" in
+      '') continue ;;
+      '#WALKFAIL') echo 'INCOMPLETE walk'; continue ;;
+      ./*) ;;
+      *) continue ;;
+    esac
+    p="\${line#./}"
+    if [ -L "$line" ]; then echo "LINK $(b64 "$p")"; continue; fi
+    [ -f "$line" ] || continue
+    size=$(wc -c < "$line"); size=$((size + 0))
+    trunc=0; take=$size
+    if [ "$size" -gt 65536 ]; then trunc=1; take=65536; fi
+    if [ "$files" -ge 200 ]; then echo 'INCOMPLETE files'; break; fi
+    if [ $((bytes + take)) -gt 2097152 ]; then echo 'INCOMPLETE bytes'; break; fi
+    files=$((files + 1)); bytes=$((bytes + take))
+    echo "BUILD $(b64 "$p") $trunc $(head -c 65536 "$line" | base64 | tr -d '\\n')"
+  done
+}
+exit 0
+`;
+
+/** The clone script followed by the walk: what the probe container runs. Exported for tests. */
+export const PROBE_SCRIPT = CLONE_SCRIPT + WALK_SCRIPT;
 
 // Entrypoint of every sandbox with an idle timeout: $1 is the timeout and $2 the
 // poll interval, both in seconds. Exits 0 (stopping the container) once nothing
@@ -114,9 +234,10 @@ done
 // cases in test/integration/docker.test.ts, which `npm run test:docker` skips.
 // Run `npm run test:docker:pressure` after changing this script or the images.
 // The guard was measured on dash 0.5.12 (Debian 13, `buildpack-deps:stable`) and
-// BusyBox 1.37.0 `sh` (Alpine 3.24, `alpine/git:latest`) in November 2026. Both tags
-// float, so a newer shell behind either is untested until the pressure cases have
-// been run against it.
+// BusyBox 1.37.0 `sh` (Alpine 3.24, the pinned `alpine/git` image of `probeImage` in
+// src/config.ts) in November 2026. The dash tag floats, so a newer shell behind it
+// is untested until the pressure cases have been run against it; the pin changes
+// only when someone bumps it, and the cases should be run then too.
 const WATCHDOG_SCRIPT = `
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 idle="$1"; poll="$2"
@@ -174,10 +295,20 @@ export function isStoppedExecFailure(r: {
   return false;
 }
 
-export function parseProbeOutput(stdout: string): ProbeData {
-  const data: ProbeData = { commit: "", entries: [], files: {} };
+const INCOMPLETE_REASONS = ["pattern", "newline", "depth", "files", "bytes", "walk"];
+
+/**
+ * Parse the clone's stdout. Lines are matched exactly (no trimming): `BUILD` has four space-separated parts
+ * (the fourth may be empty), `LINK` and `INCOMPLETE` two. `outputTruncated` says the capture hit its cap:
+ * the last line may then be partial and is dropped, and the walk is marked incomplete.
+ */
+export function parseProbeOutput(stdout: string, outputTruncated = false): ProbeData {
+  const data: ProbeData = { commit: "", entries: [], files: {}, walk: { files: [] } };
   const b64 = (s: string | undefined) => Buffer.from(s ?? "", "base64").toString("utf8");
-  for (const line of stdout.split("\n")) {
+  const lines = stdout.split("\n");
+  if (outputTruncated) lines.pop();
+  const skipped: string[] = [];
+  for (const line of lines) {
     const parts = line.split(" ");
     if (parts[0] === "HEAD" && /^[0-9a-f]{40,64}$/.test(parts[1] ?? "")) {
       data.commit = parts[1]!;
@@ -185,8 +316,18 @@ export function parseProbeOutput(stdout: string): ProbeData {
       data.entries.push({ name: b64(parts[2]), dir: parts[1] === "d" });
     } else if (parts[0] === "FILE" && parts.length === 3 && MANIFESTS.includes(parts[1]!)) {
       data.files[parts[1]!] = b64(parts[2]);
+    } else if (parts[0] === "BUILD" && parts.length === 4 && (parts[2] === "0" || parts[2] === "1")) {
+      const file: BuildFile = { path: b64(parts[1]), content: b64(parts[3]) };
+      if (parts[2] === "1") file.truncated = true;
+      data.walk.files.push(file);
+    } else if (parts[0] === "LINK" && parts.length === 2) {
+      skipped.push(b64(parts[1]));
+    } else if (parts[0] === "INCOMPLETE" && parts.length === 2 && INCOMPLETE_REASONS.includes(parts[1]!)) {
+      data.walk.incomplete ??= parts[1]!;
     }
   }
+  if (skipped.length > 0) data.walk.skippedLinks = skipped;
+  if (outputTruncated) data.walk.incomplete = "output";
   return data;
 }
 
@@ -291,6 +432,14 @@ export class SandboxRefusedError extends Error {
   }
 }
 
+/** A volume a method was given is missing, from before ownership, or has the wrong role: nothing was created. */
+export class VolumeNotUsableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VolumeNotUsableError";
+  }
+}
+
 /** Docker could not be asked, or answered in a way that cannot be read: nothing was assumed. */
 export class DockerUnavailableError extends Error {
   constructor(message: string) {
@@ -301,6 +450,33 @@ export class DockerUnavailableError extends Error {
 
 const NOT_THERE = /no such (container|object|volume)/i;
 const FULL_ID = /^[0-9a-f]{64}$/;
+const ROLE_LABEL = "mcp-everything.role";
+const ONE_SHOT_ROLES: readonly string[] = ["clone", "scan", "copy"];
+const EXTRA_CAPS: readonly string[] = ["CHOWN", "FOWNER", "DAC_OVERRIDE", "FSETID"];
+
+/** What a one-shot container is for; the label and the name carry it, and nothing a caller types. */
+export type OneShotRole = "clone" | "scan" | "copy";
+/** The only capabilities a one-shot container may be given beyond none. */
+export type OneShotCap = "CHOWN" | "FOWNER" | "DAC_OVERRIDE" | "FSETID";
+export interface OneShotSpec {
+  role: OneShotRole;
+  image: string;
+  network: string;
+  /** `-v` values, `<volume>:<path>[:ro]`. Callers must have classified the volumes. */
+  mounts?: string[];
+  /** `--mount` values (a read-only mount needs the long form's `readonly`). Callers must have classified the volumes. */
+  mountFlags?: string[];
+  /** A file of NAME=value lines for `--env-file`; the caller writes it, guards it and removes it. */
+  envFile?: string;
+  workdir?: string;
+  /** When omitted, no `--entrypoint` flag: the image's own entrypoint runs. */
+  entrypoint?: string;
+  caps?: OneShotCap[];
+  /** Arguments after the image. */
+  args: string[];
+  timeoutMs: number;
+  maxBytes: number;
+}
 // A format that label content cannot confuse (every value is JSON). Never `{{json .}}`: it holds the environment.
 const NETWORKS = '"networks":{{json .NetworkSettings.Networks}}';
 const BASE_FORMAT = `{"id":{{json .Id}},"running":{{json .State.Running}},${NETWORKS}}`;
@@ -444,11 +620,12 @@ export class Docker {
     return new Error(`Sandbox ${clean(name)} does not exist`);
   }
 
-  async ensureImage(image: string, onOutput?: (chunk: string) => void): Promise<void> {
+  /** `pullTimeoutMs` bounds the pull only (default 900 s); the local inspect keeps its own 30 s. */
+  async ensureImage(image: string, onOutput?: (chunk: string) => void, pullTimeoutMs = 900_000): Promise<void> {
     const have = await this.docker(["image", "inspect", "--format", "{{.Id}}", image], { timeoutMs: 30_000 });
     if (have.code === 0) return;
     onOutput?.(`Pulling image ${image}…\n`);
-    const pull = await this.docker(["pull", "--quiet", image], { timeoutMs: 900_000 });
+    const pull = await this.docker(["pull", "--quiet", image], { timeoutMs: pullTimeoutMs });
     if (pull.code !== 0) throw new Error(`Failed to pull image ${image}: ${pull.stderr.trim()}`);
   }
 
@@ -479,39 +656,305 @@ export class Docker {
     return args;
   }
 
-  /** Clone the repository into a fresh volume and report what is in it. */
-  async probe(
-    repo: RepoRef,
-    volume: string,
-    opts: { ref?: string; submodules?: boolean; onOutput?: (chunk: string) => void },
-  ): Promise<ProbeData> {
-    // The name must be free: never build on a volume somebody else may own.
+  /**
+   * Run one command in a fresh, owned, named, one-shot container and remove it by id whatever
+   * happens (success, failure, a timeout, a throw). `docker run --rm` cannot do that: a timeout
+   * kills only the `docker` client and leaves the container running. So: `create --rm` (the
+   * daemon also removes it on exit, which keeps a crashed Node process from leaking an exited
+   * one), `start -a <id>` through `run()`, and `rm -f <id>` in a `finally`.
+   *
+   * It mounts whatever it is given. It acts only on the container it made, so it is not in the
+   * guarded table; callers must classify every volume they pass (mine, staging, sandbox) first.
+   * A Node process killed mid-call leaves a container named `...-<role>-<hex>` with the label
+   * `mcp-everything.role`; leg 6's startup sweep removes those.
+   *
+   * No caller text reaches the name or the labels: the role is a closed type and the rest is
+   * the installation id and random hexadecimal.
+   */
+  protected async runOnce(spec: OneShotSpec): Promise<RunResult> {
+    if (!ONE_SHOT_ROLES.includes(spec.role)) throw new Error(`Unknown one-shot role ${JSON.stringify(spec.role)}`);
+    const caps = spec.caps ?? [];
+    for (const c of caps) if (!EXTRA_CAPS.includes(c)) throw new Error(`Capability ${JSON.stringify(c)} is not one a one-shot container may have`);
+    const name = `${this.cfg.docker.namePrefix}${this.installationId}-${spec.role}-${randomBytes(4).toString("hex")}`;
+    const created = await this.docker(
+      [
+        "create", "--rm",
+        "--name", name,
+        "--label", "mcp-everything=1",
+        "--label", `${OWNER_LABEL}=${this.installationId}`,
+        "--label", `${ROLE_LABEL}=${spec.role}`,
+        ...this.limits(),
+        ...caps.flatMap((c) => ["--cap-add", c]),
+        "--network", spec.network,
+        ...(spec.mounts ?? []).flatMap((m) => ["-v", m]),
+        ...(spec.mountFlags ?? []).flatMap((m) => ["--mount", m]),
+        ...(spec.envFile !== undefined ? ["--env-file", spec.envFile] : []),
+        ...(spec.workdir !== undefined ? ["-w", spec.workdir] : []),
+        ...(spec.entrypoint !== undefined ? ["--entrypoint", spec.entrypoint] : []),
+        spec.image,
+        ...spec.args,
+      ],
+      { timeoutMs: 60_000 },
+    );
+    if (created.timedOut) {
+      // The daemon may have made the container under this call's own random name. Remove it by that name.
+      // Residual risk: it may still be created after this; leg 6's startup sweep removes it.
+      await this.docker(["rm", "-f", name], { timeoutMs: 30_000 }).catch(() => undefined);
+      throw new Error(`Could not create the ${spec.role} container: docker create timed out`);
+    }
+    const id = created.stdout.trim();
+    if (created.code !== 0) throw new Error(`Could not create the ${spec.role} container: ${created.stderr.trim().split("\n").slice(-3).join("\n") || "docker create failed"}`);
+    if (!FULL_ID.test(id)) throw new Error(`Could not create the ${spec.role} container: Docker printed no usable id: ${oneLine(id, 80) || "(nothing)"}`);
+    try {
+      return await this.docker(["start", "-a", id], { timeoutMs: spec.timeoutMs, maxBytes: spec.maxBytes });
+    } finally {
+      try {
+        // "No such container" is success (--rm may have removed it). Any other failure is ignored: it must
+        // never mask the command's outcome, and leg 6's startup sweep removes what is left.
+        await this.docker(["rm", "-f", id], { timeoutMs: 60_000 });
+      } catch {
+        /* as above */
+      }
+    }
+  }
+
+  /** The name must be free: never build on a volume somebody else may own. */
+  private async assertNameFree(volume: string): Promise<void> {
     const existing = await this.inspectVolume(volume);
     if (existing) {
       this.refuseUnless([this.volumeFacts(volume, existing.labels)]);
       throw new Error(`Volume ${clean(volume)} already exists`);
     }
-    await this.ensureImage(this.cfg.docker.probeImage, opts.onOutput);
-    const vol = await this.docker(["volume", "create", "--label", "mcp-everything=1", "--label", `mcp-everything.owner=${this.installationId}`, volume], { timeoutMs: 30_000 });
-    if (vol.code !== 0) throw new Error(`Failed to create volume: ${vol.stderr.trim()}`);
-    const res = await this.docker(
+  }
+
+  /** `docker volume create` with the generic and owner labels, and the role when it has one. */
+  private async makeVolume(volume: string, role?: "staging"): Promise<void> {
+    const vol = await this.docker(
       [
-        "run", "--rm", "--network", "bridge",
-        ...this.limits(),
-        "-v", `${volume}:${WORKSPACE}`,
-        "--entrypoint", "sh",
-        this.cfg.docker.probeImage,
+        "volume", "create", "--label", "mcp-everything=1", "--label", `${OWNER_LABEL}=${this.installationId}`,
+        ...(role ? ["--label", `${ROLE_LABEL}=${role}`] : []),
+        volume,
+      ],
+      { timeoutMs: 30_000 },
+    );
+    if (vol.code !== 0) throw new Error(`Failed to create volume: ${vol.stderr.trim()}`);
+  }
+
+  /**
+   * An empty volume for a sandbox, labelled as `probe` labels a sandbox volume (generic and owner labels, no
+   * role). It refuses when the name exists, by the rule `probe` applies: another's or not ours is a refusal, an
+   * existing one of this installation is a plain error.
+   */
+  async createSandboxVolume(volume: string): Promise<void> {
+    await this.assertNameFree(volume);
+    await this.makeVolume(volume);
+  }
+
+  /**
+   * A fresh name for a staging volume: `<prefix><installation id>-stg-<8 hex>`, the form no slug produces (a slug
+   * is lowercase letters, digits and underscores, never a hyphen). Issues no Docker command; the volume is made by `probe` with the role `staging`.
+   */
+  stagingName(): string {
+    return `${this.cfg.docker.namePrefix}${this.installationId}-stg-${randomBytes(4).toString("hex")}`;
+  }
+
+  /**
+   * Remove a staging volume. Guarded like the others: a volume that is not there is success; another's or not
+   * ours is a refusal; one of this installation's that is not a staging volume (no role, another role, or made
+   * before ownership was recorded) is `VolumeNotUsableError` and is left alone. Nothing but a staging volume is
+   * ever removed by this method.
+   */
+  async removeStagingVolume(volume: string): Promise<void> {
+    const v = await this.inspectVolume(volume);
+    if (!v) return;
+    this.refuseUnless([this.volumeFacts(volume, v.labels)]);
+    if (classifySandbox(v.labels, this.installationId) !== "mine" || v.labels?.[ROLE_LABEL] !== "staging") {
+      throw new VolumeNotUsableError(`Volume ${clean(volume)} is not a staging volume of this installation; it was not removed`);
+    }
+    const rm = await this.docker(["volume", "rm", "-f", volume], { timeoutMs: 120_000 });
+    if (rm.code !== 0) throw new Error(`Failed to remove volume ${clean(volume)}: ${rm.stderr.trim()}`);
+  }
+
+  /**
+   * Inspect every volume first, then require each to exist, be this installation's (`mine`: a volume from before
+   * ownership is never a staging volume or a copy's target) and carry the wanted role (`staging`) or none. Throws
+   * before anything is created. A refusal names every volume it speaks of.
+   */
+  private async requireVolumes(wants: Array<{ name: string; role: "staging" | "none" }>): Promise<void> {
+    const found: Array<Awaited<ReturnType<Docker["inspectVolume"]>>> = [];
+    for (const w of wants) found.push(await this.inspectVolume(w.name));
+    this.refuseUnless(wants.flatMap((w, i) => (found[i] ? [this.volumeFacts(w.name, found[i]!.labels)] : [])));
+    wants.forEach((w, i) => {
+      const v = found[i];
+      if (!v) throw new VolumeNotUsableError(`Volume ${clean(w.name)} does not exist`);
+      if (classifySandbox(v.labels, this.installationId) !== "mine") {
+        throw new VolumeNotUsableError(`Volume ${clean(w.name)} was made before ownership was recorded; it cannot be used here`);
+      }
+      const role = v.labels?.[ROLE_LABEL];
+      if (w.role === "staging" && role !== "staging") throw new VolumeNotUsableError(`Volume ${clean(w.name)} is not a staging volume`);
+      if (w.role === "none" && role !== undefined) throw new VolumeNotUsableError(`Volume ${clean(w.name)} is not a sandbox volume (it has the role ${oneLine(role, LABEL_MAX)})`);
+    });
+  }
+
+  /**
+   * Run one operator scanner over a staging volume. The volume must be this installation's staging volume
+   * (checked before any container exists). The image's own entrypoint runs with `spec.command` as its arguments, no
+   * network unless the scanner is configured to have one, the checkout mounted read-only at /scan and the working
+   * directory /scan/repo (a checkout with no `repo` directory makes `start` fail: the caller reports it as a failed run).
+   */
+  async runScanner(volume: string, spec: ScannerSpec, opts: { timeoutMs: number; envFile?: string }): Promise<RunResult> {
+    await this.requireVolumes([{ name: volume, role: "staging" }]);
+    return this.runOnce({
+      role: "scan",
+      image: spec.image,
+      network: spec.network ? "bridge" : "none",
+      mountFlags: [`type=volume,src=${volume},dst=/scan,readonly`],
+      workdir: "/scan/repo",
+      envFile: opts.envFile,
+      args: spec.command,
+      timeoutMs: opts.timeoutMs,
+      maxBytes: 8_000_000,
+    });
+  }
+
+  /**
+   * Copy a staging volume into a new sandbox volume, exactly (`cp -a`: owners, modes, links). `from` must be this
+   * installation's staging volume and `to` its sandbox volume (no role); both are inspected before anything is
+   * created. The container is the one place that has extra capabilities: it runs no repository code, has no
+   * network and reads its source read-only, and without CHOWN, FOWNER, DAC_OVERRIDE and FSETID `cp -a` cannot
+   * keep an owner other than root's or read a mode-000 directory. A failed copy leaves `to` partly written; the
+   * caller removes it.
+   */
+  async copyVolume(from: string, to: string): Promise<void> {
+    await this.requireVolumes([{ name: from, role: "staging" }, { name: to, role: "none" }]);
+    await this.ensureImage(this.cfg.docker.probeImage);
+    const res = await this.runOnce({
+      role: "copy",
+      image: this.cfg.docker.probeImage,
+      network: "none",
+      entrypoint: "cp",
+      caps: ["CHOWN", "FOWNER", "DAC_OVERRIDE", "FSETID"],
+      mounts: [`${from}:/from:ro`, `${to}:/to`],
+      args: ["-a", "/from/.", "/to/"],
+      timeoutMs: 300_000,
+      maxBytes: 64_000,
+    });
+    if (res.timedOut) throw new Error("Could not copy the checkout: timed out after 300s");
+    if (res.code !== 0) throw new Error(`Could not copy the checkout: ${oneLine(res.stderr.slice(-300), 300) || `exit code ${res.code}`}`);
+  }
+
+  /**
+   * Remove what a check left behind that is this installation's and old: containers with a role of `clone`,
+   * `scan` or `copy` and volumes with the role `staging`. It acts only on what it listed and then re-verified by
+   * inspect (the owner label is this installation's id, the role is in the allowlist, the age is known and over
+   * `maxAgeSec`), removing containers by their full id. A thing that is gone meanwhile is skipped. It never
+   * throws: Docker failures are counted, for the caller to log. Never anything without a role label or with
+   * another owner.
+   *
+   * `maxAgeSec` must exceed the longest a live check can hold these things, because another process of the same
+   * installation may be mid-check: the clone (600 s), plus the pulls and the scan budget, plus the copy (300 s),
+   * plus the staging volume's life through the rest of an install. Leg 7 computes it from the configuration.
+   */
+  async sweepCheckLeftovers(maxAgeSec: number): Promise<{ removed: string[]; failures: number }> {
+    const removed: string[] = [];
+    let failures = 0;
+    const owned = `label=${OWNER_LABEL}=${this.installationId}`;
+    const old = (created: unknown): boolean => {
+      const t = typeof created === "string" ? Date.parse(created) : Number.NaN;
+      if (Number.isNaN(t)) throw new Error("unreadable creation time");
+      return Date.now() - t > maxAgeSec * 1000;
+    };
+    const listed = async (args: string[]): Promise<string[]> => {
+      const res = await this.ask(args, 60_000);
+      if (res.code !== 0 || res.timedOut || res.truncated) throw new Error("list failed");
+      return res.stdout.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+    };
+    const read = async (args: string[]): Promise<{ labels: Record<string, unknown>; created: unknown; id?: unknown } | null> => {
+      const res = await this.ask(args, 30_000);
+      if (this.isNotThere(res)) return null;
+      if (res.code !== 0 || res.timedOut || res.truncated) throw new Error("inspect failed");
+      const v = JSON.parse(res.stdout.trim()) as { labels?: unknown; created?: unknown; id?: unknown } | null;
+      if (!v || typeof v !== "object" || !v.labels || typeof v.labels !== "object" || Array.isArray(v.labels)) throw new Error("unreadable inspect");
+      return { labels: v.labels as Record<string, unknown>, created: v.created, id: v.id };
+    };
+    const remove = async (args: string[], what: string): Promise<void> => {
+      const res = await this.ask(args, 120_000);
+      if (res.code === 0) removed.push(what);
+      else if (!this.isNotThere(res)) throw new Error("remove failed");
+    };
+
+    let ids: string[] = [];
+    try {
+      ids = await listed(["ps", "-a", "--no-trunc", "--filter", owned, "--filter", `label=${ROLE_LABEL}`, "--format", "{{.ID}}"]);
+    } catch {
+      failures++;
+    }
+    for (const listedId of ids) {
+      try {
+        if (!FULL_ID.test(listedId)) throw new Error("not a full id");
+        const c = await read(["inspect", "--type", "container", "--format", '{"id":{{json .Id}},"labels":{{json .Config.Labels}},"created":{{json .Created}}}', listedId]);
+        if (!c) continue;
+        if (c.id !== listedId) throw new Error("id mismatch");
+        if (c.labels[OWNER_LABEL] !== this.installationId || !ONE_SHOT_ROLES.includes(String(c.labels[ROLE_LABEL]))) continue;
+        if (!old(c.created)) continue;
+        await remove(["rm", "-f", listedId], listedId);
+      } catch {
+        failures++;
+      }
+    }
+
+    let names: string[] = [];
+    try {
+      names = await listed(["volume", "ls", "--filter", owned, "--filter", `label=${ROLE_LABEL}=staging`, "--format", "{{.Name}}"]);
+    } catch {
+      failures++;
+    }
+    for (const name of names) {
+      try {
+        const v = await read(["volume", "inspect", "--format", '{"labels":{{json .Labels}},"created":{{json .CreatedAt}}}', name]);
+        if (!v) continue;
+        if (v.labels[OWNER_LABEL] !== this.installationId || v.labels[ROLE_LABEL] !== "staging") continue;
+        if (!old(v.created)) continue;
+        await remove(["volume", "rm", "-f", name], name);
+      } catch {
+        failures++;
+      }
+    }
+    return { removed, failures };
+  }
+
+  /** Clone the repository into a fresh volume and report what is in it. */
+  async probe(
+    repo: RepoRef,
+    volume: string,
+    // `timeoutMs` is for tests only.
+    opts: { ref?: string; submodules?: boolean; onOutput?: (chunk: string) => void; volumeRole?: "staging"; timeoutMs?: number },
+  ): Promise<ProbeData> {
+    await this.assertNameFree(volume);
+    await this.ensureImage(this.cfg.docker.probeImage, opts.onOutput);
+    await this.makeVolume(volume, opts.volumeRole);
+    const timeoutMs = opts.timeoutMs ?? 600_000;
+    const res = await this.runOnce({
+      role: "clone",
+      image: this.cfg.docker.probeImage,
+      network: "bridge",
+      mounts: [`${volume}:${WORKSPACE}`],
+      entrypoint: "sh",
+      args: [
         "-c", PROBE_SCRIPT, "probe",
         repo.cloneUrl, opts.ref ?? "", opts.submodules ? "1" : "0",
         ...MANIFESTS,
+        WALK_SEPARATOR,
+        ...walkArguments(),
       ],
-      { timeoutMs: 600_000, maxBytes: 8_000_000 },
-    );
+      timeoutMs,
+      maxBytes: 16_000_000,
+    });
     if (res.code !== 0) {
-      const detail = res.stderr.trim().split("\n").slice(-6).join("\n");
+      const detail = res.timedOut ? `timed out after ${Math.round(timeoutMs / 1000)}s` : res.stderr.trim().split("\n").slice(-6).join("\n");
       throw new Error(`Could not clone ${repo.cloneUrl}${opts.ref ? ` at ${opts.ref}` : ""}:\n${detail || "git failed"}`);
     }
-    const data = parseProbeOutput(res.stdout);
+    const data = parseProbeOutput(res.stdout, res.truncated);
     if (!data.commit) throw new Error(`Clone of ${repo.cloneUrl} produced no commit`);
     return data;
   }

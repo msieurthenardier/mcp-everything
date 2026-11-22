@@ -2,15 +2,28 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { TEST_INSTALLATION_ID } from "./helpers.js";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { RunOptions } from "../src/util/exec.js";
 import {
   classifySandbox,
   Docker,
   DockerUnavailableError,
   isStoppedExecFailure,
+  MANIFESTS,
   OWNER_SHOWN,
+  parseProbeOutput,
+  PROBE_SCRIPT,
+  WALK_SCRIPT,
+  WALK_SEPARATOR,
+  walkArguments,
   SandboxRefusedError,
+  VolumeNotUsableError,
   watchdogPollSec,
   type ExecResult,
+  type OneShotSpec,
   type SandboxClass,
 } from "../src/sandbox/docker.js";
 
@@ -42,6 +55,12 @@ interface FakeContainer {
  */
 class ScriptedDocker extends Docker {
   argvs: string[][] = [];
+  /** The options each command was given, parallel to `argvs`. */
+  optsList: Array<RunOptions | undefined> = [];
+  /** What `docker start -a` prints for a one-shot container (the clone's script prints this). */
+  startOutput = `HEAD ${"c".repeat(40)}\n`;
+  /** What `docker create` was asked for: name, labels, the whole argument list. */
+  created: Array<{ name: string; id: string; labels: Record<string, string>; args: string[] }> = [];
   containers = new Map<string, FakeContainer>();
   volumes = new Map<string, Labels>();
   execReplies: Reply[] = [];
@@ -53,8 +72,9 @@ class ScriptedDocker extends Docker {
   strict = false;
   violations: string[][] = [];
 
-  protected override async docker(args: string[]) {
+  protected override async docker(args: string[], opts?: RunOptions) {
     this.argvs.push(args);
+    this.optsList.push(opts);
     if (this.strict && !(args[0] === "inspect" || args[0] === "version" || (args[0] === "volume" && args[1] === "inspect"))) {
       this.violations.push(args);
       throw new Error(`unexpected command in a read-only double: ${args.join(" ")}`);
@@ -90,11 +110,26 @@ class ScriptedDocker extends Docker {
         out.networks = Object.fromEntries(c.networks.map((n) => [n, { IPAddress: "10.0.0.2" }]));
         return { stdout: `${JSON.stringify(out)}\n` };
       }
+      case "create": {
+        const name = args[args.indexOf("--name") + 1]!;
+        const labels: Record<string, string> = {};
+        args.forEach((a, i) => {
+          if (a === "--label") {
+            const [k, ...v] = args[i + 1]!.split("=");
+            labels[k!] = v.join("=");
+          }
+        });
+        const id = idFor(name);
+        this.created.push({ name, id, labels, args });
+        this.containers.set(name, { id, running: false, labels, networks: ["bridge"] });
+        return { stdout: `${id}\n` };
+      }
       case "start": {
-        const found = this.find(args[1]!);
+        const one = args[1] === "-a";
+        const found = this.find(args[args.length - 1]!);
         if (!found) return { code: 1, stderr: "Error response from daemon: No such container\n" };
         found[1].running = true;
-        return { stdout: `${args[1]}\n` };
+        return { stdout: one ? this.startOutput : `${args[1]}\n` };
       }
       case "rm": {
         const found = this.find(args[args.length - 1]!);
@@ -129,8 +164,8 @@ class ScriptedDocker extends Docker {
     this.containers.set(name, { id, running: opts.running ?? true, labels: LABELS[cls], networks: opts.networks ?? [] });
     return id;
   }
-  putVolume(name: string, cls: SandboxClass): void {
-    this.volumes.set(name, LABELS[cls]);
+  putVolume(name: string, cls: SandboxClass, role?: string): void {
+    this.volumes.set(name, role === undefined ? LABELS[cls] : { ...LABELS[cls], "mcp-everything.role": role });
   }
   get execs() {
     return this.argvs.filter((a) => a[0] === "exec");
@@ -151,6 +186,9 @@ const STOPPED_STATE = "cannot exec in a stopped state\n";
 const OCI = "OCI runtime exec failed: exec failed: cannot exec in a stopped container\n";
 const N = "mcpe-0123abcd-box";
 const V = "mcpe-0123abcd-box-vol";
+const STAGING = "mcpe-0123abcd-stage";
+const TARGET = "mcpe-0123abcd-target";
+const SCANNER = { name: "s", image: "scan:1", command: ["scan", "--sarif", "."], network: false, timeoutSec: 60, env: [] };
 const REPO = { forge: "github", host: "github.com", path: "o/r", cloneUrl: "https://github.com/o/r.git", id: "github:o/r", name: "r" } as const;
 const READ_ONLY = new Set(["inspect", "volume inspect", "version"]);
 
@@ -580,6 +618,11 @@ interface MethodCase {
   resource: "container" | "volume";
   /** Setup of the container for the acting cases. */
   container?: { running?: boolean; networks?: string[] };
+  /**
+   * The volumes a "volume" case takes, by position, each with the role the method requires of it (none by default).
+   * Default: the one volume V, with no role.
+   */
+  volumes?: Array<{ name: string; role?: string }>;
   /** The command it must issue, on the id, when the sandbox is mine or from before. */
   acts: "exec" | "start" | "rm" | "network" | null;
 }
@@ -594,11 +637,23 @@ const CASES: Record<string, MethodCase> = {
   destroy: { run: (d) => d.destroy(N, V), resource: "container", acts: "rm" },
   probe: { run: (d) => d.probe(REPO, V, {}), resource: "volume", acts: null },
   createContainer: { run: (d) => d.createContainer({ name: N, volume: V, image: "img", project: "p" }), resource: "volume", acts: null },
+  // Leg 6. The staging volume is read through a read-only mount; the target of a copy is a sandbox volume (no role).
+  runScanner: { run: (d) => d.runScanner(STAGING, SCANNER, { timeoutMs: 20_000 }), resource: "volume", volumes: [{ name: STAGING, role: "staging" }], acts: null },
+  copyVolume: { run: (d) => d.copyVolume(STAGING, TARGET), resource: "volume", volumes: [{ name: STAGING, role: "staging" }, { name: TARGET }], acts: null },
+  createSandboxVolume: { run: (d) => d.createSandboxVolume(TARGET), resource: "volume", volumes: [{ name: TARGET }], acts: null },
+  // Leg 7. Removes only a staging volume of this installation; "stagingName" issues no command and is listed in NOT_GUARDED.
+  removeStagingVolume: { run: (d) => d.removeStagingVolume(STAGING), resource: "volume", volumes: [{ name: STAGING, role: "staging" }], acts: null },
 };
-/** Setup: the resource of the case in a class. */
-function setup(d: ScriptedDocker, c: MethodCase, cls: SandboxClass): string | undefined {
+/** The volume positions of a case: one for a container case's volume, none for the container itself. */
+const slots = (c: MethodCase) => c.volumes ?? [{ name: V }];
+/**
+ * Setup: the resource of the case in a class. For a volume case with several volumes, `position` says which one
+ * is in `cls`; the others are `mine`, each with the role the method requires of it (so a role check cannot make
+ * the case pass vacuously).
+ */
+function setup(d: ScriptedDocker, c: MethodCase, cls: SandboxClass, position = 0): string | undefined {
   if (c.resource === "volume") {
-    d.putVolume(V, cls);
+    slots(c).forEach((v, i) => d.putVolume(v.name, i === position ? cls : "mine", v.role));
     return undefined;
   }
   return d.put(N, cls, c.container);
@@ -835,14 +890,14 @@ describe("probe's volume", () => {
     const d = mk();
     await probe(d).catch(() => {});
     expect(d.count("volume create")).toBe(1);
-    expect(d.count("run")).toBe(1);
+    expect(d.count("create")).toBe(1);
   });
 
   it.each<SandboxClass>(["another", "not-ours"])("refuses a volume that is %s", async (cls) => {
     const d = mk();
     d.putVolume(V, cls);
     await expect(probe(d)).rejects.toBeInstanceOf(SandboxRefusedError);
-    expect(d.count("volume create") + d.count("run")).toBe(0);
+    expect(d.count("volume create") + d.count("create")).toBe(0);
   });
 
   it.each<SandboxClass>(["mine", "before"])("says a volume that is %s already exists", async (cls) => {
@@ -853,14 +908,233 @@ describe("probe's volume", () => {
     expect(e).not.toBeInstanceOf(SandboxRefusedError);
     expect(e).not.toBeInstanceOf(DockerUnavailableError);
     expect((e as Error).message).toMatch(/already exists/);
-    expect(d.count("volume create") + d.count("run")).toBe(0);
+    expect(d.count("volume create") + d.count("create")).toBe(0);
   });
 
   it("says Docker could not be asked", async () => {
     const d = mk();
     d.script.push((a) => (a[0] === "volume" ? { code: 1, stderr: "Cannot connect" } : undefined));
     await expect(probe(d)).rejects.toBeInstanceOf(DockerUnavailableError);
-    expect(d.count("volume create") + d.count("run")).toBe(0);
+    expect(d.count("volume create") + d.count("create")).toBe(0);
+  });
+});
+
+/** The one-shot method is protected; a subclass reaches it, as this double does the binary. */
+class OneShotDocker extends ScriptedDocker {
+  once(spec: OneShotSpec) {
+    return this.runOnce(spec);
+  }
+}
+const mkOnce = (env: Record<string, string> = {}) => new OneShotDocker(loadConfig(env), TEST_INSTALLATION_ID);
+const SPEC: OneShotSpec = {
+  role: "scan",
+  image: "img:1",
+  network: "none",
+  mounts: ["vol:/workspace:ro"],
+  workdir: "/workspace",
+  args: ["echo", "hi"],
+  timeoutMs: 1234,
+  maxBytes: 5678,
+};
+const NAME_SHAPE = new RegExp(`^mcpe-${TEST_INSTALLATION_ID}-scan-[0-9a-f]{8}$`);
+
+describe("the one-shot method", () => {
+  it("creates with the exact arguments: --rm, a name of prefix, installation, role and eight hex, the three labels, the limits, no -t", async () => {
+    const d = mkOnce();
+    await d.once(SPEC);
+    const a = d.created[0]!.args;
+    const name = d.created[0]!.name;
+    expect(name).toMatch(NAME_SHAPE);
+    const limits = ["--memory", "--cpus", "--pids-limit", "--security-opt", "no-new-privileges", "--cap-drop", "ALL"];
+    expect(a.slice(0, 3)).toEqual(["create", "--rm", "--name"]);
+    expect(a).not.toContain("-t");
+    expect(a).not.toContain("-it");
+    expect(a).not.toContain("--entrypoint");
+    expect(a).not.toContain("--cap-add");
+    for (const l of limits) expect(a).toContain(l);
+    expect(d.created[0]!.labels).toEqual({
+      "mcp-everything": "1",
+      "mcp-everything.owner": TEST_INSTALLATION_ID,
+      "mcp-everything.role": "scan",
+    });
+    expect(a.slice(a.indexOf("--network"), a.indexOf("--network") + 2)).toEqual(["--network", "none"]);
+    expect(a.slice(a.indexOf("-v"), a.indexOf("-v") + 2)).toEqual(["-v", "vol:/workspace:ro"]);
+    expect(a.slice(a.indexOf("-w"), a.indexOf("-w") + 2)).toEqual(["-w", "/workspace"]);
+    expect(a.slice(-3)).toEqual(["img:1", "echo", "hi"]);
+  });
+
+  it("names two calls differently", async () => {
+    const d = mkOnce();
+    await d.once(SPEC);
+    await d.once(SPEC);
+    expect(d.created[0]!.name).not.toBe(d.created[1]!.name);
+  });
+
+  it("uses the configured name prefix", async () => {
+    const d = mkOnce({ MCPE_NAME_PREFIX: "box-" });
+    await d.once({ ...SPEC, role: "copy" });
+    expect(d.created[0]!.name).toMatch(new RegExp(`^box-${TEST_INSTALLATION_ID}-copy-[0-9a-f]{8}$`));
+  });
+
+  it("passes an entrypoint when given, before the image, and none otherwise", async () => {
+    const d = mkOnce();
+    await d.once({ ...SPEC, entrypoint: "sh" });
+    const a = d.created[0]!.args;
+    expect(a.slice(a.indexOf("--entrypoint"), a.indexOf("--entrypoint") + 3)).toEqual(["--entrypoint", "sh", "img:1"]);
+  });
+
+  it("adds the extra capabilities after the limits, from a closed set only", async () => {
+    const d = mkOnce();
+    await d.once({ ...SPEC, caps: ["CHOWN", "FOWNER", "DAC_OVERRIDE", "FSETID"] });
+    const a = d.created[0]!.args;
+    const caps = a.flatMap((x, i) => (x === "--cap-add" ? [a[i + 1]] : []));
+    expect(caps).toEqual(["CHOWN", "FOWNER", "DAC_OVERRIDE", "FSETID"]);
+    expect(a.indexOf("--cap-add")).toBeGreaterThan(a.indexOf("--cap-drop"));
+    const bad = mkOnce();
+    await expect(bad.once({ ...SPEC, caps: ["SYS_ADMIN" as never] })).rejects.toThrow(/not one a one-shot container may have/);
+    expect(bad.count("create")).toBe(0);
+    await expect(bad.once({ ...SPEC, role: "x; rm" as never })).rejects.toThrow(/Unknown one-shot role/);
+    expect(bad.count("create")).toBe(0);
+  });
+
+  it("starts attached by the id create printed, with the caller's timeout and cap, and returns what run reported", async () => {
+    const d = mkOnce();
+    d.startOutput = "out\n";
+    const r = await d.once(SPEC);
+    expect(r).toMatchObject({ code: 0, stdout: "out\n", timedOut: false, truncated: false });
+    const i = d.argvs.findIndex((a) => a[0] === "start");
+    expect(d.argvs[i]).toEqual(["start", "-a", d.created[0]!.id]);
+    expect(d.optsList[i]).toEqual({ timeoutMs: 1234, maxBytes: 5678 });
+    expect(d.optsList[d.argvs.findIndex((a) => a[0] === "create")]).toEqual({ timeoutMs: 60_000 });
+  });
+
+  const removed = (d: OneShotDocker) => d.argvs.filter((a) => a[0] === "rm");
+  it.each([
+    ["success", undefined],
+    ["a non-zero exit", { code: 3, stderr: "boom" }],
+    ["a timeout", { code: null as unknown as number, timedOut: true }],
+  ] as Array<[string, Reply | undefined]>)("removes the container by id after %s", async (_n, r) => {
+    const d = mkOnce();
+    if (r) d.script.push((a) => (a[0] === "start" ? r : undefined));
+    const res = await d.once(SPEC);
+    if (r) expect(res).toMatchObject(r);
+    expect(removed(d)).toEqual([["rm", "-f", d.created[0]!.id]]);
+    expect(d.containers.has(d.created[0]!.name)).toBe(false);
+    expect(d.verbs.at(-1)).toBe("rm");
+  });
+
+  it("removes the container by id when start throws, and the throw is the outcome", async () => {
+    class StartThrows extends OneShotDocker {
+      protected override async docker(args: string[], opts?: RunOptions) {
+        if (args[0] === "start") {
+          this.argvs.push(args);
+          throw new Error("spawn docker ENOENT");
+        }
+        return super.docker(args, opts);
+      }
+    }
+    const d = new StartThrows(loadConfig({}), TEST_INSTALLATION_ID);
+    await expect(d.once(SPEC)).rejects.toThrow("spawn docker ENOENT");
+    expect(removed(d)).toEqual([["rm", "-f", d.created[0]!.id]]);
+  });
+
+  it("treats 'No such container' from rm -f as success, and ignores any other rm failure", async () => {
+    for (const stderr of ["Error response from daemon: No such container: x\n", "Error response from daemon: busy\n"]) {
+      const d = mkOnce();
+      d.script.push((a) => (a[0] === "rm" ? { code: 1, stderr } : undefined));
+      expect(await d.once(SPEC)).toMatchObject({ code: 0 });
+    }
+    class RmThrows extends OneShotDocker {
+      protected override async docker(args: string[], opts?: RunOptions) {
+        if (args[0] === "rm") throw new Error("daemon gone");
+        return super.docker(args, opts);
+      }
+    }
+    expect(await new RmThrows(loadConfig({}), TEST_INSTALLATION_ID).once(SPEC)).toMatchObject({ code: 0 });
+  });
+
+  it("starts nothing and removes nothing when create fails", async () => {
+    const d = mkOnce();
+    d.script.push((a) => (a[0] === "create" ? { code: 125, stderr: "no space left\n" } : undefined));
+    await expect(d.once(SPEC)).rejects.toThrow(/Could not create the scan container: no space left/);
+    expect(d.count("start") + d.count("rm")).toBe(0);
+  });
+
+  it("removes by the call's own name when create times out, and fails as a creation failure", async () => {
+    const d = mkOnce();
+    d.script.push((a) => (a[0] === "create" ? { code: null as unknown as number, timedOut: true } : undefined));
+    await expect(d.once(SPEC)).rejects.toThrow(/Could not create the scan container: docker create timed out/);
+    const create = d.argvs.find((a) => a[0] === "create")!;
+    const name = create[create.indexOf("--name") + 1]!;
+    expect(name).toMatch(NAME_SHAPE);
+    expect(d.argvs.filter((a) => a[0] === "rm")).toEqual([["rm", "-f", name]]);
+    expect(d.count("start")).toBe(0);
+  });
+
+  it.each([["nothing", ""], ["a short id", "abc123\n"], ["a name", "mcpe-box\n"], ["capitals", `${"A".repeat(64)}\n`], ["two lines", `${"a".repeat(64)}\n${"b".repeat(64)}\n`]])(
+    "rejects %s from create as the id, and starts nothing",
+    async (_n, out) => {
+      const d = mkOnce();
+      d.script.push((a) => (a[0] === "create" ? { stdout: out } : undefined));
+      await expect(d.once(SPEC)).rejects.toThrow(/Could not create the scan container: Docker printed no usable id/);
+      expect(d.count("start") + d.count("rm")).toBe(0);
+    },
+  );
+});
+
+describe("probe's container and volume labels", () => {
+  it("runs the clone as a one-shot container: role clone, bridge, the volume at /workspace, the same entrypoint, 600 s and 16 MB", async () => {
+    const d = mk();
+    const data = await d.probe(REPO, V, {});
+    expect(data.commit).toBe("c".repeat(40));
+    const c = d.created[0]!;
+    expect(c.labels["mcp-everything.role"]).toBe("clone");
+    expect(c.name).toMatch(new RegExp(`^mcpe-${TEST_INSTALLATION_ID}-clone-[0-9a-f]{8}$`));
+    const a = c.args;
+    expect(a.slice(a.indexOf("--network"), a.indexOf("--network") + 2)).toEqual(["--network", "bridge"]);
+    expect(a.slice(a.indexOf("-v"), a.indexOf("-v") + 2)).toEqual(["-v", `${V}:/workspace`]);
+    const i = a.indexOf("--entrypoint");
+    expect(a.slice(i, i + 3)).toEqual(["--entrypoint", "sh", loadConfig({}).docker.probeImage]);
+    expect(a.slice(i + 3, i + 4)).toEqual(["-c"]);
+    expect(a[i + 5]).toBe("probe");
+    expect(a.slice(i + 6, i + 9)).toEqual([REPO.cloneUrl, "", "0"]);
+    const start = d.argvs.findIndex((x) => x[0] === "start");
+    expect(d.optsList[start]).toEqual({ timeoutMs: 600_000, maxBytes: 16_000_000 });
+    expect(d.count("run")).toBe(0);
+  });
+
+  it("takes a shorter timeout when a test gives one", async () => {
+    const d = mk();
+    await d.probe(REPO, V, { timeoutMs: 2000 });
+    expect(d.optsList[d.argvs.findIndex((x) => x[0] === "start")]).toMatchObject({ timeoutMs: 2000 });
+  });
+
+  it("labels the volume as staging only when asked, and otherwise exactly as before", async () => {
+    const plain = mk();
+    await plain.probe(REPO, V, {});
+    expect(plain.argvs.find((a) => a[0] === "volume" && a[1] === "create")).toEqual(["volume", "create", "--label", "mcp-everything=1", "--label", `mcp-everything.owner=${TEST_INSTALLATION_ID}`, V]);
+    const staging = mk();
+    await staging.probe(REPO, V, { volumeRole: "staging" });
+    expect(staging.argvs.find((a) => a[0] === "volume" && a[1] === "create")).toEqual([
+      "volume", "create", "--label", "mcp-everything=1", "--label", `mcp-everything.owner=${TEST_INSTALLATION_ID}`, "--label", "mcp-everything.role=staging", V,
+    ]);
+  });
+
+  it("says a timed-out clone timed out, as a clone failure, and leaves no container", async () => {
+    const d = mk();
+    d.script.push((a) => (a[0] === "start" ? { code: null as unknown as number, timedOut: true } : undefined));
+    await expect(d.probe(REPO, V, { timeoutMs: 2000 })).rejects.toThrow(/^Could not clone https:\/\/github.com\/o\/r.git:\ntimed out after 2s$/);
+    expect(d.containers.size).toBe(0);
+    expect(d.argvs.filter((a) => a[0] === "rm")).toEqual([["rm", "-f", d.created[0]!.id]]);
+  });
+
+  it("still reports a failed clone's stderr and a clone with no commit", async () => {
+    const bad = mk();
+    bad.script.push((a) => (a[0] === "start" ? { code: 128, stderr: "fatal: not found\n" } : undefined));
+    await expect(bad.probe(REPO, V, { ref: "v1" })).rejects.toThrow(/Could not clone https:\/\/github.com\/o\/r.git at v1:\nfatal: not found/);
+    const none = mk();
+    none.startOutput = "";
+    await expect(none.probe(REPO, V, {})).rejects.toThrow(/produced no commit/);
   });
 });
 
@@ -919,11 +1193,24 @@ describe("createContainer's volume and result", () => {
 });
 
 describe("the guard cannot be skipped unnoticed", () => {
-  /** Methods of the class that touch no sandbox, or are private helpers; each is judged by hand. */
+  /**
+   * Methods of the class that touch no sandbox, or are private helpers, or (runOnce) act only on the one
+   * container they create themselves; each is judged by hand. The guarded table is for acting on caller-named sandboxes.
+   */
   const NOT_GUARDED = [
     "assertAvailable", "ensureImage", "sandboxName", "docker", "imagePath", "limits", "ask", "isNotThere", "unreadable",
     "inspectContainer", "inspectVolume", "containerFacts", "volumeFacts", "refuseUnless", "resolveContainer", "startId",
     "doesNotExist", "startIfStopped", "execOnce", "look", "rmContainer",
+    // Leg 6's private helpers of the guarded methods below (the name check, the volume creation, the role-aware volume check).
+    "assertNameFree", "makeVolume", "requireVolumes",
+    // Acts only on the one container it created itself, by the id `create` printed; the guarded table is for
+    // acting on caller-named sandboxes. Callers classify the volumes they pass.
+    "runOnce",
+    // Leg 6: acts only on what it listed and re-verified by owner and role (the owner label equals this installation's
+    // id on inspect, the role is in the allowlist, the age is known), never on a name a caller typed. Its own describe block.
+    "sweepCheckLeftovers",
+    // Leg 7: only forms a name from the prefix, the installation id and random bytes; issues no Docker command.
+    "stagingName",
   ];
   /**
    * Methods that report instead of refusing: they never throw and issue only read-only commands, which the
@@ -1004,15 +1291,21 @@ describe("the guard cannot be skipped unnoticed", () => {
     });
   });
 
-  it.each(Object.keys(CASES))("%s is refused against another's sandbox on a double that accepts only inspects", async (method) => {
+  it.each(Object.keys(CASES))("%s is refused against another's or not-ours sandbox, in every volume position, on a double that accepts only inspects", async (method) => {
     const c = CASES[method]!;
-    const d = mk();
-    d.strict = true;
-    setup(d, c, "another");
-    const e = await settle(c.run(d));
-    expect(d.violations).toEqual([]);
-    expect(e).toBeInstanceOf(SandboxRefusedError);
-    expect(d.verbs.some((v) => v === "inspect" || v === "volume inspect")).toBe(true);
+    const positions = c.resource === "volume" ? slots(c).map((_, i) => i) : [0];
+    for (const position of positions) {
+      for (const cls of ["another", "not-ours"] as const) {
+        const d = mk();
+        d.strict = true;
+        setup(d, c, cls, position);
+        const e = await settle(c.run(d));
+        expect(d.violations, `${method} ${cls} at ${position}`).toEqual([]);
+        expect(e, `${method} ${cls} at ${position}`).toBeInstanceOf(SandboxRefusedError);
+        expect((e as SandboxRefusedError).reason).toBe(cls);
+        expect(d.verbs.some((v) => v === "inspect" || v === "volume inspect")).toBe(true);
+      }
+    }
   });
 
   it.each(Object.keys(CASES))("%s does not refuse a sandbox that is mine", async (method) => {
@@ -1041,7 +1334,7 @@ describe("the guard cannot be skipped unnoticed", () => {
         for (const a of d.argvs) {
           let where: string | undefined;
           if (a[0] === "exec") where = a[2] === "-w" ? a[4] : a[2];
-          else if (a[0] === "start") where = a[1];
+          else if (a[0] === "start") where = a.at(-1);
           else if (a[0] === "rm") where = a.at(-1);
           else if (a[0] === "network") where = a.at(-1);
           if (where === undefined) continue;
@@ -1051,5 +1344,671 @@ describe("the guard cannot be skipped unnoticed", () => {
       }
     }
     expect([...seen].sort()).toEqual(["exec", "network", "rm", "start"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The clone's walk (leg 5)
+// ---------------------------------------------------------------------------
+
+describe("walkArguments", () => {
+  it("is exactly the prune names, then one quadruple per build-file pattern", () => {
+    expect(walkArguments()).toEqual([
+      "7",
+      ".git", "node_modules", "target", "vendor", ".venv", "venv", "__pycache__",
+      "name", "package.json", "0", "0",
+      "name", "binding.gyp", "0", "0",
+      "name", ".pnpmfile.cjs", "1", "0",
+      "name", ".yarnrc.yml", "1", "0",
+      "name", ".yarnrc", "1", "0",
+      "name", ".npmrc", "1", "0",
+      "name", "pnpm-lock.yaml", "1", "1",
+      "name", "yarn.lock", "1", "1",
+      "name", "setup.py", "1", "0",
+      "name", "setup.cfg", "1", "0",
+      "name", "pyproject.toml", "1", "0",
+      "name", "hatch.toml", "1", "0",
+      "name", "hatch_build.py", "1", "0",
+      "name", "requirements.txt", "1", "0",
+      "name", "meson.build", "1", "0",
+      "name", "meson.options", "1", "0",
+      "name", "meson_options.txt", "1", "0",
+      "name", "Cargo.toml", "0", "0",
+      "name", "build.rs", "0", "0",
+      "path", ".cargo/config.toml", "1", "0",
+      "path", ".cargo/config", "1", "0",
+      "name", "CMakeLists.txt", "0", "0",
+      "glob", "*.cmake", "0", "0",
+      "name", "configure", "1", "0",
+      "name", "configure.ac", "1", "0",
+      "name", "Makefile.am", "1", "0",
+      "name", "Makefile.in", "1", "0",
+      "glob", "*.m4", "1", "0",
+      "name", "Makefile", "0", "0",
+      "name", "makefile", "0", "0",
+      "name", "GNUmakefile", "0", "0",
+      "glob", "*.mk", "0", "0",
+      "name", "Gemfile", "1", "0",
+      "glob", "*.gemspec", "1", "0",
+      "name", "extconf.rb", "0", "0",
+      "name", "Rakefile", "0", "0",
+    ]);
+  });
+
+  it("holds no shell-special character other than the glob *, and a glob only for -name", () => {
+    const a = walkArguments();
+    const n = Number(a[0]);
+    const rest = a.slice(1 + n);
+    expect(rest.length % 4).toBe(0);
+    for (const x of [...a.slice(1, 1 + n), ...rest.filter((_, i) => i % 4 === 1)]) expect(x).toMatch(/^[A-Za-z0-9._*/-]+$/);
+    for (let i = 0; i < rest.length; i += 4) {
+      expect(["name", "glob", "path"]).toContain(rest[i]);
+      expect(["0", "1"]).toContain(rest[i + 2]);
+      expect(["0", "1"]).toContain(rest[i + 3]);
+      if (rest[i] !== "glob") expect(rest[i + 1]).not.toContain("*");
+    }
+  });
+
+  it("marks exactly the two lockfiles for presence only", () => {
+    const all = walkArguments();
+    const rest = all.slice(1 + Number(all[0]));
+    const marked: string[] = [];
+    for (let i = 0; i < rest.length; i += 4) if (rest[i + 3] === "1") marked.push(rest[i + 1]!);
+    expect(marked).toEqual(["pnpm-lock.yaml", "yarn.lock"]);
+  });
+});
+
+describe("parseProbeOutput: the walk", () => {
+  const b = (s: string) => Buffer.from(s).toString("base64");
+  const HEAD = `HEAD ${"a".repeat(40)}\n`;
+
+  it("always has a walk", () => {
+    expect(parseProbeOutput(HEAD).walk).toEqual({ files: [] });
+  });
+
+  it("reads BUILD lines: path, truncation flag and UTF-8 content, with an empty file valid", () => {
+    const w = parseProbeOutput(`${HEAD}BUILD ${b("a/b.json")} 0 ${b("café")}\nBUILD ${b("big")} 1 ${b("xx")}\nBUILD ${b("empty")} 0 \n`).walk;
+    expect(w.files).toEqual([
+      { path: "a/b.json", content: "café" },
+      { path: "big", content: "xx", truncated: true },
+      { path: "empty", content: "" },
+    ]);
+    expect(w.incomplete).toBeUndefined();
+  });
+
+  it("ignores malformed BUILD, LINK and INCOMPLETE lines", () => {
+    const bad = [
+      `BUILD ${b("x")} 0`, // three parts
+      `BUILD ${b("x")} 0 ${b("y")} extra`, // five parts
+      `BUILD ${b("x")} 2 ${b("y")}`, // bad flag
+      `BUILD ${b("x")}  ${b("y")}`, // empty flag
+      ` BUILD ${b("x")} 0 ${b("y")}`, // no trimming
+      `BUILD ${b("x")} 0 ${b("y")} `, // a trailing space makes five parts
+      `LINK`, `LINK a b`, `INCOMPLETE`, `INCOMPLETE files extra`, `INCOMPLETE nonsense`, `INCOMPLETE FILES`, `link ${b("x")}`,
+    ];
+    expect(parseProbeOutput(`${HEAD}${bad.join("\n")}\n`).walk).toEqual({ files: [] });
+  });
+
+  it("reads LINK lines and keeps the first INCOMPLETE reason", () => {
+    const w = parseProbeOutput(`${HEAD}LINK ${b("setup.py")}\nINCOMPLETE depth\nLINK ${b("x/y")}\nINCOMPLETE files\n`).walk;
+    expect(w.skippedLinks).toEqual(["setup.py", "x/y"]);
+    expect(w.incomplete).toBe("depth");
+  });
+
+  it.each(["pattern", "newline", "depth", "files", "bytes", "walk"])("accepts the reason %s", (r) => {
+    expect(parseProbeOutput(`${HEAD}INCOMPLETE ${r}\n`).walk.incomplete).toBe(r);
+  });
+
+  it("does not trim lines: a carriage return spoils the reason", () => {
+    expect(parseProbeOutput(`${HEAD}INCOMPLETE files\r\n`).walk.incomplete).toBeUndefined();
+  });
+
+  it("drops the last, possibly partial, line of truncated output and says incomplete: output", () => {
+    const w = parseProbeOutput(`${HEAD}BUILD ${b("a")} 0 ${b("one")}\nBUILD ${b("b")} 0 ${b("two")}`.slice(0, -3), true).walk;
+    expect(w.files).toEqual([{ path: "a", content: "one" }]);
+    expect(w.incomplete).toBe("output");
+    // The cut wins over an earlier reason.
+    expect(parseProbeOutput(`${HEAD}INCOMPLETE pattern\nBUILD ${b("a")} 0 ${b("o")}\nBUI`, true).walk.incomplete).toBe("output");
+  });
+
+  it("leaves FILE and ENTRY handling as it was", () => {
+    const d = parseProbeOutput(`${HEAD}ENTRY d ${b("src")}\nFILE package.json ${b("{}")}\nFILE other ${b("x")}\n`);
+    expect(d.entries).toEqual([{ name: "src", dir: true }]);
+    expect(d.files).toEqual({ "package.json": "{}" });
+  });
+});
+
+describe("probe passes the separator and the walk's arguments after the manifests", () => {
+  it("puts --walk-- after every manifest, then the walk's arguments", async () => {
+    const d = mk();
+    await d.probe(REPO, V, {});
+    const a = d.created[0]!.args;
+    const i = a.indexOf("probe");
+    const tail = a.slice(i + 4);
+    const sep = tail.indexOf(WALK_SEPARATOR);
+    expect(WALK_SEPARATOR).toBe("--walk--");
+    expect(sep).toBeGreaterThan(0);
+    expect(tail.slice(0, sep)).toContain("package.json");
+    expect(tail.slice(0, sep)).not.toContain("--walk--");
+    expect(tail.slice(sep + 1)).toEqual(walkArguments());
+    // The script is the clone followed by the walk.
+    expect(a[i - 1]).toContain('"--walk--"');
+    expect(a[i - 1]).toContain(WALK_SCRIPT);
+  });
+});
+
+/** The walk run in the host's own sh over a scratch directory (the integration case runs it in the pinned image). */
+describe("the walk script, in a local shell", () => {
+  const hasSh = fs.existsSync("/bin/sh");
+  const head = `HEAD ${"a".repeat(40)}\n`;
+  const exec = (dir: string) => {
+    const script = WALK_SCRIPT.replace("cd /workspace/repo", `cd '${dir}'`);
+    return execFileSync("/bin/sh", ["-c", script, "walk", ...walkArguments()], { encoding: "utf8", maxBuffer: 64_000_000 });
+  };
+  const withDir = (fn: (dir: string) => void) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-walk-"));
+    try {
+      fn(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const put = (dir: string, rel: string, content: string | Buffer = "x\n") => {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), content);
+  };
+  const walkOf = (raw: string) => parseProbeOutput(head + raw).walk;
+  const it2 = (name: string, fn: () => void) => it.skipIf(!hasSh)(name, { timeout: 60_000 }, fn);
+
+  it2("reads the root and nested package.json, prunes node_modules, and does not follow a link", () => {
+    withDir((dir) => {
+      put(dir, "package.json", '{"r":1}');
+      put(dir, "sub/package.json", '{"s":1}');
+      put(dir, "node_modules/x/package.json", "{}");
+      fs.writeFileSync(path.join(dir, "secret"), "s");
+      fs.symlinkSync(path.join(dir, "secret"), path.join(dir, "setup.py"));
+      const w = walkOf(exec(dir));
+      expect(w.files.map((f) => f.path)).toEqual(["package.json", "sub/package.json"]);
+      expect(w.skippedLinks).toEqual(["setup.py"]);
+      expect(w.incomplete).toBeUndefined();
+    });
+  });
+
+  it2("reports a nested link that a find pattern matches, and never reads it", () => {
+    withDir((dir) => {
+      fs.writeFileSync(path.join(dir, "outside"), "secret");
+      put(dir, "sub/x", "x");
+      fs.symlinkSync(path.join(dir, "outside"), path.join(dir, "sub/package.json"));
+      fs.symlinkSync("sub", path.join(dir, "linkdir"));
+      const w = walkOf(exec(dir));
+      expect(w.files).toEqual([]);
+      expect(w.skippedLinks).toEqual(["sub/package.json"]);
+    });
+  });
+
+  it2("reads root-only entries only at the root, once, and prints nothing for an empty tree", () => {
+    withDir((dir) => {
+      put(dir, ".cargo/config.toml", "a");
+      put(dir, "nested/.cargo/config.toml", "b");
+      put(dir, "nested/setup.py", "c");
+      put(dir, "setup.py", "d");
+      expect(walkOf(exec(dir)).files.map((f) => f.path).sort()).toEqual([".cargo/config.toml", "setup.py"]);
+    });
+    withDir((dir) => {
+      expect(exec(dir)).toBe("");
+    });
+  });
+
+  it2("reads a 5 MB pnpm-lock.yaml for presence only: empty, not truncated, no budget used", () => {
+    withDir((dir) => {
+      put(dir, "pnpm-lock.yaml", Buffer.alloc(5_000_000, 97));
+      put(dir, "yarn.lock", "y");
+      for (let i = 0; i < 30; i++) put(dir, `d${i}/Makefile`, Buffer.alloc(70_000, 98));
+      const raw = exec(dir);
+      const w = walkOf(raw);
+      expect(w.files.find((f) => f.path === "pnpm-lock.yaml")).toEqual({ path: "pnpm-lock.yaml", content: "" });
+      expect(w.files.find((f) => f.path === "yarn.lock")).toEqual({ path: "yarn.lock", content: "" });
+      expect(w.files.filter((f) => f.path.endsWith("Makefile"))).toHaveLength(30);
+      expect(w.incomplete).toBeUndefined();
+      expect(raw.length).toBeLessThan(3_500_000);
+    });
+  });
+
+  it2("reports a presence-only lockfile that is a link, and reads none that is not a file", () => {
+    withDir((dir) => {
+      fs.symlinkSync("/etc/hostname", path.join(dir, "yarn.lock"));
+      fs.mkdirSync(path.join(dir, "pnpm-lock.yaml"));
+      const w = walkOf(exec(dir));
+      expect(w.files).toEqual([]);
+      expect(w.skippedLinks).toEqual(["yarn.lock"]);
+    });
+  });
+
+  it2("truncates a file over 64 KB at 64 KB and flags it", () => {
+    withDir((dir) => {
+      put(dir, "configure", Buffer.alloc(70_000, 99));
+      put(dir, "Makefile", Buffer.alloc(65_536, 100));
+      const w = walkOf(exec(dir));
+      const c = w.files.find((f) => f.path === "configure")!;
+      expect(c.truncated).toBe(true);
+      expect(c.content).toHaveLength(65_536);
+      const m = w.files.find((f) => f.path === "Makefile")!;
+      expect(m.truncated).toBeUndefined();
+      expect(m.content).toHaveLength(65_536);
+    });
+  });
+
+  it2("reports a directory name with a newline as INCOMPLETE newline and skips what is inside it", () => {
+    withDir((dir) => {
+      put(dir, "package.json", "{}");
+      put(dir, "a\nb/package.json", "{}");
+      put(dir, "a\n./package.json", "{}");
+      const raw = exec(dir);
+      expect(raw.split("\n")).toContain("INCOMPLETE newline");
+      expect(walkOf(raw).files.map((f) => f.path)).toEqual(["package.json"]);
+    });
+  });
+
+  it2("reports INCOMPLETE depth for a match below the depth limit, and none at the limit", () => {
+    withDir((dir) => {
+      put(dir, "a/b/c/d/e/f/g/Makefile", "x"); // depth 8: read
+      const ok = exec(dir);
+      expect(ok).not.toContain("INCOMPLETE");
+      expect(walkOf(ok).files).toHaveLength(1);
+    });
+    withDir((dir) => {
+      put(dir, "a/b/c/d/e/f/g/h/Makefile", "x"); // depth 9: not read
+      expect(exec(dir).split("\n")).toContain("INCOMPLETE depth");
+    });
+  });
+
+  it2("caps a pattern at 40 files with INCOMPLETE pattern, and still exits 0 when head closes the pipe early", () => {
+    withDir((dir) => {
+      for (let i = 0; i < 300; i++) put(dir, `m/f${i}.cmake`, "x");
+      const lines = exec(dir).split("\n"); // execFileSync throws on a non-zero exit
+      expect(lines).toContain("INCOMPLETE pattern");
+      expect(lines.filter((l) => l.startsWith("BUILD "))).toHaveLength(40);
+    });
+  });
+
+  it2("enforces the file budget, reading the root package.json first", () => {
+    withDir((dir) => {
+      put(dir, "package.json", '{"root":1}');
+      for (const n of ["package.json", "Cargo.toml", "build.rs", "binding.gyp", "CMakeLists.txt", "Rakefile"]) {
+        for (let i = 0; i < 40; i++) put(dir, `d${i}/${n}`, "x");
+      }
+      const raw = exec(dir);
+      const w = walkOf(raw);
+      expect(w.files).toHaveLength(200);
+      expect(raw.split("\n")).toContain("INCOMPLETE files");
+      expect(w.files[0]).toEqual({ path: "package.json", content: '{"root":1}' });
+    });
+  });
+
+  it2("enforces the byte budget", () => {
+    withDir((dir) => {
+      for (let i = 0; i < 40; i++) put(dir, `d${i}/x.mk`, Buffer.alloc(70_000, 97));
+      const raw = exec(dir);
+      const w = walkOf(raw);
+      expect(w.files).toHaveLength(32); // 32 x 64 KB is exactly 2 MB
+      expect(w.files.every((f) => f.truncated === true)).toBe(true);
+      expect(raw.split("\n")).toContain("INCOMPLETE bytes");
+    });
+  });
+
+  it2("keeps the root match of a pattern inside its cap when nested ones are more than 40", () => {
+    withDir((dir) => {
+      for (let i = 0; i < 60; i++) put(dir, `A${i}/Makefile`, "x");
+      put(dir, "Makefile", "root\n");
+      const w = walkOf(exec(dir));
+      expect(w.files[0]).toEqual({ path: "Makefile", content: "root\n" });
+      expect(w.incomplete).toBe("pattern");
+    });
+  });
+
+  it2("treats file names as data: no expansion, no command substitution", () => {
+    withDir((dir) => {
+      // A stray file here would make the final check pass vacuously.
+      expect(fs.existsSync(path.resolve("pwned"))).toBe(false);
+      put(dir, "a.cmake", "x");
+      put(dir, "$(touch pwned).cmake", "x");
+      put(dir, "x;y.cmake", "x");
+      const w = walkOf(exec(dir));
+      expect(w.files.map((f) => f.path).sort()).toEqual(["$(touch pwned).cmake", "a.cmake", "x;y.cmake"]);
+      expect(fs.existsSync(path.join(dir, "pwned"))).toBe(false);
+      expect(fs.existsSync(path.resolve("pwned"))).toBe(false);
+    });
+  });
+
+  it2("is silent about a tree with no matches", () => {
+    withDir((dir) => {
+      put(dir, "README", "x");
+      expect(exec(dir)).toBe("");
+    });
+  });
+});
+
+/** The whole clone-and-walk script against a local git repository, with /workspace redirected to a scratch directory. */
+describe("the whole probe script, in a local shell", () => {
+  const hasTools = fs.existsSync("/bin/sh") && (() => { try { execFileSync("git", ["--version"]); return true; } catch { return false; } })();
+  it.skipIf(!hasTools)("prints each manifest once, none outside MANIFESTS, and the walk's files after the separator split", { timeout: 60_000 }, () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-probe-"));
+    try {
+      const src = path.join(root, "src");
+      fs.mkdirSync(src);
+      fs.writeFileSync(path.join(src, "package.json"), '{"a":1}');
+      fs.writeFileSync(path.join(src, "Makefile"), "all:\n");
+      fs.writeFileSync(path.join(src, "go.mod"), "module x\n");
+      fs.mkdirSync(path.join(src, "sub"));
+      fs.writeFileSync(path.join(src, "sub", "Makefile"), "all:\n");
+      const git = (...a: string[]) => execFileSync("git", ["-C", src, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { stdio: "pipe" });
+      git("init", "--quiet");
+      git("add", ".");
+      git("commit", "--quiet", "-m", "x");
+      const ws = path.join(root, "ws");
+      fs.mkdirSync(ws);
+      const probeScript = PROBE_SCRIPT.split("/workspace").join(ws);
+      const out = execFileSync("/bin/sh", ["-c", probeScript, "probe", src, "", "0", ...MANIFESTS, WALK_SEPARATOR, ...walkArguments()], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      const names = out.split("\n").filter((l) => l.startsWith("FILE ")).map((l) => l.split(" ")[1]!);
+      expect(names.sort()).toEqual(["Makefile", "go.mod", "package.json"]);
+      for (const n of names) expect(MANIFESTS).toContain(n);
+      const data = parseProbeOutput(out);
+      expect(data.walk.files.map((f) => f.path).sort()).toEqual(["Makefile", "package.json", "sub/Makefile"]);
+      expect(data.walk.incomplete).toBeUndefined();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scanners, the copy and the leftovers sweep (leg 6)
+// ---------------------------------------------------------------------------
+
+describe("runScanner", () => {
+  const stage = (d: ScriptedDocker, cls: SandboxClass = "mine", role: string | null = "staging") => d.putVolume(STAGING, cls, role ?? undefined);
+
+  it("runs the image's own entrypoint with the command, no network, the volume read-only at /scan, in /scan/repo, capped at 8 MB", async () => {
+    const d = mk();
+    stage(d);
+    await d.runScanner(STAGING, SCANNER, { timeoutMs: 20_000 });
+    const a = d.created[0]!.args;
+    expect(d.created[0]!.labels["mcp-everything.role"]).toBe("scan");
+    expect(a).not.toContain("--entrypoint");
+    expect(a).not.toContain("-v");
+    expect(a).not.toContain("--env-file");
+    expect(a).not.toContain("--cap-add");
+    expect(a.slice(a.indexOf("--network"), a.indexOf("--network") + 2)).toEqual(["--network", "none"]);
+    expect(a.slice(a.indexOf("--mount"), a.indexOf("--mount") + 2)).toEqual(["--mount", `type=volume,src=${STAGING},dst=/scan,readonly`]);
+    expect(a.filter((x) => x === "--mount")).toHaveLength(1);
+    expect(a.slice(a.indexOf("-w"), a.indexOf("-w") + 2)).toEqual(["-w", "/scan/repo"]);
+    expect(a.slice(-4)).toEqual(["scan:1", "scan", "--sarif", "."]);
+    const i = d.argvs.findIndex((x) => x[0] === "start");
+    expect(d.optsList[i]).toEqual({ timeoutMs: 20_000, maxBytes: 8_000_000 });
+  });
+
+  it("uses the bridge network only when the scanner is configured for one, and passes the env file before the image", async () => {
+    const d = mk();
+    stage(d);
+    await d.runScanner(STAGING, { ...SCANNER, network: true }, { timeoutMs: 20_000, envFile: "/data/tmp/env-0123456789abcdef" });
+    const a = d.created[0]!.args;
+    expect(a.slice(a.indexOf("--network"), a.indexOf("--network") + 2)).toEqual(["--network", "bridge"]);
+    expect(a.slice(a.indexOf("--env-file"), a.indexOf("--env-file") + 2)).toEqual(["--env-file", "/data/tmp/env-0123456789abcdef"]);
+    expect(a.indexOf("--env-file")).toBeLessThan(a.indexOf("scan:1"));
+  });
+
+  it.each<[string, (d: ScriptedDocker) => void, RegExp | undefined]>([
+    ["another's", (d) => stage(d, "another"), undefined],
+    ["not mcp-everything's", (d) => stage(d, "not-ours"), undefined],
+    ["missing", () => undefined, /does not exist/],
+    ["from before ownership", (d) => stage(d, "before"), /before ownership/],
+    ["without a role", (d) => stage(d, "mine", null), /not a staging volume/],
+    ["a sandbox volume's role", (d) => stage(d, "mine", "sandbox"), /not a staging volume/],
+  ])("throws for a volume that is %s, and creates no container", async (_n, set, text) => {
+    const d = mk();
+    set(d);
+    const e = await settle(d.runScanner(STAGING, SCANNER, { timeoutMs: 20_000 }));
+    expect(e).toBeInstanceOf(Error);
+    if (text) {
+      expect(e).not.toBeInstanceOf(SandboxRefusedError);
+      expect((e as Error).message).toMatch(text);
+    } else {
+      expect(e).toBeInstanceOf(SandboxRefusedError);
+    }
+    expect(d.count("create")).toBe(0);
+    expect(d.count("start")).toBe(0);
+  });
+});
+
+describe("copyVolume", () => {
+  const both = (d: ScriptedDocker) => {
+    d.putVolume(STAGING, "mine", "staging");
+    d.putVolume(TARGET, "mine");
+  };
+
+  it("runs cp -a from the clone image: no network, the four capabilities, the source read-only, a 300 s limit", async () => {
+    const d = mk();
+    both(d);
+    await d.copyVolume(STAGING, TARGET);
+    const a = d.created[0]!.args;
+    expect(d.created[0]!.labels["mcp-everything.role"]).toBe("copy");
+    const caps = a.flatMap((x, i) => (x === "--cap-add" ? [a[i + 1]] : []));
+    expect(caps).toEqual(["CHOWN", "FOWNER", "DAC_OVERRIDE", "FSETID"]);
+    expect(a.slice(a.indexOf("--network"), a.indexOf("--network") + 2)).toEqual(["--network", "none"]);
+    expect(a.slice(a.indexOf("--entrypoint"), a.indexOf("--entrypoint") + 2)).toEqual(["--entrypoint", "cp"]);
+    const mounts = a.flatMap((x, i) => (x === "-v" ? [a[i + 1]] : []));
+    expect(mounts).toEqual([`${STAGING}:/from:ro`, `${TARGET}:/to`]);
+    expect(a.slice(-4)).toEqual([loadConfig({}).docker.probeImage, "-a", "/from/.", "/to/"]);
+    expect(d.optsList[d.argvs.findIndex((x) => x[0] === "start")]!.timeoutMs).toBe(300_000);
+  });
+
+  it.each<[string, (d: ScriptedDocker) => void, boolean]>([
+    ["the source is another's", (d) => { both(d); d.putVolume(STAGING, "another", "staging"); }, true],
+    ["the target is another's", (d) => { both(d); d.putVolume(TARGET, "another"); }, true],
+    ["the source is from before ownership", (d) => { both(d); d.putVolume(STAGING, "before", "staging"); }, false],
+    ["the target is from before ownership", (d) => { both(d); d.putVolume(TARGET, "before"); }, false],
+    ["the source has no role", (d) => { both(d); d.putVolume(STAGING, "mine"); }, false],
+    ["the target has a role", (d) => { both(d); d.putVolume(TARGET, "mine", "staging"); }, false],
+    ["the source is missing", (d) => d.putVolume(TARGET, "mine"), false],
+    ["the target is missing", (d) => d.putVolume(STAGING, "mine", "staging"), false],
+  ])("throws when %s, and creates no container", async (_n, set, refusal) => {
+    const d = mk();
+    set(d);
+    const e = await settle(d.copyVolume(STAGING, TARGET));
+    expect(e).toBeInstanceOf(Error);
+    expect(e instanceof SandboxRefusedError).toBe(refusal);
+    expect(d.count("create")).toBe(0);
+  });
+
+  it("throws with the cleaned stderr tail on a non-zero exit, and on a timeout", async () => {
+    const d = mk();
+    both(d);
+    d.script.push((a) => (a[0] === "start" ? { code: 1, stderr: "cp: \u001b[31mcannot\u001b[0m stat '/from/x'\nPermission denied\n" } : undefined));
+    await expect(d.copyVolume(STAGING, TARGET)).rejects.toThrow("Could not copy the checkout: cp: cannot stat '/from/x' Permission denied");
+    const t = mk();
+    both(t);
+    t.script.push((a) => (a[0] === "start" ? { code: null as unknown as number, timedOut: true } : undefined));
+    await expect(t.copyVolume(STAGING, TARGET)).rejects.toThrow(/timed out after 300s/);
+  });
+});
+
+describe("createSandboxVolume", () => {
+  it("creates an owned volume with the generic and owner labels and no role", async () => {
+    const d = mk();
+    await d.createSandboxVolume(TARGET);
+    const create = d.argvs.find((a) => a[0] === "volume" && a[1] === "create")!;
+    expect(create).toEqual(["volume", "create", "--label", "mcp-everything=1", "--label", `mcp-everything.owner=${TEST_INSTALLATION_ID}`, TARGET]);
+  });
+
+  it("refuses a name that exists: another's by refusal, this installation's by a plain error, and creates nothing", async () => {
+    for (const cls of ["another", "not-ours"] as const) {
+      const d = mk();
+      d.putVolume(TARGET, cls);
+      expect(await settle(d.createSandboxVolume(TARGET))).toBeInstanceOf(SandboxRefusedError);
+      expect(d.count("volume create")).toBe(0);
+    }
+    const d = mk();
+    d.putVolume(TARGET, "mine");
+    await expect(d.createSandboxVolume(TARGET)).rejects.toThrow(/already exists/);
+    expect(d.count("volume create")).toBe(0);
+  });
+});
+
+describe("stagingName and removeStagingVolume", () => {
+  it("stagingName is prefix, installation id, -stg-, eight hex digits; fresh each time; no command", () => {
+    const d = mk();
+    const a = d.stagingName();
+    expect(a).toMatch(new RegExp(`^mcpe-${TEST_INSTALLATION_ID}-stg-[0-9a-f]{8}$`));
+    expect(d.stagingName()).not.toBe(a);
+    expect(d.argvs).toEqual([]);
+  });
+
+  it("removes a staging volume of this installation by its name", async () => {
+    const d = mk();
+    d.putVolume(STAGING, "mine", "staging");
+    await d.removeStagingVolume(STAGING);
+    expect(d.argvs.find((a) => a[0] === "volume" && a[1] === "rm")).toEqual(["volume", "rm", "-f", STAGING]);
+  });
+
+  it("a volume that is not there is success and nothing is removed", async () => {
+    const d = mk();
+    await d.removeStagingVolume(STAGING);
+    expect(d.count("volume rm")).toBe(0);
+  });
+
+  it("leaves a volume of this installation that is not a staging volume: no role, another role, or from before", async () => {
+    for (const [cls, role] of [["mine", undefined], ["mine", "other"], ["before", undefined]] as const) {
+      const d = mk();
+      d.putVolume(STAGING, cls, role);
+      await expect(d.removeStagingVolume(STAGING)).rejects.toBeInstanceOf(VolumeNotUsableError);
+      expect(d.count("volume rm")).toBe(0);
+    }
+  });
+
+  it("a failed removal says so", async () => {
+    const d = mk();
+    d.putVolume(STAGING, "mine", "staging");
+    d.script.push((a) => (a[0] === "volume" && a[1] === "rm" ? { code: 1, stderr: "volume in use" } : undefined));
+    await expect(d.removeStagingVolume(STAGING)).rejects.toThrow(/Failed to remove volume/);
+  });
+});
+
+describe("sweepCheckLeftovers", () => {
+  const HOUR = 3600_000;
+  const iso = (agoMs: number, offset = "Z") => new Date(Date.now() - agoMs).toISOString().replace("Z", offset);
+  const cid = (n: number) => String(n).repeat(64).slice(0, 64);
+  interface C { id: string; labels: Record<string, string>; created: string }
+  interface Vol { name: string; labels: Record<string, string>; created: string }
+  const mine = { "mcp-everything": "1", "mcp-everything.owner": TEST_INSTALLATION_ID };
+  const role = (r: string, extra: Record<string, string> = mine) => ({ ...extra, "mcp-everything.role": r });
+
+  /** A daemon with the given containers and volumes; `ps` and `volume ls` list them all, whatever the filters (the sweep must re-verify). */
+  function world(cs: C[], vs: Vol[], more: Array<(a: string[]) => { code?: number; stderr?: string; stdout?: string } | undefined> = []) {
+    const d = mk();
+    d.script.push((a) => {
+      for (const m of more) {
+        const r = m(a);
+        if (r) return r;
+      }
+      if (a[0] === "ps") return { stdout: cs.map((c) => `${c.id}\n`).join("") };
+      if (a[0] === "volume" && a[1] === "ls") return { stdout: vs.map((v) => `${v.name}\n`).join("") };
+      if (a[0] === "inspect") {
+        const c = cs.find((x) => x.id === a.at(-1));
+        return c ? { stdout: JSON.stringify({ id: c.id, labels: c.labels, created: c.created }) } : { code: 1, stderr: "Error response from daemon: No such container: x" };
+      }
+      if (a[0] === "volume" && a[1] === "inspect") {
+        const v = vs.find((x) => x.name === a.at(-1));
+        return v ? { stdout: JSON.stringify({ labels: v.labels, created: v.created }) } : { code: 1, stderr: "Error: No such volume: x" };
+      }
+      return undefined;
+    });
+    return d;
+  }
+
+  it("lists by this installation's owner label and the presence of a role label, with full ids", async () => {
+    const d = world([], []);
+    await d.sweepCheckLeftovers(60);
+    expect(d.argvs).toContainEqual(["ps", "-a", "--no-trunc", "--filter", `label=mcp-everything.owner=${TEST_INSTALLATION_ID}`, "--filter", "label=mcp-everything.role", "--format", "{{.ID}}"]);
+    expect(d.argvs).toContainEqual(["volume", "ls", "--filter", `label=mcp-everything.owner=${TEST_INSTALLATION_ID}`, "--filter", "label=mcp-everything.role=staging", "--format", "{{.Name}}"]);
+  });
+
+  it("removes an old copy container by its full id and an old staging volume by name, with a UTC offset in the volume's age", async () => {
+    const d = world(
+      [{ id: cid(1), labels: role("copy"), created: iso(2 * HOUR) }, { id: cid(2), labels: role("scan"), created: iso(2 * HOUR) }, { id: cid(3), labels: role("clone"), created: iso(2 * HOUR) }],
+      [{ name: "mcpe-x-stage", labels: role("staging"), created: iso(2 * HOUR, "+00:00") }],
+    );
+    const r = await d.sweepCheckLeftovers(3600);
+    expect(r).toEqual({ removed: [cid(1), cid(2), cid(3), "mcpe-x-stage"], failures: 0 });
+    expect(d.argvs.filter((a) => a[0] === "rm")).toEqual([cid(1), cid(2), cid(3)].map((i) => ["rm", "-f", i]));
+    expect(d.argvs).toContainEqual(["volume", "rm", "-f", "mcpe-x-stage"]);
+  });
+
+  it("leaves what it must: a sandbox with no role, another owner's scan container, an unlisted role, a young staging volume", async () => {
+    const d = world(
+      [
+        { id: cid(1), labels: mine, created: iso(5 * HOUR) },
+        { id: cid(2), labels: role("scan", { "mcp-everything": "1", "mcp-everything.owner": OTHER_ID }), created: iso(5 * HOUR) },
+        { id: cid(3), labels: role("sandbox"), created: iso(5 * HOUR) },
+        { id: cid(4), labels: role("scan"), created: iso(10_000) },
+      ],
+      [
+        { name: "young", labels: role("staging"), created: iso(10_000) },
+        { name: "theirs", labels: role("staging", { "mcp-everything": "1", "mcp-everything.owner": OTHER_ID }), created: iso(5 * HOUR) },
+        { name: "norole", labels: mine, created: iso(5 * HOUR) },
+        { name: "other-role", labels: role("sandbox"), created: iso(5 * HOUR) },
+      ],
+    );
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [], failures: 0 });
+    expect(d.count("rm")).toBe(0);
+    expect(d.count("volume rm")).toBe(0);
+  });
+
+  it("skips what is gone by the time it is inspected or removed, and counts a failed inspect or remove without throwing", async () => {
+    const old = iso(2 * HOUR);
+    const d = world(
+      [{ id: cid(1), labels: role("copy"), created: old }, { id: cid(2), labels: role("scan"), created: old }, { id: cid(3), labels: role("scan"), created: old }, { id: cid(4), labels: role("clone"), created: "not a date" }],
+      [{ name: "v1", labels: role("staging"), created: old }, { name: "v2", labels: role("staging"), created: old }],
+      [
+        (a) => (a[0] === "inspect" && a.at(-1) === cid(1) ? { code: 1, stderr: "Error response from daemon: No such container: x" } : undefined),
+        (a) => (a[0] === "inspect" && a.at(-1) === cid(2) ? { code: 1, stderr: "Cannot connect to the Docker daemon" } : undefined),
+        (a) => (a[0] === "rm" && a.at(-1) === cid(3) ? { code: 1, stderr: "Error: No such container: x" } : undefined),
+        (a) => (a[0] === "volume" && a[1] === "rm" && a.at(-1) === "v1" ? { code: 1, stderr: "volume is in use" } : undefined),
+      ],
+    );
+    const r = await d.sweepCheckLeftovers(3600);
+    // cid(1) gone: skipped; cid(2) failed inspect: failure; cid(3) gone at removal: skipped; cid(4) NaN age: failure; v1 in use: failure; v2 removed.
+    expect(r).toEqual({ removed: ["v2"], failures: 3 });
+    expect(d.argvs.filter((a) => a[0] === "rm").map((a) => a.at(-1))).toEqual([cid(3)]);
+  });
+
+  it("counts a failed listing and keeps going; an owner label that differs on inspect keeps the item", async () => {
+    const d = world(
+      [{ id: cid(1), labels: role("scan", { "mcp-everything": "1", "mcp-everything.owner": OTHER_ID }), created: iso(2 * HOUR) }],
+      [{ name: "v", labels: role("staging"), created: iso(2 * HOUR) }],
+      [(a) => (a[0] === "volume" && a[1] === "ls" ? { code: 1, stderr: "boom" } : undefined)],
+    );
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [], failures: 1 });
+    expect(d.count("rm")).toBe(0);
+  });
+
+  it("never throws when Docker cannot be run at all", async () => {
+    class Throws extends ScriptedDocker {
+      protected override async docker(): Promise<never> {
+        throw new Error("spawn docker ENOENT");
+      }
+    }
+    const r = await new Throws(loadConfig({}), TEST_INSTALLATION_ID).sweepCheckLeftovers(0);
+    expect(r).toEqual({ removed: [], failures: 2 });
+  });
+});
+
+describe("runScanner and copyVolume on volumes that are mine with their roles", () => {
+  it("do not throw", async () => {
+    const d = mk();
+    d.putVolume(STAGING, "mine", "staging");
+    d.putVolume(TARGET, "mine");
+    await d.runScanner(STAGING, SCANNER, { timeoutMs: 20_000 });
+    await d.copyVolume(STAGING, TARGET);
+    expect(d.count("create")).toBe(2);
   });
 });

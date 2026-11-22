@@ -73,7 +73,7 @@ Give mcp-everything a way to check a repository after it is cloned and before an
 - Every report says what the policy decided and why ("blocked: 2 findings at error or above, from trivy").
 
 **DD5 — The built-in check: what the build will run.** A check named `build-hooks`, always present, run in-process on files the clone container reads. It shares DD3's findings and DD4's policy; it is not a container under DD2's contract.
-- **The walk.** The clone script additionally walks the checkout (skipping `.git`, `node_modules`, `vendor`) for files that hold build code: every `package.json`, `setup.py`, `pyproject.toml`, `build.rs`, `Cargo.toml`, `CMakeLists.txt` and `*.cmake`, `configure`/`configure.ac`, `Makefile` variants, `*.gemspec`, `extconf.rb`, `Rakefile`, `binding.gyp`. At most 200 files, at most 64 KB each, and **at most 2 MB in total**.
+- **The walk.** *(In flight, 2026-11-22: the file list is now `BUILD_FILE_PATTERNS` in leg 3, `build-hooks`, which added the package-manager, Cargo, Python-backend, Ruby and autotools files the recipes also run; the list below is the planning-time one.)* The clone script additionally walks the checkout (skipping `.git`, `node_modules`, `vendor`) for files that hold build code: every `package.json`, `setup.py`, `pyproject.toml`, `build.rs`, `Cargo.toml`, `CMakeLists.txt` and `*.cmake`, `configure`/`configure.ac`, `Makefile` variants, `*.gemspec`, `extconf.rb`, `Rakefile`, `binding.gyp`. At most 200 files, at most 64 KB each, and **at most 2 MB in total**.
   - **In the script**: busybox `find` with `-prune`, `-name` and `-type f` (which also skips symlinks), output sorted for a stable order, and guarded so that `set -eu` cannot abort the clone on a `find` error. The counters live inside the `while read` loop's subshell, so the loop itself prints an `INCOMPLETE` line when a budget is reached. A name containing a newline is skipped and also marks the walk incomplete.
   - **Its output** is a new line, `BUILD <base64 path> <base64 content>` (paths may contain spaces), parsed by a branch of its own into a new `ProbeData` field, not `files`, which detection reads. The clone's stdout cap rises from 8 MB to 16 MB: the existing manifests alone (300 KB each, base64) can approach 8 MB.
   - **Never clean when partial**: when the script reports `INCOMPLETE`, or the runner reports truncated output, the check says **incomplete** and what it did not read.
@@ -112,13 +112,13 @@ Give mcp-everything a way to check a repository after it is cloned and before an
 
 **DD9 — Split `Installer.install` first, without changing behavior.** Mission 02's debrief: the method is about 225 lines with three state variables for two facts; it was edited in three legs, and its one false statement to the operator came from that. Split it before the next change. Leg 1 does the three extractions the debrief named (retiring the old sandbox; the build attempts; settling a failure), with the phase as one value, **leaving room for a state before `old`** (DD6's `checking`) without adding it. Leg 5 then owns the new sequence end to end.
 
-**DD10 — The clone image is pinned.** `alpine/git:latest` clones every repository, now reads its build code, and runs the copy. It becomes a digest-pinned reference, still overridable with `MCPE_PROBE_IMAGE`, per the mission's constraint on images mcp-everything chooses. Landed in leg 3, before the real-Docker cases depend on it. Build images (`node:lts` and so on) are left alone: version detection chooses their tags. Trade-off: the pin goes stale until someone bumps it.
+**DD10 — The clone image is pinned.** `alpine/git:latest` clones every repository, now reads its build code, and runs the copy. It becomes a digest-pinned reference, still overridable with `MCPE_PROBE_IMAGE`, per the mission's constraint on images mcp-everything chooses. Landed in leg 4 (`owned-clone`; leg 3 at planning), before the real-Docker cases depend on it. Build images (`node:lts` and so on) are left alone: version detection chooses their tags. Trade-off: the pin goes stale until someone bumps it.
 
 **DD11 — Verification apparatus.**
 - **Unit**: the existing Docker test double for the contract, the runner's sequence of Docker calls, parsing, cleaning, the policy, the built-in patterns and budgets, the install's sequences and outcomes; SARIF written by hand in the test files (not golden files). Every new Docker method is added to the coverage test's lists (`test/docker.test.ts`, which asserts the class's methods are exactly those lists): the runner, the copy and the sweep act on what they listed or created, so they go in the guarded table, not `NOT_GUARDED`.
 - **Docker-gated suite**, with a scanner that needs no custom image: pinned `alpine` running `sh -c` to print a fixed SARIF document, print garbage, or sleep past its time. Cases: a check of `tomnomnom/gron` (the Go path: "runs nothing"); an install under `block` with the always-error scanner (blocked, no record, nothing left in Docker); a reinstall of an installed project under the same (blocked; the old sandbox still answers a tool call); a timed-out scanner (reported, not blocking, its container gone); a copy that preserves a symlink and an executable bit; the startup sweep (old leftovers of this installation removed, another owner's left).
 - **Act and observe**: the suite drives `App` through `callTool`, as today. It observes the tool results, `docker ps -a` / `docker volume ls` filtered on the suite's own owner label, and a tool call into the old sandbox.
-- **Guard**: new cases use the suite's own name prefix; `mayRemove` is extended deliberately for the staging, scan, clone and copy names, not loosened, and its self-test gains cases for each, including negatives (the same names under the operator's own prefix must be refused). Mission 02's rule holds: the first run of the new destructive cases is gated on the Flight Director's go-ahead, with the operator's container and volume ids recorded at the start of execution.
+- **Guard**: new cases use the suite's own name prefix; `mayRemove` is extended deliberately for the staging, scan, clone and copy names, not loosened, and its self-test gains cases for each, including negatives (the same names under the operator's own prefix must be refused). *(In flight, 2026-11-22: not extended after all. Every new case runs under the suite's own `mcpe-it-<pid>-` prefix, which `mayRemove` already covers; extending it would widen the safety surface for no gain. A later leg that runs a new case under the default prefix must extend it then.)* Mission 02's rule holds: the first run of the new destructive cases is gated on the Flight Director's go-ahead, with the operator's container and volume ids recorded at the start of execution.
 - A repository with npm hooks (a real `build-hooks` report through a real build) is left to the HAT leg, chosen there: the suites must not depend on a third party's package scripts staying put.
 
 ### Prerequisites
@@ -140,6 +140,7 @@ Give mcp-everything a way to check a repository after it is cloned and before an
 ## In-Flight
 
 ### Technical Approach
+*(In flight, 2026-11-22: the legs below are the planning-time breakdown. The live list is under Legs: `scan-rules` was split into `scan-rules` and `build-hooks`, and `clone-walk` into `owned-clone` and `clone-walk`, giving nine legs. The walk's output line is now `BUILD <path> <0|1> <content>` and it matches links as well as files (leg 5).)*
 - **Leg 1 — split.** DD9. Suites green and unchanged.
 - **Leg 2 — scan rules (no Docker).** Configuration (DD1) in `config.ts`; a new `src/scan/` module with the scanner file's validation (DD2), SARIF parsing, cleaning and bounds (DD3), the policy (DD4), and the built-in check's analysis over given file contents (DD5's report and red flags). Pure functions, unit-tested; nothing calls them yet.
 - **Leg 3 — the clone's walk.** The clone container named, labelled (`role=clone`) and removed by id on a timeout; a role parameter on the probe; DD5's walk in the clone script, its `BUILD` and `INCOMPLETE` lines, their parser, and the raised cap; the clone image's pin (DD10). Coverage-test lists updated; a Docker-suite case for the walk's output on a real clone.
@@ -174,12 +175,16 @@ Give mcp-everything a way to check a repository after it is cloned and before an
 
 > **Note:** These are tentative suggestions, not commitments. Legs are planned and created one at a time as the flight progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] `split-install` - Split `Installer.install` into the three pieces mission 02's debrief named, with no change in behavior
-- [ ] `scan-rules` - Configuration, the scanner file, SARIF findings and their cleaning, the policy, and the built-in check's analysis; no Docker
-- [ ] `clone-walk` - The named clone container, the bounded walk of build code and its parser, the pinned clone image
-- [ ] `scan-in-docker` - The scanner runner, the guarded copy, the leftovers sweep
-- [ ] `check-before-build` - The checked install: checking state, re-read, moved prelude, staging and copy, blocked installs and reinstalls, the outcome
-- [ ] `agent-view-and-docs` - `check_project`, the security status in instructions and results, the README
+- [x] `split-install` - Split `Installer.install` into the three pieces mission 02's debrief named, with no change in behavior
+- [x] `scan-rules` - Configuration, shared scan types, the scanner file, SARIF findings and their cleaning, the policy; no Docker
+- [x] `build-hooks` - The built-in check's analysis of what each recipe runs, and its red flags; no Docker *(split out of `scan-rules` at its design review, 2026-11-22)*
+- [x] `owned-clone` - The clone as an owned one-shot container removed by id, the staging label, the raised cap, the pinned clone image
+- [x] `clone-walk` - The bounded walk of build files and its parser *(split from `owned-clone` at its design review, 2026-11-22)*
+- [x] `scan-in-docker` - The scanner runner, the guarded copy, the leftovers sweep
+- [x] `checked-install` - `installChecked` in the installer: check first, re-read, shared opening and remainder, staging and copy, the outcome
+- [x] `checked-install-server` - The server's entry point, wording by outcome, "being checked", the startup sweep, and the integration cases *(split from `check-before-build` at its design review, 2026-11-22)*
+- [x] `check-tool` - `check_project` on its own job key, `Installer.check`, the shared report renderer
+- [x] `security-status-and-docs` - Generated instructions, the `security:` line, the startup statement, and the README with its corrections *(split from `agent-view-and-docs` at its design review, 2026-11-22)*
 - [ ] `hat-and-alignment` *(optional)* - Guided HAT (human acceptance test) session with iterative fixes
 
 ---
