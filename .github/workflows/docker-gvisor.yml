@@ -16,13 +16,14 @@ on:
   workflow_dispatch:
   pull_request:
     types: [opened, synchronize, ready_for_review]
+    # Advisory (not a required check): runs on demand, or for sandbox, network and install changes.
     paths:
-      - "src/**"
-      - "test/**"
-      - "package.json"
+      - "src/sandbox/**"
+      - "src/network/**"
+      - "src/install/**"
+      - "test/integration/**"
       - "package-lock.json"
       - ".nvmrc"
-      - "tsconfig*.json"
       - ".github/workflows/docker-gvisor.yml"
 
 permissions:

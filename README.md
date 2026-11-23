@@ -432,6 +432,7 @@ or times out never blocks an install.
       "image": "aquasec/trivy@sha256:<digest of the version you chose>",
       "command": ["fs", "--quiet", "--format", "sarif", "/scan/repo"],
       "network": true,
+      "hosts": ["mirror.gcr.io", "ghcr.io"],
       "timeout_seconds": 300,
       "env": []
     }
@@ -858,9 +859,14 @@ the same entry form as above except that it may hold IP literals and local names
 only those hosts, through a one-shot proxy that lives as long as the scanner
 runs, and local addresses are allowed for them. **A scanner with `network: true`
 and no `hosts` is refused at startup** under containment, naming the scanner.
-Under `open`, `hosts` has no effect. The Trivy example above has no `hosts`: the
-hosts a real Trivy run needs were not measured here, so find them from the
-scanner's documentation, add them, and test.
+Under `open`, `hosts` has no effect. The Trivy example above lists the hosts
+measured on 2026-11-23 with Trivy 0.76.2 under `MCPE_NETWORK=contained`:
+`check_project` on a Go repository and on a Node install both reported Trivy
+`ran` with only these two. They are the registries of Trivy's default
+`--db-repository`, `--java-db-repository` and `--checks-bundle-repository`
+(`mirror.gcr.io` first, `ghcr.io` as the fallback). Those runs did not exercise
+the Java DB download. A different Trivy version or different flags (a different
+`--db-repository`, say) may need other hosts; a refused run names them.
 
 ### What reaches outside services
 
@@ -1131,11 +1137,18 @@ because Docker refuses an unregistered runtime and does not fall back.
   and that it is required, or that Docker's default is in use.
 - **What is tested.** The check, its caching, the refusal messages and the
   comparison with an existing sandbox's runtime are tested against a test
-  double of Docker. No runtime other than Docker's default has been run by this
-  project's tests so far; in particular, a build that a stronger runtime
-  refuses (a syscall it does not support) would show up only when you run it.
-  Behavior under gVisor (`runsc`) is not yet tested in CI.
-  <!-- LEG 12 (gvisor-ci): replace the sentence above once docker-gvisor.yml has passed with: "Behavior under gVisor is tested in CI on Linux (docker-gvisor.yml)." and say what that run covers; until then it stays as it is. -->
+  double of Docker. Behavior under gVisor is tested in CI on Linux
+  (`.github/workflows/docker-gvisor.yml`, advisory, run on demand or for
+  changes under `src/sandbox`, `src/network`, `src/install` and
+  `test/integration`): the Docker suite runs with
+  `MCPE_DOCKER_RUNTIME=runsc` (gVisor registered with `--overlay2=none`),
+  including contained installs and local access, and a runtime proof checks
+  that every container mcp-everything starts runs under gVisor. Two pressure
+  cases and the stopped-sandbox recreation case above are skipped under
+  `runsc`. Containment is also tested under `runc` on native Linux. Not tested:
+  Docker Desktop with gVisor. A build that gVisor refuses (a syscall it does
+  not support) for a project the tests do not install would show up only when
+  you run it.
 
 ## Several installations on one Docker daemon
 

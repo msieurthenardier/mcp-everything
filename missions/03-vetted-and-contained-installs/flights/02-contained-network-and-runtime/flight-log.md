@@ -644,6 +644,68 @@ The Docker case for the volume fix has a fifth, owed in Phase B: run it once wit
 - CHANGED, T14 "in code": `skipIf(MCPE_DOCKER_RUNTIME === "runsc")`; unchanged otherwise.
 - CHANGED, `test/integration/gvisor.test.ts` runtime-proof case: the events format.
 - No new Docker object is made by any case. Cases that call `setNetwork(.., "contained")` on a running sandbox now stop and start it under `MCPE_DOCKER_RUNTIME=runsc` (the product change), which only the CI `gvisor` job exercises; locally (no runtime named) they behave as before.
+README gVisor sentence updated after run 45210799694
+
+### hat-and-alignment — inline fixes
+- README: the Trivy scanner example now has `"hosts": ["mirror.gcr.io", "ghcr.io"]`; the "not measured" paragraph is replaced by the measurement (Trivy 0.76.2, `MCPE_NETWORK=contained`, 2026-11-23, Go repository and Node install both `ran`; Java DB download not exercised; other versions or flags may need other hosts). No other README text called the Trivy hosts unmeasured.
+- `.github/workflows/docker-gvisor.yml`: the `pull_request` `paths` filter narrowed to `src/sandbox/**`, `src/network/**`, `src/install/**`, `test/integration/**`, `package-lock.json`, `.nvmrc` and the workflow itself, with a comment that the job is advisory and on demand; `workflow_dispatch` kept. The README gVisor sentence now says when the workflow runs.
+- Tests: `npm test` 2751 passed / 71 skipped (unchanged); `test/readme.test.ts` 17 passed. No test changed.
+
+### hat-and-alignment — the session (operator with the Flight Director, 2026-11-23)
+Run on `3cba097` plus the README gVisor sentence, with `dist/` rebuilt from that commit. The operator's mcp-everything runs `MCPE_SCAN=on` with Trivy 0.76.2 as its scanner.
+
+1. **Built and reconnected, containment off. Pass.**
+   - `set_project_hosts` is in the tool list.
+   - The instructions say "Sandbox networks are not contained … MCPE_NETWORK=contained", and the runtime is Docker's default.
+   - `project_info` gron: `network: off` from Docker's view.
+2. **Trivy's hosts. Pass on the first try.**
+   - The candidates came from Trivy 0.76.2's own `fs --help` defaults: `--db-repository`, `--java-db-repository`, `--checks-bundle-repository`.
+   - `"hosts": ["mirror.gcr.io", "ghcr.io"]` was added to the operator's `scanners.json`; the backup is in the session scratchpad.
+   - The operator re-registered with `MCPE_NETWORK=contained` and reconnected.
+   - `check_project tomnomnom/gron`: Trivy `ran` and found CVE-2026-39824 (its DB downloaded through the proxy; no cache configured).
+   - No storage-redirect host was needed. The Java DB was not exercised.
+3. **Containment on. Pass, with little to exercise:** no project had its network on.
+   - The startup pass created no networks or proxies.
+   - gron's tool ran.
+   - gron is a pre-ownership sandbox, so it is not containable (a standing gap). Its network was left off.
+4. **A refusal fixed, without a reinstall. Pass.** On rebuilt rea with its network on:
+   - Contained with its defaults: `registry.npmjs.org` 200; `api.github.com` refused; a direct connection has no route.
+   - `set_project_hosts add api.github.com`: it returns 200 at once, and `github.com` is still refused.
+   - `project_info` shows `network: contained`, the effective allowlist, the recorded hosts, and the refusals with the advisory hint.
+   - The host was removed again, and exactly one proxy remained after two replacements.
+   - The hint wording drew no objection.
+5. **A contained install. Pass.** `install_project morluto/rea reinstall` under containment:
+   - It is ready on sandbox `mcpe-e44f84eb-rea` (owned).
+   - Trivy scanned it (1 medium).
+   - The build was refused `telemetry.vercel.com:443`, with the advisory hint, and finished.
+   - Its network was off afterwards; the proxy and network were removed with it.
+6. **Local access. Skipped**, operator's choice: covered by the local Docker suite and both CI jobs.
+7. **Settings.**
+   - The operator **stays contained** (`MCPE_NETWORK=contained`; Trivy `hosts` kept).
+   - rea's network is back to off; gron is untouched.
+   - No throwaway project was added: the rea reinstall served as step 5.
+
+**Findings during the HAT**
+- **rea's old sandbox was gone before the HAT began.**
+  - `mcpe-rea`, its container and volume, was missing from Docker while its record said `ready`. It was present at 03:15 local (fix2 before-list) and absent at 07:55 (leg 13 before-list).
+  - At 07:50:30 the operator's other installation, `bde0aedf` (apparently on Windows, against the same Docker Desktop), created `mcpe-bde0aedf-rea` for the same repository.
+  - Likely cause, not proven: a sandbox made before ownership labels (`mcp-everything=1`, project label, no owner) is classed `before`, which every installation treats as its own. So another installation can take it as its leftover.
+  - Nothing in this flight ran destructive Docker work in that window. Docker's event buffer was flooded by another project's health checks, so it could not confirm.
+  - The operator chose to reinstall rea (done, now owned) and **did not choose a squawk for the cause**. It is carried to the debrief. gron keeps the same exposure until reinstalled.
+- **rea's MCP tools changed shape.**
+  - Before: its registered server `rea-mcp` published 40 of 255 tools.
+  - Now: the detected server `rea` offers 263, so none are published individually. 28 CLI-level tools are published, and the server's tools are reachable through `find_project_tools` / `call_project_tool` / `select_project_tools`.
+  - This is a tool-limit policy from before this flight, not containment. Noted for the debrief.
+- **A server outlived its reconnect by about 10 minutes.** After the second `/mcp` reconnect, the previous server (no containment) kept running beside the new one, then exited on its own. The one before it exited at once. Noted for the debrief; nothing observed depended on it.
+
+**Operator decisions**
+- Stay contained.
+- The `gvisor` job is advisory and on demand: `main` has no branch protection, and the PR trigger is narrowed to sandbox, network, install and integration-test changes.
+- Step 6 skipped.
+- **Squawks:** 0053, the nine leftover test volumes (deferred; full ids attributed, removal needs the operator's OK).
+- **npm floods a refused registry:** chosen as a squawk, but it fails the squawk gate (a design choice between proxy backoff and an installer early stop, and a lifecycle change), so it is **recommended as a sortie** and carried to the debrief.
+  - The refusal record is already bounded: one row per host with a count, and messages capped at 10 lines.
+- **Not chosen:** a squawk for unowned sandboxes being removable by another installation, and one for pre-ownership sandboxes not being contained. Both are carried to the debrief.
 
 ## Decisions
 
@@ -1192,6 +1254,14 @@ The Docker case for the volume fix has a fifth, owed in Phase B: run it once wit
   - 9 mutations; 8 were caught. **Not caught**: a failed `docker stop` in `whileStopped` (no test pins "stop fails, so nothing changes"). The code throws correctly.
   - **Follow-ups (non-blocking)**: a unit test for a failed stop, and splitting a double statement in `test/docker-bypass.test.ts:282`.
   - Leg 14 set to `completed`; committed and pushed for the third `gvisor` round.
+- **Third full `gvisor` round on `3cba097` (run 45210799694): ALL GREEN.**
+  - `ci.yml` ✅.
+  - **`gvisor` Run A: 65 passed, 3 skipped** (the two pressure cases, and T14 under runsc with its named cause), 590 s. **Run B: 3 of 3.**
+  - **`contained-linux` (runc, native Linux): 31 of 31.**
+  - `measure` ✅.
+  - The fixed proxy MAC cleared every swap case, so **`RESTART_AFTER_SWAP` stays off**.
+  - **DD13 holds: under `runsc` on native Linux, every container mcp-everything starts runs under gVisor. Contained installs, the containment cases and the local-access path all pass under gVisor; containment passes under runc on native Linux too.**
+- The README's gVisor sentence (leg 11's placeholder) is updated by a Developer. It rides with the HAT leg's commit.
 - **A stalled shell, found by the operator.**
   - A Developer's background wait loop, `while pgrep -f 'vitest run test/integration' …; do sleep 15; done`, had run for 7 h 46 min (since about leg 9's Docker run).
   - It could never end, because `pgrep -f` matched the loop's own command line, which contains the pattern. It kept that agent's task "waiting on its own background work".

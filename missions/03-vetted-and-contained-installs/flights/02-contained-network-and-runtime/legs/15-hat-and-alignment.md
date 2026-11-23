@@ -1,6 +1,6 @@
 # Leg: hat-and-alignment
 
-**Status**: ready
+**Status**: completed
 **Flight**: [Contained Network and Isolation Runtime](../flight.md)
 
 ## Objective
@@ -32,13 +32,13 @@ The operator also decides the open items. Issues found are fixed as they come.
   - whether the client's mcp-everything stays contained after the HAT.
 
 ## Acceptance Criteria (verification steps, one at a time)
-- [ ] 1. **Built and reconnected, containment off.** `npm run build`, then reconnect mcp-everything. `set_project_hosts` appears in the tool list. The server's instructions say networks are not contained, and how to turn containment on. `project_info` of one existing project shows `network: off | open` from Docker's view.
-- [ ] 2. **Trivy's hosts.** In `scanners.json`, add a first `hosts` list to the Trivy entry (candidates read from Trivy's own documentation at the time, not from memory). Then reconnect with `MCPE_NETWORK=contained` and run `check_project` on a small repository. Either Trivy's outcome is `ran`, or its failure text names the refused hosts, which are added, and the step repeats until it is `ran`. The final list is recorded for the README's Trivy example.
-- [ ] 3. **Containment on.** With `MCPE_NETWORK=contained`, the instructions say "contained". The startup log, and `project_info` of each project whose network was on, shows it contained. Their tools still run. A project whose server needs an outside API shows a refusal with the advisory hint.
-- [ ] 4. **A refusal fixed.** Where step 3 or a deliberate call shows a refused host, `set_project_hosts(add: [...])` makes the call work, with no reinstall. `project_info` lists the host. The operator judges that the hint's wording is advisory, not instructive.
-- [ ] 5. **A contained install.** A throwaway project, chosen with the operator, installs under containment and its tool runs. `project_info` shows the network state, and no refusal warnings (or the expected ones).
-- [ ] 6. **Local access** *(optional, the operator's choice)*. A service on the operator's machine (published port) is reached only by the repository named in `MCPE_LOCAL_ACCESS`, after a reconnect and turning the project's network on.
-- [ ] 7. **Back to the operator's chosen settings**, then reconnect. The throwaway project is removed. The operator's decisions on the open items are recorded.
+- [x] 1. **Built and reconnected, containment off.** `npm run build`, then reconnect mcp-everything. `set_project_hosts` appears in the tool list. The server's instructions say networks are not contained, and how to turn containment on. `project_info` of one existing project shows `network: off | open` from Docker's view.
+- [x] 2. **Trivy's hosts.** In `scanners.json`, add a first `hosts` list to the Trivy entry (candidates read from Trivy's own documentation at the time, not from memory). Then reconnect with `MCPE_NETWORK=contained` and run `check_project` on a small repository. Either Trivy's outcome is `ran`, or its failure text names the refused hosts, which are added, and the step repeats until it is `ran`. The final list is recorded for the README's Trivy example.
+- [x] 3. **Containment on.** With `MCPE_NETWORK=contained`, the instructions say "contained". The startup log, and `project_info` of each project whose network was on, shows it contained. Their tools still run. A project whose server needs an outside API shows a refusal with the advisory hint.
+- [x] 4. **A refusal fixed.** Where step 3 or a deliberate call shows a refused host, `set_project_hosts(add: [...])` makes the call work, with no reinstall. `project_info` lists the host. The operator judges that the hint's wording is advisory, not instructive.
+- [x] 5. **A contained install.** A throwaway project, chosen with the operator, installs under containment and its tool runs. `project_info` shows the network state, and no refusal warnings (or the expected ones).
+- [x] 6. *(skipped, operator's choice)* **Local access** *(optional, the operator's choice)*. A service on the operator's machine (published port) is reached only by the repository named in `MCPE_LOCAL_ACCESS`, after a reconnect and turning the project's network on.
+- [x] 7. **Back to the operator's chosen settings**, then reconnect. The throwaway project is removed. The operator's decisions on the open items are recorded.
 
 ## Post-Completion
 Completion steps — status transitions, flight-log update, checking off in the parent flight, and commit — are Flight Control protocol, driven by the execution workflow. Not repeated here.
