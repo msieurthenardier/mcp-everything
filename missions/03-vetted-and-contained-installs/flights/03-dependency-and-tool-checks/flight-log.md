@@ -3,7 +3,7 @@
 **Flight**: [Checking Dependencies and Tool Descriptions](flight.md)
 
 ## Summary
-In flight since 2026-11-23. Premises measured 2026-11-23 against GitHub's dependency graph and OSV (see the flight's Open Questions).
+Landed 2026-11-23: three autonomous legs and a HAT (steps 1–5 and 7 passed, step 6 skipped by the operator; no code fixes were needed at the HAT). The README's security chapters move to `docs/` in flight 4's first leg (operator decision at the HAT). Premises measured 2026-11-23 against GitHub's dependency graph and OSV (see the flight's Open Questions).
 
 **Baseline** (2026-11-23, `4a0dd5e`): `npx vitest run` gives 2751 passed, 71 skipped, 0 failed, in two consecutive runs. A first run under load (35.9 s) had 1 failure that did not repeat; it was not identified (a flake, likely timing in a real-socket file).
 
@@ -89,6 +89,18 @@ Items carried from flight 01's and flight 02's debriefs that touch this flight, 
   - `vetCatalog` is exported from `discovery.ts` so the throw case is unit-tested directly; the other cases run through the installer and `App`.
   - Flight checklist boxes were not touched (legs 1 and 2 are also unchecked there).
 - **Notes**: nothing committed.
+
+### hat-and-alignment
+
+- **Status**: completed
+- **Step 1 (rebuild and reconnect)**: passed, 2026-11-23. `dist/` built at 12:35 from `06b42c9`; the operator's mcp-everything process restarted at 14:29 (after `/mcp`). The live instructions, rendered from that process's own `MCPE_*` environment with `buildInstructions(loadConfig())`, name `dependencies (built-in, GitHub repositories: sends the repository name to GitHub and exact package versions to OSV)`, `build-hooks`, `tool-descriptions (built-in, generated tools when they are discovered)` and `trivy`, followed by the withholding sentence. (The Flight Director's own copy of the instructions is the one captured at session start and still shows the old line: the client does not refresh a server's instructions mid-session. Not a defect.)
+- **Step 2 (`check_project OWASP/NodeGoat`)**: passed, 2026-11-23, at `c5cb68a`. `dependencies: ran; 1 error, 130 warning, 0 note`; sent line names GitHub (api.github.com) and 1091 packages to OSV (api.osv.dev; planning counted 1,085, so the graph has moved slightly). The one error is `fsevents 1.2.9` as `malicious-package` (`MAL-2023-462`, with `GHSA-8r6j-v8pm-fqw3`), a real OSV entry (the hijacked binary-download domain), which Trivy also reports as CVE-2023-45311 critical. Lodash appears as `lodash 2.4.2` in the 20 shown; `4.13.1` is not confirmed (among the 111 not shown). Order: dependencies, build-hooks, trivy. The operator judged the wording and length fine, including the shared "130 warning" count format and the overlap with Trivy's list.
+- **Step 3 (`check_project tomnomnom/gron` at `v0.7.1`)**: result as specified, 2026-11-23, at `badf401`. `dependencies: not-run; … GitHub's dependency graph describes the default branch (master), not v0.7.1; check without a ref to see it`; sent line `the repository's name to GitHub (api.github.com)` only. Decision line adds "dependencies did not run and was not counted". build-hooks ran (go); trivy 1 note.
+- **Step 4 (`check_project gitlab:pages/plain-html`)**: result as specified, 2026-11-23, at `87e8c32`. `dependencies: not-run; 0 error, 0 warning, 0 note; GitLab has no public dependency graph`, no sent line (nothing contacted). build-hooks ran (generic); trivy clean; decision line "dependencies did not run and was not counted".
+- **Step 5 (`refresh_mcp rea`, `project_info rea`)**: passed, 2026-11-23. Refresh: 1 MCP server, 263 proxied tools, first line unchanged in form. Both outputs carry `tool descriptions: checked 2026-11-23 under warn: 0 error, 0 warning` directly after `security:`. No finding on rea's 263 upstream tools plus its 28 published generated tools (long CLI-derived descriptions, rich schemas, subcommands such as `capture-process`, `annotate-native-function`): no false positive to triage.
+- **Step 6 (withholding under block)**: skipped at the operator's decision, 2026-11-23. Withholding stays covered by the unit suite (`installer.test.ts`, `server.test.ts`: block-mode install and refresh, `call_project_tool` "withheld", `project_info` naming the tool). The Flight Director's optional suggestion of a tool count on the `tool descriptions:` line was not taken up.
+- **Step 7 (README read-through)**: the operator raised the README's size (1,596 lines; 1,032 at the mission's start). Fix-vs-feature call (Flight Director, out loud): not a fix to this flight's surface but a reorganization of documentation written across the whole mission, spanning `README.md`, new files, `package.json` `files` and `test/readme.test.ts`; so not done inline. Operator decisions (2026-11-23): the security chapters move in **flight 4's first leg**, as a mechanical move, to **`docs/checking.md`, `docs/containment.md`, `docs/security-model.md`** (not `SECURITY.md`, which GitHub treats as the vulnerability-reporting policy in root, `docs/` or `.github/`). Recorded in `mission.md`'s flight 4 entry. The operator then read the three passages (`README.md` "The dependency check", "The tool-description check", "What reaches outside services") and judged the content fine.
+- **Outcome**: no code changed during the HAT. Flight set to `landed`; flight 3 checked off in `mission.md`.
 
 ---
 

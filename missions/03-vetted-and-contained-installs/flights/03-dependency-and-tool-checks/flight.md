@@ -1,15 +1,15 @@
 # Flight: Checking Dependencies and Tool Descriptions
 
-**Status**: in-flight
+**Status**: landed
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-23.** The mission's tentative flight 3 ("Checking what a project brings with it") held three independent clusters of design decisions. At the operator's agreement it was split: this flight takes the two checks that run inside mcp-everything and change no sandbox layout. The layout change (build output onto a volume, a scanner stage after the build) becomes flight 4, together with the `docker.ts` split and the `before` ownership fix that flight 2's debrief puts ahead of it.
 
 ## Contributing to Criteria
-- [ ] With scanning on and no scanner of the operator's own configured, the operator still gets… **for GitHub repositories, its dependencies that are known to be vulnerable or malicious** (the half flight 1 left).
-- [ ] With scanning on, … **generated tool descriptions, including those of tools added after the install, are checked before they are published** (the "what a build installed" half is flight 4).
-- [ ] The agent can have a repository checked without installing it, and gets the same findings an install would (extended to the dependency check).
-- [ ] The README describes … **what reaches outside services when scanning is on** (GitHub's API and OSV), and what these two checks do and do not catch.
+- [x] With scanning on and no scanner of the operator's own configured, the operator still gets… **for GitHub repositories, its dependencies that are known to be vulnerable or malicious** (the half flight 1 left).
+- [x] With scanning on, … **generated tool descriptions, including those of tools added after the install, are checked before they are published** (the "what a build installed" half is flight 4).
+- [x] The agent can have a repository checked without installing it, and gets the same findings an install would (extended to the dependency check).
+- [x] The README describes … **what reaches outside services when scanning is on** (GitHub's API and OSV), and what these two checks do and do not catch.
 
 ---
 
@@ -172,12 +172,12 @@ Flags:
 - [x] `api.github.com` dependency graph answers unauthenticated (measured 2026-11-23).
 - [x] `api.osv.dev/v1/querybatch` answers and returns `MAL-` ids (measured 2026-11-23).
 - [x] Docker reachable for the Docker-gated suite (server 29.8.2; unchanged since flight 2).
-- [ ] Unit and Docker suite baselines recorded at the start of execution (flight 2's debrief: 2751 passed, 71 skipped, 17.4 s unit).
+- [x] Unit and Docker suite baselines recorded at the start of execution (flight 2's debrief: 2751 passed, 71 skipped, 17.4 s unit).
 
 ### Pre-Flight Checklist
 - [x] All open questions resolved
 - [x] Design decisions documented
-- [ ] Prerequisites verified (the baseline is execution-time by design)
+- [x] Prerequisites verified (the baseline is execution-time by design)
 - [x] Validation approach defined
 - [x] Legs defined
 
@@ -199,10 +199,10 @@ Flags:
 4. **HAT.**
 
 ### Checkpoints
-- [ ] Discovery extracted; `npm test` count unchanged.
-- [ ] `check_project` on a GitHub repository reports a `dependencies` outcome, with what was sent, alongside the clone's report.
-- [ ] Under `block`, a flagged tool is absent from the tool list, `find_project_tools` and `call_project_tool`, and `project_info` names it.
-- [ ] README and instructions describe both checks and what reaches outside services.
+- [x] Discovery extracted; `npm test` count unchanged.
+- [x] `check_project` on a GitHub repository reports a `dependencies` outcome, with what was sent, alongside the clone's report.
+- [x] Under `block`, a flagged tool is absent from the tool list, `find_project_tools` and `call_project_tool`, and `project_info` names it. (Unit tests; the live demonstration, HAT step 6, was skipped by the operator.)
+- [x] README and instructions describe both checks and what reaches outside services.
 
 ### Adaptation Criteria
 
@@ -222,17 +222,17 @@ Flags:
 - [x] `extract-discovery` - Move discovery out of `installer.ts` behind the same calls, with no behavior change. Only the installer changes; nothing in `src/toolgen/` (low risk).
 - [x] `dependency-check` - GitHub dependency graph and OSV lookups as the `dependencies` built-in check, before the clone, at checked installs and in `check_project`. Includes `CheckOutcome.contacted`, the lookup that is inert unless injected (`Installer` and `AppOptions`; the real client in `index.ts`), the rewritten `unreachableBlock`, the report, the instructions and the README (high risk: third-party input parser, outside services).
 - [x] `tool-description-check` - `buildToolsWithText` with transient sources, the `tool-descriptions` check in `vetCatalog` at the end of discovery, withholding under block, `toolCheck` on the record, what the agent is told, the instructions and the README (high risk: changes what is published and callable).
-- [ ] `hat-and-alignment` - Guided HAT session with iterative fixes (operator, 2026-11-23).
+- [x] `hat-and-alignment` - Guided HAT session with iterative fixes (operator, 2026-11-23).
 
 ---
 
 ## Post-Flight
 
 ### Completion Checklist
-- [ ] All legs completed
+- [x] All legs completed
 - [ ] Code merged
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Tests passing
+- [x] Documentation updated
 
 ### Verification
 - `check_project` on a GitHub repository with scanning off reports `dependencies` and what was sent; an install with scanning off sends nothing (unit-pinned: the injected interface is never called). Under `block` at `error` with no operator scanner, the startup log and instructions say what can still block.
