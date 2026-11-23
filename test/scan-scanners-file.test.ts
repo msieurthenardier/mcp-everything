@@ -13,7 +13,7 @@ describe("parseScannersFile", () => {
   it("accepts an empty list and applies defaults", () => {
     expect(parse({ scanners: [] })).toEqual([]);
     expect(parse({ scanners: [entry()] })).toEqual([
-      { name: "trivy", image: "aquasec/trivy:0.50", command: ["trivy", "fs", "."], network: false, timeoutSec: 300, env: [] },
+      { name: "trivy", image: "aquasec/trivy:0.50", command: ["trivy", "fs", "."], network: false, hosts: [], timeoutSec: 300, env: [] },
     ]);
   });
   it("accepts every field", () => {
@@ -87,5 +87,37 @@ describe("parseScannersFile", () => {
   it("does not read inherited values", () => {
     // `name` etc. must be own keys; an entry with only inherited-looking data is simply missing them.
     bad({ scanners: [{}] }, /"name"/);
+  });
+
+  describe("hosts", () => {
+    it("is [] when absent and normalized when given", () => {
+      expect(parse({ scanners: [entry()] })[0]!.hosts).toEqual([]);
+      expect(
+        parse({ scanners: [entry({ network: true, hosts: ["GHCR.io.", "registry.example.com:443", "10.0.0.5:8080", "[0:0:0:0:0:0:0:1]:9", "*.pages.dev", "db.lan"] })] })[0]!.hosts,
+      ).toEqual(["ghcr.io", "registry.example.com:443", "10.0.0.5:8080", "[::1]:9", "*.pages.dev", "db.lan"]);
+    });
+    it("accepts 64 entries and refuses 65, none and a non-array", () => {
+      const many = (n: number) => Array.from({ length: n }, (_, i) => `h${i}.example.com`);
+      expect(parse({ scanners: [entry({ hosts: many(64) })] })[0]!.hosts).toHaveLength(64);
+      bad({ scanners: [entry({ hosts: many(65) })] }, /scanners\[0\] \(trivy\).*"hosts".*1 to 64/);
+      bad({ scanners: [entry({ hosts: [] })] }, /"hosts".*1 to 64/);
+      bad({ scanners: [entry({ hosts: "ghcr.io" })] }, /"hosts".*array/);
+      bad({ scanners: [entry({ hosts: null })] }, /"hosts".*array/);
+    });
+    it("refuses a non-string entry", () => {
+      bad({ scanners: [entry({ hosts: [5] })] }, /"hosts" entries must be strings/);
+    });
+    it.each([
+      ["localhost", /two labels/],
+      ["127.1", /number/],
+      ["*.co.uk", /registry suffix/],
+      ["a.com:0", /port "0"/],
+      ["https://a.com", /scheme/],
+      ["fe80::1", /colon/],
+      ["", /empty/],
+    ])("refuses %j through the grammar, naming the file, scanner and field", (h, re) => {
+      bad({ scanners: [entry({ hosts: [h] })] }, re);
+      bad({ scanners: [entry({ hosts: [h] })] }, /^s\.json: scanners\[0\] \(trivy\): "hosts" entry/);
+    });
   });
 });

@@ -4,8 +4,9 @@ import path from "node:path";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
-import { DockerUnavailableError, OWNER_SHOWN, parseProbeOutput, SandboxRefusedError } from "../src/sandbox/docker.js";
+import { DockerUnavailableError, OWNER_SHOWN, parseProbeOutput, RuntimeMismatchError, RuntimeUnavailableError, SandboxRefusedError } from "../src/sandbox/docker.js";
 import { Registry } from "../src/registry.js";
+import { Containment } from "../src/network/containment.js";
 import { App, buildInstructions } from "../src/server.js";
 import { unreachableBlock } from "../src/scan/policy.js";
 import { serveApp } from "../src/entry.js";
@@ -45,6 +46,41 @@ beforeEach(() => {
 afterEach(async () => {
   await app.shutdown();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+describe("containment wiring (leg 7)", () => {
+  it("the App builds a Containment over its registry and installs it as the Docker layer's hook", () => {
+    const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir });
+    const fake = new FakeDocker(cfg);
+    const install = vi.spyOn(fake, "setContainment");
+    const a = new App({ cfg, docker: fake, proxy: new McpProxy(cfg, fake, up.connector) });
+    expect(a.containment).toBeInstanceOf(Containment);
+    expect(install).toHaveBeenCalledTimes(1);
+    expect(install.mock.calls[0]![0]).toBeTypeOf("function");
+  });
+
+  it("under containment the App gives the installer its Containment (leg 8): the installer's constructor would refuse to be built without one", () => {
+    const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_NETWORK: "contained" });
+    const fake = new FakeDocker(cfg);
+    const a = new App({ cfg, docker: fake, proxy: new McpProxy(cfg, fake, up.connector) });
+    expect(a.containment).toBeInstanceOf(Containment);
+    expect(a.installer).toBeDefined();
+  });
+
+  it("builds the Containment before the installer (the source's order), and passes it as the installer's last argument", () => {
+    const src = fs.readFileSync(path.join(import.meta.dirname, "../src/server.ts"), "utf8");
+    const made = src.indexOf("this.containment = new Containment(");
+    const installer = src.indexOf("this.installer = new Installer(");
+    expect(made).toBeGreaterThan(0);
+    expect(installer).toBeGreaterThan(made);
+    expect(src).toMatch(/new Installer\([^)]*opts\.env, this\.containment\)/);
+  });
+
+  it("under open, the hook never changes anything: it answers no environment for a sandbox on bridge, and the registry is not touched", async () => {
+    const facts = { id: fakeSandboxId("x"), name: "mcpe-demo", running: true, labels: { "mcp-everything.project": "github:owner/demo" }, networks: ["bridge"], runtime: undefined };
+    expect(await app.containment.ensureContained(facts, "full")).toBeUndefined();
+    expect(fs.readdirSync(dir).filter((f) => f.includes(".proxy-"))).toEqual([]);
+  });
 });
 
 describe("tool lookup", () => {
@@ -163,7 +199,7 @@ describe("built-in tools", () => {
   it("set_project_network toggles the container and records the state", async () => {
     const res = await app.callTool("set_project_network", { project: "demo", enabled: true });
     expect(body(res)).toMatch(/now ON/);
-    expect(docker.network).toEqual([["mcpe-demo", true]]);
+    expect(docker.network).toEqual([["mcpe-demo", "open"]]);
     expect(app.registry.get("demo")!.network).toBe(true);
     expect((await app.callTool("set_project_network", { project: "demo" })).isError).toBe(true);
   });
@@ -1046,7 +1082,8 @@ describe("host environment variables for proxied MCP servers", () => {
       // project_info is the same description plus its one line about the sandbox's owner (leg 4)
       const info = body(await a.callTool("project_info", { project: "demo" }));
       expect(info).toMatch(/\n\nSandbox owner: [^\n]*$/);
-      expect(body(res).endsWith(info.replace(/\n\nSandbox owner: [^\n]*$/, ""))).toBe(true);
+      // (leg 9: project_info's network line is Docker's own view, `network: off`; the other tools say `network (recorded): off`)
+      expect(body(res).endsWith(info.replace(/\n\nSandbox owner: [^\n]*$/, "").replace("; network: off", "; network (recorded): off"))).toBe(true);
       expect(body(res)).not.toContain(SECRET_VALUE);
       expect(a.registry.get("demo")!.tools.filter((t) => t.kind === "mcp")).toHaveLength(4);
     });
@@ -1219,12 +1256,72 @@ describe("startup work: sweeps and stale installs", () => {
   });
   const mtime = () => fs.statSync(path.join(dir, "registry.json")).mtimeMs;
 
+  describe("the required runtime", () => {
+    class Runtime extends Reachable {
+      outcome: () => Promise<void> = async () => {};
+      runtimeCalls = 0;
+      override async assertRuntime(): Promise<void> {
+        this.runtimeCalls++;
+        return this.outcome();
+      }
+    }
+    const started = async (env: Record<string, string>, outcome?: () => Promise<void>) => {
+      const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, ...env });
+      const rt = new Runtime(cfg);
+      if (outcome) rt.outcome = outcome;
+      const log: string[] = [];
+      local = new App({ cfg, docker: rt, proxy: new McpProxy(cfg, rt, up.connector), log: (l) => log.push(l) });
+      local.start();
+      await local.startup;
+      await new Promise((r) => setImmediate(r));
+      return { rt, log };
+    };
+
+    it("does nothing when no runtime is named", async () => {
+      const { rt, log } = await started({});
+      expect(rt.runtimeCalls).toBe(0);
+      expect(log.filter((l) => l.includes("runtime"))).toEqual([]);
+    });
+
+    it("logs one line when Docker runs the named runtime", async () => {
+      const { rt, log } = await started({ MCPE_DOCKER_RUNTIME: "runsc" });
+      expect(rt.runtimeCalls).toBe(1);
+      expect(log.filter((l) => l.includes("runtime"))).toEqual(["startup: runtime runsc: Docker runs it"]);
+    });
+
+    it("logs the refusal's message", async () => {
+      const refusal = new RuntimeUnavailableError("runsc", "Docker lists no runtime called runsc");
+      const { log } = await started({ MCPE_DOCKER_RUNTIME: "runsc" }, async () => {
+        throw refusal;
+      });
+      expect(log).toContain(`startup: ${refusal.message}`);
+    });
+
+    it("logs that it was not checked when Docker is not reachable", async () => {
+      const { log } = await started({ MCPE_DOCKER_RUNTIME: "runsc" }, async () => {
+        throw new DockerUnavailableError("Docker daemon is not reachable");
+      });
+      expect(log).toContain("startup: runtime runsc not checked: Docker is not reachable");
+    });
+
+    it("never delays startup or the reconciliation: a check that never finishes does not hold `startup`", async () => {
+      const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_DOCKER_RUNTIME: "runsc" });
+      const rt = new Runtime(cfg);
+      rt.outcome = () => new Promise(() => {});
+      local = new App({ cfg, docker: rt, proxy: new McpProxy(cfg, rt, up.connector) });
+      local.registry.put({ ...record("old"), status: "installing", network: true });
+      local.start();
+      await local.startup;
+      expect(local.registry.get("old")).toMatchObject({ status: "failed", network: false });
+    });
+  });
+
   it("marks a stale installing record failed", async () => {
     local.registry.put({ ...record("old"), status: "installing", network: true });
     local.start();
     await local.startup;
     expect(local.registry.get("old")).toMatchObject({ status: "failed", network: false });
-    expect(fake.network).toEqual([["mcpe-old", false]]);
+    expect(fake.network).toEqual([["mcpe-old", "off"]]);
   });
 
   it("leaves a fresh installing record and the file alone", async () => {
@@ -1459,10 +1556,53 @@ describe("one check per operation, and the command runs on what the check return
   it("set_project_network: acquires once, then sets the network on that reference", async () => {
     await app.callTool("set_project_network", { project: "demo", enabled: true });
     expect(docker.ensureCalls).toEqual(["mcpe-demo"]);
-    expect(docker.network).toEqual([["mcpe-demo", true]]);
+    expect(docker.network).toEqual([["mcpe-demo", "open"]]);
     expect(docker.networkRefs).toEqual([docker.acquired[0]]);
     expect(docker.networkRefs[0]).toBeDefined();
     expect(docker.calls).toEqual([]);
+  });
+
+  describe("set_project_network on a sandbox acquire refuses for its runtime", () => {
+    const MISMATCH = () => new RuntimeMismatchError("mcpe-demo", "runsc", "runc");
+
+    it("false succeeds by name without calling acquire", async () => {
+      docker.acquireError = MISMATCH();
+      app.registry.put({ ...app.registry.get("demo")!, network: true });
+      const res = await app.callTool("set_project_network", { project: "demo", enabled: false });
+      expect(res.isError).toBeFalsy();
+      expect(body(res)).toMatch(/now off/);
+      expect(docker.ensureCalls).toEqual([]);
+      expect(docker.network).toEqual([["mcpe-demo", "off"]]);
+      expect(docker.networkRefs).toEqual([undefined]);
+      expect(app.registry.get("demo")!.network).toBe(false);
+    });
+
+    it("true is refused with the mismatch, and changes nothing", async () => {
+      docker.acquireError = MISMATCH();
+      const res = await app.callTool("set_project_network", { project: "demo", enabled: true });
+      expect(res.isError).toBe(true);
+      expect(body(res)).toMatch(/Reinstall the project to run it under runsc/);
+      expect(docker.network).toEqual([]);
+      expect(app.registry.get("demo")!.network).toBe(false);
+    });
+
+    it("false during an install is refused with the installing message", async () => {
+      app.registry.put({ ...app.registry.get("demo")!, status: "installing", network: true });
+      (app as unknown as { jobs: Map<string, unknown> }).jobs.set("github:owner/demo", { promise: new Promise(() => {}), log: [], startedAt: Date.now() });
+      const res = await app.callTool("set_project_network", { project: "demo", enabled: false });
+      expect(res.isError).toBe(true);
+      expect(body(res)).toMatch(/demo is still installing; check project_info\./);
+      expect(docker.network).toEqual([]);
+      expect(app.registry.get("demo")!.network).toBe(true);
+    });
+
+    it("false on a missing sandbox gives the reinstall message", async () => {
+      docker.stateResult = "missing";
+      const res = await app.callTool("set_project_network", { project: "demo", enabled: false });
+      expect(res.isError).toBe(true);
+      expect(body(res)).toMatch(/The sandbox for demo no longer exists\. Rebuild it with install_project\(repo: "github:owner\/demo", reinstall: true\)/);
+      expect(docker.network).toEqual([]);
+    });
   });
 
   it("a proxied tool: the server checks once, and a session that has to be opened checks again by name", async () => {
@@ -2237,10 +2377,37 @@ describe("what the agent is told about security", () => {
       expect(await instructionsOf(make({ MCPE_SCAN: "warn" }, true))).toContain("build-hooks (built-in), and the operator's scanners: trivy.");
       expect(await instructionsOf(make({ MCPE_SCAN: "warn" }))).toContain("the operator has configured no scanners of their own");
     });
-    it("name the runtime when one is set", async () => {
+    it("name the runtime when one is set, and say that it is required", async () => {
       const t = await instructionsOf(make({ MCPE_DOCKER_RUNTIME: "runsc" }));
-      expect(t).toContain("Isolation runtime: runsc.");
+      expect(t).toContain(
+        "Isolation runtime: runsc, required: installs and checks refuse to start if Docker cannot run it, and sandboxes created under another runtime must be reinstalled.",
+      );
       expect(t).not.toContain("Docker's default runtime");
+    });
+    it("say how containment is turned on when the network is open, and nothing else about containment", async () => {
+      const t = await instructionsOf(make({}));
+      expect(t).toContain(`${NETWORK} The operator turns containment on with MCPE_NETWORK=contained.`);
+      expect(t).not.toContain("Sandbox networks are contained");
+      expect(t).not.toContain("MCPE_LOCAL_ACCESS");
+      expect(t).not.toContain("required:");
+    });
+    it("say what is contained, for whom and how it is changed when MCPE_NETWORK=contained", async () => {
+      const t = await instructionsOf(make({ MCPE_NETWORK: "contained" }));
+      expect(t).toContain("Sandbox networks are contained: ");
+      expect(t).not.toContain("Sandbox networks are not contained");
+      expect(t).not.toContain("MCPE_NETWORK=contained.");
+      expect(t).toContain("clones reach only the repository's forge");
+      expect(t).toContain("builds reach their package registries, GitHub and the project's hosts");
+      expect(t).toContain("a sandbox with its network on reaches its registries and the project's hosts");
+      expect(t).toContain("Local addresses are reachable only where the operator allows a repository (MCPE_LOCAL_ACCESS), and the agent cannot add them.");
+      expect(t).toContain("set_project_hosts changes a project's hosts.");
+      expect(t).toContain("Refused hosts are reported. A refused host was chosen by the project's code, so allow it only if you expect the project to need it.");
+      expect(t).toContain("Isolation runtime: Docker's default runtime.");
+    });
+    it("state both runtime variants under containment too", async () => {
+      const t = await instructionsOf(make({ MCPE_NETWORK: "contained", MCPE_DOCKER_RUNTIME: "runsc" }));
+      expect(t).toContain("Sandbox networks are contained: ");
+      expect(t).toContain("Isolation runtime: runsc, required: ");
     });
     it("are one string per App, the one buildInstructions gives for its configuration", async () => {
       const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_SCAN: "warn" });
@@ -2332,5 +2499,103 @@ describe("what the agent is told about security", () => {
       expect(verbose).toContain("[note] build-hooks/runs: x runs (package.json:3)");
       expect(await list(p)).not.toContain("checks at install");
     });
+  });
+});
+
+describe("startup containment wiring (leg 10)", () => {
+  const KEY = "github:owner/unseen";
+  const flush = async (n = 20) => {
+    for (let i = 0; i < n; i++) await new Promise<void>((r) => setImmediate(r));
+  };
+  /** A Docker double whose listing is held until a test releases it. */
+  class Listing extends FakeDocker {
+    listed = 0;
+    release!: () => void;
+    private held = new Promise<void>((r) => {
+      this.release = r;
+    });
+    holdListing = true;
+    override async assertAvailable(): Promise<void> {}
+    override async listOwnSandboxes(): Promise<never[]> {
+      this.listed++;
+      if (this.holdListing) await this.held;
+      return [];
+    }
+  }
+  let local: App | undefined;
+  afterEach(async () => {
+    await local?.shutdown();
+    local = undefined;
+  });
+  const build = (env: Record<string, string>, log: string[] = []) => {
+    const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, ...env });
+    const fake = new Listing(cfg);
+    local = new App({ cfg, docker: fake, proxy: new McpProxy(cfg, fake, up.connector), log: (l) => log.push(l) });
+    return { fake, app: local };
+  };
+
+  it("under contained, start() registers the gate synchronously: a wait begun right after it is held until the listing is handled", async () => {
+    const log: string[] = [];
+    const { fake, app: a } = build({ MCPE_NETWORK: "contained" }, log);
+    a.start();
+    let done = false;
+    const w = a.containment.waitFor(KEY).then((waited) => {
+      done = true;
+      return waited;
+    });
+    await flush();
+    expect(fake.listed).toBe(1);
+    expect(done).toBe(false);
+    fake.release();
+    expect(await w).toBe(true);
+    await a.startup;
+    expect(log).toContain("startup: network containment pass: no sandboxes");
+    expect(await a.containment.waitFor(KEY)).toBe(false);
+  });
+
+  it("the pass runs after the reconciliation, and `startup` includes it", async () => {
+    const { fake, app: a } = build({ MCPE_NETWORK: "contained" });
+    fake.holdListing = false;
+    let finish!: () => void;
+    const reconcile = new Promise<string[]>((r) => {
+      finish = () => r([]);
+    });
+    vi.spyOn(a.installer, "reconcileStale").mockReturnValue(reconcile);
+    a.start();
+    await flush();
+    expect(fake.listed).toBe(0);
+    let started = false;
+    void a.startup!.then(() => (started = true));
+    finish();
+    await a.startup;
+    expect(fake.listed).toBe(1);
+    expect(started).toBe(true);
+  });
+
+  it("a failed listing rejects the gate only: `startup` still resolves, and a wait is refused with the reason", async () => {
+    const log: string[] = [];
+    const { fake, app: a } = build({ MCPE_NETWORK: "contained" }, log);
+    fake.holdListing = false;
+    vi.spyOn(fake, "listOwnSandboxes").mockRejectedValue(new DockerUnavailableError("Docker daemon is not reachable"));
+    a.start();
+    await a.startup;
+    await expect(a.containment.waitFor(KEY)).rejects.toThrow(/network containment could not be checked at startup: Docker daemon is not reachable/);
+    expect(log.some((l) => l.includes("could not be listed"))).toBe(true);
+  });
+
+  it("under open there is no pass, no gate and no new Docker call", async () => {
+    const { fake, app: a } = build({});
+    a.start();
+    await a.startup;
+    expect(fake.listed).toBe(0);
+    expect(await a.containment.waitFor(KEY)).toBe(false);
+  });
+
+  it("shutdown does not wait for the pass", async () => {
+    const { fake, app: a } = build({ MCPE_NETWORK: "contained" });
+    a.start();
+    await flush();
+    expect(fake.listed).toBe(1);
+    await a.shutdown(); // the listing is still held
   });
 });

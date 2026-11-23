@@ -3,14 +3,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ENV_FILE_NAME } from "../src/proxy/mcp-proxy.js";
-import { SandboxRefusedError, VolumeNotUsableError } from "../src/sandbox/docker.js";
+import { SandboxRefusedError, VolumeNotUsableError, type OneShotResult } from "../src/sandbox/docker.js";
 import { runScanners, type ScanDocker } from "../src/scan/run.js";
 import type { ScannerSpec } from "../src/scan/types.js";
 import type { RunResult } from "../src/util/exec.js";
 
 const sarif = (results: unknown[]) => JSON.stringify({ version: "2.1.0", runs: [{ tool: { driver: { name: "x" } }, results }] });
 const ok = (stdout: string, extra: Partial<RunResult> = {}): RunResult => ({ code: 0, stdout, stderr: "", timedOut: false, truncated: false, ...extra });
-const spec = (over: Partial<ScannerSpec> = {}): ScannerSpec => ({ name: "sc", image: "img:1", command: ["go"], network: false, timeoutSec: 60, env: [], ...over });
+const spec = (over: Partial<ScannerSpec> = {}): ScannerSpec => ({ name: "sc", image: "img:1", command: ["go"], network: false, hosts: [], timeoutSec: 60, env: [], ...over });
 
 class Fake implements ScanDocker {
   clock = 0;
@@ -18,13 +18,13 @@ class Fake implements ScanDocker {
   runs: Array<{ volume: string; spec: ScannerSpec; timeoutMs: number; envFile?: string; fileText?: string; mode?: number }> = [];
   pullCost = 0;
   pull: (image: string) => Promise<void> = async () => undefined;
-  run: (s: ScannerSpec, n: number) => Promise<RunResult> | RunResult = () => ok(sarif([]));
+  run: (s: ScannerSpec, n: number) => Promise<OneShotResult> | OneShotResult = () => ok(sarif([]));
   async ensureImage(image: string, _o?: unknown, t?: number): Promise<void> {
     this.pulls.push({ image, timeoutMs: t });
     this.clock += this.pullCost;
     await this.pull(image);
   }
-  async runScanner(volume: string, s: ScannerSpec, o: { timeoutMs: number; envFile?: string }): Promise<RunResult> {
+  async runScanner(volume: string, s: ScannerSpec, o: { timeoutMs: number; envFile?: string }): Promise<OneShotResult> {
     const rec: Fake["runs"][number] = { volume, spec: s, ...o };
     if (o.envFile) {
       rec.fileText = fs.readFileSync(o.envFile, "utf8");
@@ -241,6 +241,64 @@ describe("runScanners", () => {
       d2.run = () => ok("x", { stderr: "abc abc" });
       const [o2] = await go(d2, [spec({ env: ["SHORT"] })], { env: { SHORT: "abc" } });
       expect(o2!.error).toBe("output is not valid JSON: abc abc");
+    });
+  });
+
+  // Leg 8: a scanner behind containment's proxy; what the proxy refused is added to a FAILED outcome only.
+  describe("what the scanner's proxy refused", () => {
+    const row = (host: string | null, port: number | null = 443, reason = "not-allowed") => ({
+      kind: "connect" as const, host, port, reason: reason as "not-allowed", count: 1, firstAt: "t", lastAt: "t",
+    });
+    const report = (...rows: ReturnType<typeof row>[]) => ({ rows, total: rows.length, resolverFailures: 0 });
+    const withProxy = (r: RunResult, ...rows: ReturnType<typeof row>[]): OneShotResult => ({ ...r, proxy: report(...rows) });
+
+    it("adds a line per refused host to a failed run's error, after the stderr tail", async () => {
+      const d = new Fake();
+      d.run = () => withProxy(ok("garbage", { stderr: "dial tcp: refused" }), row("api.example.com", 8443), row("other.example"));
+      const [o] = await go(d, [spec({ network: true, hosts: ["x.example"] })]);
+      expect(o!.status).toBe("failed");
+      expect(o!.error).toContain("output is not valid JSON: dial tcp: refused");
+      expect(o!.error).toContain("The scanner was refused `api.example.com:8443`. Only the operator can allow a host for a scanner, in its \"hosts\" in the scanners file.");
+      expect(o!.error).toContain("`other.example:443`");
+      expect(o!.error!.indexOf("dial tcp")).toBeLessThan(o!.error!.indexOf("api.example.com"));
+    });
+
+    it("also on a timeout and on an output over 8 MB", async () => {
+      const d = new Fake();
+      const replies = [ok("", { timedOut: true, code: null as unknown as number }), ok("x", { truncated: true })];
+      d.run = (_s, n) => withProxy(replies[n - 1]!, row("h.example"));
+      const out = await go(d, [spec({ name: "a" }), spec({ name: "b" })]);
+      expect(out.map((o) => o.status)).toEqual(["failed", "failed"]);
+      expect(out[0]!.error).toMatch(/^timed out after 60 s .*`h\.example:443`/);
+      expect(out[1]!.error).toMatch(/^output over 8 MB .*`h\.example:443`/);
+    });
+
+    it("never adds them to a run that produced valid output", async () => {
+      const d = new Fake();
+      d.run = () => withProxy(ok(sarif([{ level: "note", message: { text: "n" } }])), row("h.example"));
+      const [o] = await go(d, [spec()]);
+      expect(o).toMatchObject({ status: "ran" });
+      expect(o!.error).toBeUndefined();
+      expect(JSON.stringify(o)).not.toContain("h.example");
+    });
+
+    it("a failed run with no report, an unavailable one or no rows keeps today's exact text", async () => {
+      const d = new Fake();
+      const replies: OneShotResult[] = [ok("garbage"), { ...ok("garbage"), proxy: { unavailable: true } }, withProxy(ok("garbage"))];
+      d.run = (_s, n) => replies[n - 1]!;
+      const out = await go(d, [spec({ name: "a" }), spec({ name: "b" }), spec({ name: "c" })]);
+      expect(new Set(out.map((o) => o.error)).size).toBe(1);
+      expect(out[0]!.error).toBe("output is not valid JSON");
+    });
+
+    it("keeps the error bounded however many hosts were refused, and redacts the scanner's values from it", async () => {
+      const d = new Fake();
+      const secret = "0123456789abcdef";
+      d.run = () => withProxy(ok("x", { stderr: `token ${secret}` }), ...Array.from({ length: 30 }, (_, n) => row(`h${n}.example.com`)));
+      const [o] = await go(d, [spec({ env: ["T"] })], { env: { T: secret } });
+      expect(o!.error!.length).toBeLessThanOrEqual(2_000);
+      expect(o!.error).not.toContain(secret);
+      expect(o!.error).toContain("and 21 more.");
     });
   });
 });

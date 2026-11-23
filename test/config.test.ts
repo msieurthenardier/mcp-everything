@@ -24,6 +24,19 @@ describe("sandboxIdleSec", () => {
   });
 });
 
+describe("proxyImage", () => {
+  it("is pinned by the index digest, with its tag in a comment, and Node 22 or later", () => {
+    expect(loadConfig({}).docker.proxyImage).toMatch(/^node:(\d+)-alpine@sha256:[0-9a-f]{64}$/);
+    expect(Number(/^node:(\d+)/.exec(loadConfig({}).docker.proxyImage)![1])).toBeGreaterThanOrEqual(22);
+    const src = fs.readFileSync(path.join(__dirname, "../src/config.ts"), "utf8");
+    expect(src).toMatch(/Pinned by the index digest, with the tag it was read under: `node:22-alpine`/);
+  });
+  it("is overridden by MCPE_PROXY_IMAGE, and an empty value is the default", () => {
+    expect(loadConfig({ MCPE_PROXY_IMAGE: "registry.example/node:24" }).docker.proxyImage).toBe("registry.example/node:24");
+    expect(loadConfig({ MCPE_PROXY_IMAGE: "" }).docker.proxyImage).toBe(loadConfig({}).docker.proxyImage);
+  });
+});
+
 describe("namePrefix", () => {
   const prefix = (v?: string) => loadConfig(v === undefined ? {} : { MCPE_NAME_PREFIX: v }).docker.namePrefix;
 
@@ -136,7 +149,7 @@ describe("scan settings", () => {
     expect(cfg.mode).toBe("off");
     expect(cfg.scannersFile).toBe("/etc/scanners.json");
     expect(cfg.scanners).toEqual([
-      { name: "trivy", image: "aquasec/trivy:0.50", command: ["trivy", "fs", "/workspace/repo"], network: false, timeoutSec: 300, env: [] },
+      { name: "trivy", image: "aquasec/trivy:0.50", command: ["trivy", "fs", "/workspace/repo"], network: false, hosts: [], timeoutSec: 300, env: [] },
     ]);
   });
   it("names the file for an invalid scanners file, an unreadable one and an oversized one", () => {
@@ -164,5 +177,48 @@ describe("scan settings", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("network settings", () => {
+  const net = (env: Record<string, string>) => loadConfig(env).network;
+
+  it("defaults to open with no local access, and changes nothing else", () => {
+    expect(net({})).toEqual({ mode: "open", localAccess: {} });
+    const { network, ...rest } = loadConfig({});
+    expect(network.mode).toBe("open");
+    expect(rest.scan.scanners).toEqual([]);
+  });
+  it.each([
+    ["", "open"],
+    ["open", "open"],
+    [" OPEN ", "open"],
+    ["contained", "contained"],
+    [" Contained\n", "contained"],
+  ])("MCPE_NETWORK=%j gives %s", (v, mode) => expect(net({ MCPE_NETWORK: v }).mode).toBe(mode));
+  it.each(["closed", "on", "true", "contain", "1"])("refuses MCPE_NETWORK=%j, naming the variable and both values", (v) => {
+    expect(() => loadConfig({ MCPE_NETWORK: v })).toThrow(ConfigError);
+    expect(() => loadConfig({ MCPE_NETWORK: v })).toThrow(/MCPE_NETWORK=.*open or contained/);
+  });
+  it("reads MCPE_LOCAL_ACCESS, whatever the mode", () => {
+    expect(net({ MCPE_LOCAL_ACCESS: "a/b=db.lan:5432" }).localAccess).toEqual({ "github:a/b": [{ host: "db.lan", port: 5432 }] });
+    expect(() => loadConfig({ MCPE_LOCAL_ACCESS: "a/b=1.2.3.4:5" })).toThrow(/MCPE_LOCAL_ACCESS.*IP literal/);
+  });
+
+  describe("scanners under containment", () => {
+    const file = (over: Record<string, unknown>) => JSON.stringify({ scanners: [{ name: "trivy", image: "aquasec/trivy:0.50", command: ["trivy"], ...over }] });
+    const load = (env: Record<string, string>, text: string) => loadConfig({ MCPE_SCANNERS: "/s.json", ...env }, () => text);
+
+    it("refuses a networked scanner with no hosts, naming it", () => {
+      expect(() => load({ MCPE_NETWORK: "contained" }, file({ network: true }))).toThrow(ConfigError);
+      expect(() => load({ MCPE_NETWORK: "contained" }, file({ network: true }))).toThrow(/"trivy".*needs "hosts".*contained/);
+    });
+    it("accepts hosts, an offline scanner, and a networked one under open", () => {
+      const s = load({ MCPE_NETWORK: "contained" }, file({ network: true, hosts: ["ghcr.io"] })).scan.scanners;
+      expect(s[0]!.hosts).toEqual(["ghcr.io"]);
+      expect(load({ MCPE_NETWORK: "contained" }, file({ network: false })).scan.scanners[0]!.hosts).toEqual([]);
+      expect(load({}, file({ network: true })).scan.scanners[0]!.hosts).toEqual([]);
+      expect(load({ MCPE_NETWORK: "open" }, file({ network: true, hosts: ["ghcr.io"] })).scan.scanners[0]!.hosts).toEqual(["ghcr.io"]);
+    });
   });
 });

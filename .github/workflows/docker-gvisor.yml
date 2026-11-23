@@ -1,0 +1,587 @@
+name: Docker gVisor measurements
+
+# Three jobs (flight 02).
+#   measure (leg 4): answers, on native Linux, the premises the flight measured
+#     only on Docker Desktop. A measured "no" never fails the job; the results
+#     go to the run's step summary. It uses no repository code.
+#   gvisor (leg 12): registers a pinned, checksum-verified gVisor as `runsc`
+#     (with --overlay2=none, so that a sandbox keeps its build across idle stops)
+#     and runs mcp-everything's Docker suite under it, then the runtime proof
+#     (test/integration/gvisor.test.ts). Advisory, not a required check: the
+#     runner's Docker version floats.
+#   contained-linux (leg 13): the containment cases (legs 5 to 10) under runc,
+#     on native Linux, with no gVisor installed. In parallel with gvisor.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    # Advisory (not a required check): runs on demand, or for sandbox, network and install changes.
+    paths:
+      - "src/sandbox/**"
+      - "src/network/**"
+      - "src/install/**"
+      - "test/integration/**"
+      - "package-lock.json"
+      - ".nvmrc"
+      - ".github/workflows/docker-gvisor.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-gvisor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    name: measure
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUN: ${{ github.run_id }}
+      # The only image used. Source: `probeImage` in src/config.ts; bump the
+      # two together.
+      IMAGE: alpine/git:2.54.1@sha256:29cff25811f790b9f72fc266bf8009a5a911714c0e03c31c47339c50909d9aef
+    steps:
+      - name: Docker
+        run: |
+          set +e
+          {
+            echo "## Docker"
+            echo '```'
+            docker version
+            echo "--- Runtimes:"
+            docker info --format '{{json .Runtimes}}'
+            echo "--- DefaultRuntime:"
+            docker info --format '{{.DefaultRuntime}}'
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: DD3 isolated network
+        run: |
+          set +e
+          P="mcpe-measure-${RUN}-dd3"
+          cleanup() {
+            docker network rm "$P-isolated" "$P-inhibit" >/dev/null 2>&1
+          }
+          trap cleanup EXIT
+          {
+            echo "## DD3: isolated gateway mode"
+            echo '```'
+            echo "### gateway_mode_ipv4=isolated, --internal, --ipv6=false"
+            if out=$(docker network create --internal \
+              -o com.docker.network.bridge.gateway_mode_ipv4=isolated \
+              --ipv6=false "$P-isolated" 2>&1); then
+              echo "create: ok"
+              docker network inspect "$P-isolated" \
+                --format 'Internal={{.Internal}} EnableIPv6={{.EnableIPv6}} IPAM.Config={{json .IPAM.Config}}'
+              if docker network inspect "$P-isolated" --format '{{json .IPAM.Config}}' | grep -q '"Gateway"'; then
+                echo "RESULT: Gateway present = yes"
+              else
+                echo "RESULT: Gateway present = no"
+              fi
+            else
+              echo "create: REFUSED: $out"
+            fi
+            echo
+            echo "### inhibit_ipv4=true, --internal, --ipv6=false"
+            if out=$(docker network create --internal \
+              -o com.docker.network.bridge.inhibit_ipv4=true \
+              --ipv6=false "$P-inhibit" 2>&1); then
+              echo "create: ok"
+              docker network inspect "$P-inhibit" \
+                --format 'Internal={{.Internal}} EnableIPv6={{.EnableIPv6}} IPAM.Config={{json .IPAM.Config}}'
+              if docker network inspect "$P-inhibit" --format '{{json .IPAM.Config}}' | grep -q '"Gateway"'; then
+                echo "RESULT: Gateway present = yes"
+              else
+                echo "RESULT: Gateway present = no"
+              fi
+            else
+              echo "create: REFUSED: $out"
+            fi
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolver
+        run: |
+          set +e
+          P="mcpe-measure-${RUN}-dns"
+          cleanup() {
+            docker rm -f "$P-c" >/dev/null 2>&1
+          }
+          trap cleanup EXIT
+          {
+            echo "## Resolver"
+            echo '```'
+            echo "### runner /etc/resolv.conf"
+            cat /etc/resolv.conf
+            echo "### systemd-resolved active?"
+            if systemctl is-active systemd-resolved 2>&1; then
+              :
+            else
+              echo "(systemd-resolved not active or not present)"
+            fi
+            echo "### container on bridge: /etc/resolv.conf"
+            docker run -d --name "$P-c" --entrypoint sleep "$IMAGE" 120 >/dev/null
+            docker exec "$P-c" cat /etc/resolv.conf
+            echo "### resolve github.com through each nameserver"
+            if docker exec "$P-c" sh -c 'command -v getent >/dev/null'; then
+              echo "(getent present; it uses the container's resolv.conf, so nslookup is used per nameserver)"
+            else
+              echo "(getent missing; nslookup used)"
+            fi
+            for ns in $(docker exec "$P-c" sh -c "awk '/^nameserver/ {print \$2}' /etc/resolv.conf"); do
+              echo "--- nameserver $ns"
+              docker exec "$P-c" nslookup github.com "$ns"
+              echo "RESULT: nslookup via $ns exit=$?"
+            done
+            echo "--- default resolution (getent, else nslookup)"
+            if docker exec "$P-c" sh -c 'command -v getent >/dev/null'; then
+              docker exec "$P-c" getent hosts github.com
+              echo "RESULT: getent exit=$?"
+            else
+              docker exec "$P-c" nslookup github.com
+              echo "RESULT: nslookup exit=$?"
+            fi
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: host-gateway
+        run: |
+          set +e
+          P="mcpe-measure-${RUN}-hg"
+          # The measuring group below runs in a pipeline subshell, so the
+          # listener's pid goes through a file for the trap to read.
+          PIDF="${RUNNER_TEMP:-/tmp}/$P.pid"
+          cleanup() {
+            [ -s "$PIDF" ] && kill "$(cat "$PIDF")" >/dev/null 2>&1
+            docker network rm "$P-internal" >/dev/null 2>&1
+          }
+          trap cleanup EXIT
+          {
+            echo "## host-gateway"
+            echo '```'
+            # Listener on the runner; try three ports.
+            PORT=""
+            for p in 18080 18081 18082; do
+              python3 -m http.server "$p" --bind 0.0.0.0 >/dev/null 2>&1 &
+              LISTENER=$!
+              echo "$LISTENER" > "$PIDF"
+              sleep 2
+              if kill -0 "$LISTENER" 2>/dev/null; then
+                PORT=$p
+                break
+              fi
+              : > "$PIDF"
+            done
+            if [ -z "$PORT" ]; then
+              echo "RESULT: no listener port available; step skipped"
+              echo '```'
+              exit 0
+            fi
+            echo "listener: pid $LISTENER port $PORT"
+
+            D0=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+            if [ -z "$D0" ]; then
+              D0=$(docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')
+              echo "(docker0 address from bridge's gateway)"
+            fi
+            echo "docker0 address: $D0"
+
+            echo "### bridge container with --add-host host.docker.internal:host-gateway"
+            docker run --rm --entrypoint sh --add-host host.docker.internal:host-gateway "$IMAGE" -c "
+              echo '--- /etc/hosts'; cat /etc/hosts
+              echo '--- host.docker.internal'
+              wget -q -T 5 -O /dev/null http://host.docker.internal:$PORT/ && echo 'RESULT: bridge -> host.docker.internal: reachable' || echo 'RESULT: bridge -> host.docker.internal: unreachable'
+              echo '--- docker0 address'
+              wget -q -T 5 -O /dev/null http://$D0:$PORT/ && echo 'RESULT: bridge -> docker0 address: reachable' || echo 'RESULT: bridge -> docker0 address: unreachable'
+            "
+
+            echo "### container on an isolated internal network"
+            docker network create --internal \
+              -o com.docker.network.bridge.gateway_mode_ipv4=isolated \
+              --ipv6=false "$P-internal" 2>&1 || echo "(isolated mode refused; this trial is not valid)"
+            docker run --rm --entrypoint sh --network "$P-internal" \
+              --add-host host.docker.internal:host-gateway "$IMAGE" -c "
+              echo '--- /etc/hosts'; cat /etc/hosts
+              wget -q -T 5 -O /dev/null http://host.docker.internal:$PORT/ && echo 'RESULT: isolated -> host.docker.internal: reachable' || echo 'RESULT: isolated -> host.docker.internal: unreachable'
+              wget -q -T 5 -O /dev/null http://$D0:$PORT/ && echo 'RESULT: isolated -> docker0 address: reachable' || echo 'RESULT: isolated -> docker0 address: unreachable'
+            "
+
+            echo "### does the host-gateway address fall inside bridge's subnet?"
+            docker network inspect bridge --format '{{json .IPAM.Config}}'
+            HG=$(docker run --rm --entrypoint sh --add-host host.docker.internal:host-gateway "$IMAGE" -c "awk '/host.docker.internal/ {print \$1}' /etc/hosts" | head -n1)
+            echo "host-gateway resolves to: $HG"
+            SUBNET=$(docker network inspect bridge --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
+            echo "bridge subnet: $SUBNET"
+            python3 -c "
+          import ipaddress, sys
+          hg, subnet = '$HG', '$SUBNET'
+          try:
+              inside = ipaddress.ip_address(hg) in ipaddress.ip_network(subnet, strict=False)
+              print('RESULT: host-gateway address inside bridge subnet =', 'yes' if inside else 'no')
+          except Exception as e:
+              print('RESULT: could not compare:', e)
+          "
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Two-holder alias
+        run: |
+          set +e
+          P="mcpe-measure-${RUN}-alias"
+          cleanup() {
+            docker rm -f "$P-a" "$P-b" "$P-probe" >/dev/null 2>&1
+            docker network rm "$P-net" >/dev/null 2>&1
+          }
+          trap cleanup EXIT
+          resolve() {
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if docker exec "$P-probe" sh -c 'command -v getent >/dev/null'; then
+                docker exec "$P-probe" getent hosts mcpe-proxy | awk '{print $1}' | head -n1
+              else
+                docker exec "$P-probe" nslookup mcpe-proxy | awk '/^Address/ && !/#/ {print $NF}' | tail -n1
+              fi
+            done | tr '\n' ' '
+            echo
+          }
+          {
+            echo "## Two-holder alias"
+            echo '```'
+            docker network create --internal \
+              -o com.docker.network.bridge.gateway_mode_ipv4=isolated \
+              --ipv6=false "$P-net" 2>&1 || echo "(isolated mode refused; trial continues on whatever was created)"
+            for h in a b; do
+              docker run -d --name "$P-$h" --network "$P-net" --network-alias mcpe-proxy \
+                --entrypoint sleep "$IMAGE" 600 >/dev/null
+              echo "holder $h: $(docker inspect "$P-$h" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')"
+            done
+            docker run -d --name "$P-probe" --network "$P-net" --entrypoint sleep "$IMAGE" 600 >/dev/null
+            if docker exec "$P-probe" sh -c 'command -v getent >/dev/null'; then
+              echo "resolver tool: getent"
+            else
+              echo "resolver tool: nslookup (getent missing)"
+            fi
+            echo "--- ten lookups, both holders up (first answer each time)"
+            resolve
+            echo "--- restarting holder a"
+            docker restart "$P-a" >/dev/null
+            sleep 2
+            echo "holder a now: $(docker inspect "$P-a" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')"
+            echo "--- ten lookups after restart"
+            resolve
+            echo "--- all answers for the alias"
+            docker exec "$P-probe" nslookup mcpe-proxy
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup check
+        run: |
+          set +e
+          {
+            echo "## Cleanup check"
+            echo '```'
+            echo "containers:"
+            docker ps -a --filter "name=mcpe-measure-${RUN}-" --format '{{.Names}}'
+            echo "networks:"
+            docker network ls --filter "name=mcpe-measure-${RUN}-" --format '{{.Name}}'
+            echo "(expected: nothing listed under either heading)"
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+  gvisor:
+    name: gvisor
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      # The gVisor release and the SHA-512 of its `runsc`, read together from
+      # https://storage.googleapis.com/gvisor/releases/release/<date>/x86_64/runsc.sha512
+      # (the newest date that answered 200 on 2026-11-23). To bump: read both
+      # again the same way and change the pair together. The download is checked
+      # against this pin and against the published file.
+      GVISOR_RELEASE: "20260817"
+      GVISOR_SHA512: 84936438d583ec976800f464e75a83e1515f0890b451b9b4db219c4472b54ca9b106a6772ee683f1e64cce2128871d7637b14d800591f8451b8137f6c39fb2ef
+      # The smoke test's image: `probeImage` in src/config.ts; bump the two together.
+      IMAGE: alpine/git:2.54.1@sha256:29cff25811f790b9f72fc266bf8009a5a911714c0e03c31c47339c50909d9aef
+    # The steps from setup-node on carry `if: hashFiles('src/network/proxy/proxy.cjs') != ''`.
+    # That file exists only from the flight's commit on, so until then the job runs its
+    # setup half only (download, checksum, registration, smoke test).
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker version
+        run: |
+          set -euo pipefail
+          out=$(docker version 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          {
+            echo "## Docker"
+            echo '```'
+            echo "$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download and verify runsc
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/gvisor"
+          mkdir -p "$dir"
+          cd "$dir"
+          base="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64"
+          curl -fsSL --retry 3 -o runsc "$base/runsc"
+          curl -fsSL --retry 3 -o runsc.sha512 "$base/runsc.sha512"
+          # The published checksum must be the pinned one, and the file must match it.
+          want="${GVISOR_SHA512}  runsc"
+          got=$(cat runsc.sha512)
+          if [ "$got" != "$want" ]; then
+            echo "the published runsc.sha512 differs from the pin"
+            echo "pinned:    $want"
+            echo "published: $got"
+            exit 1
+          fi
+          sha512sum -c runsc.sha512
+          echo "runsc ${GVISOR_RELEASE} verified"
+
+      - name: Install runsc and register it with Docker
+        run: |
+          set -euo pipefail
+          sudo install -m 0755 "$RUNNER_TEMP/gvisor/runsc" /usr/local/bin/runsc
+          runsc --version
+          # --overlay2=none: gVisor's default root-filesystem overlay discards writes outside volumes when a sandbox
+          # exits, and mcp-everything's build output lives in the container's layer, so an idle-stopped sandbox would
+          # lose its built tools. The README states this requirement.
+          sudo runsc install -- --overlay2=none
+          sudo systemctl restart docker
+          ready=0
+          for _ in $(seq 1 30); do
+            if docker info >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" != 1 ]; then
+            echo "Docker did not come back after the restart"
+            exit 1
+          fi
+          runtimes=$(docker info --format '{{json .Runtimes}}')
+          echo "$runtimes"
+          case "$runtimes" in
+            *'"runsc"'*) ;;
+            *)
+              echo "Docker does not list a runtime called runsc"
+              exit 1
+              ;;
+          esac
+          case "$runtimes" in
+            *'--overlay2=none'*) ;;
+            *)
+              echo "runsc is not registered with --overlay2=none"
+              exit 1
+              ;;
+          esac
+
+      - name: Smoke test, dmesg under runsc
+        run: |
+          set -euo pipefail
+          status=0
+          out=$(docker run --rm --runtime runsc --entrypoint dmesg "$IMAGE" 2>&1) || status=$?
+          echo "$out"
+          if [ "$status" != 0 ]; then
+            echo "dmesg under runsc exited with $status"
+            exit 1
+          fi
+          case "$out" in
+            *[Gg][Vv]isor*) ;;
+            *)
+              echo "dmesg under runsc does not mention gVisor"
+              exit 1
+              ;;
+          esac
+          {
+            echo "## Smoke test"
+            echo '```'
+            sed -n '1,3p' <<<"$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: hashFiles('src/network/proxy/proxy.cjs') != ''
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        if: hashFiles('src/network/proxy/proxy.cjs') != ''
+        run: npm ci
+
+      - name: Build
+        if: hashFiles('src/network/proxy/proxy.cjs') != ''
+        run: npm run build
+
+      # Run A: the whole Docker suite, every container under gVisor. Everything but
+      # the runtime proof, which Run B runs on its own.
+      - name: Run A, the Docker suite under gVisor
+        id: run_a
+        if: hashFiles('src/network/proxy/proxy.cjs') != ''
+        timeout-minutes: 50
+        env:
+          MCPE_DOCKER_TESTS: "1"
+          MCPE_DOCKER_RUNTIME: runsc
+        run: |
+          set -uo pipefail
+          start=$(date +%s)
+          status=0
+          npx vitest run test/integration --exclude test/integration/gvisor.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/run-a.json" || status=$?
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      # Run B: the runtime proof (test/integration/gvisor.test.ts).
+      - name: Run B, the runtime proof
+        id: run_b
+        if: "!cancelled() && hashFiles('src/network/proxy/proxy.cjs') != ''"
+        timeout-minutes: 15
+        env:
+          MCPE_DOCKER_TESTS: "1"
+          MCPE_DOCKER_RUNTIME: runsc
+        run: |
+          set -uo pipefail
+          start=$(date +%s)
+          status=0
+          npx vitest run test/integration/gvisor.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/run-b.json" || status=$?
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Summary
+        if: "always() && hashFiles('src/network/proxy/proxy.cjs') != ''"
+        env:
+          SECONDS_A: ${{ steps.run_a.outputs.seconds }}
+          SECONDS_B: ${{ steps.run_b.outputs.seconds }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const out = [];
+            const read = (name) => {
+              try {
+                return JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/" + name, "utf8"));
+              } catch (e) {
+                return undefined;
+              }
+            };
+            const cases = (r) => (r.testResults || []).flatMap((f) => f.assertionResults || []);
+            for (const [label, file, secs] of [
+              ["Run A (the Docker suite under gVisor)", "run-a.json", process.env.SECONDS_A],
+              ["Run B (the runtime proof)", "run-b.json", process.env.SECONDS_B],
+            ]) {
+              const r = read(file);
+              if (!r) {
+                out.push("### " + label, "", "no report (the run did not finish or did not start)", "");
+                continue;
+              }
+              out.push("### " + label, "", "passed " + r.numPassedTests + ", failed " + r.numFailedTests + ", skipped " + r.numPendingTests + ", " + (secs || "?") + " s", "");
+              const skipped = cases(r).filter((c) => c.status === "skipped" || c.status === "pending");
+              if (skipped.length > 0) {
+                out.push("Skipped:", "");
+                for (const c of skipped) out.push("- " + c.fullName);
+                out.push("");
+              }
+              if (file === "run-a.json") {
+                const local = cases(r).filter((c) => (c.ancestorTitles || []).join(" ").includes("local access"));
+                out.push("Local access through host-gateway (leg 9), the cases of that describe:", "");
+                for (const c of local) out.push("- " + c.status + ": " + c.title);
+                if (local.length === 0) out.push("- (none found in the report)");
+                out.push("");
+              }
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out.join("\n") + "\n");
+          '
+
+  # Run C (leg 13): the containment cases under runc on native Linux. gVisor is not installed here and no runtime is
+  # named, so every container runs under Docker's default runtime: this is the proof that containment works on a
+  # native Linux daemon (Docker Desktop proved it on a VM's daemon; the gvisor job proves it under runsc).
+  contained-linux:
+    name: contained-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # The describes of legs 5 to 10 (contained networks and the one-shot proxy, the project network primitives, the
+      # containment hook, the contained install, network tools and local access, startup containment), selected by `-t`.
+      CONTAINMENT_DESCRIBES: "docker integration: (contained networks and the one-shot proxy|project network primitives|containment hook|the contained install|network tools and local access|startup containment)"
+      # How many cases of those describes must PASS. The summary fails when fewer did, so a rename that makes `-t` select
+      # nothing, or a case that skips itself, cannot pass silently. UPDATE THIS NUMBER when a case is added to or removed
+      # from those describes in test/integration/docker.test.ts (7 + 5 + 5 + 6 + 5 + 3 at leg 13).
+      CASES_EXPECTED: "31"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker version and runtimes
+        run: |
+          set -euo pipefail
+          docker version
+          docker info --format '{{json .Runtimes}} default={{.DefaultRuntime}}'
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run C, the containment cases under runc
+        id: run_c
+        timeout-minutes: 45
+        env:
+          MCPE_DOCKER_TESTS: "1"
+        run: |
+          set -uo pipefail
+          # No runtime is named: the cases run under Docker's default (runc).
+          unset MCPE_DOCKER_RUNTIME
+          start=$(date +%s)
+          status=0
+          npx vitest run test/integration/docker.test.ts -t "$CONTAINMENT_DESCRIBES" --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/run-c.json" || status=$?
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Summary
+        if: "!cancelled()"
+        env:
+          SECONDS_C: ${{ steps.run_c.outputs.seconds }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const out = ["### Run C (the containment cases under runc, native Linux)", ""];
+            let report;
+            try {
+              report = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/run-c.json", "utf8"));
+            } catch (e) {
+              out.push("no report (the run did not finish or did not start)", "");
+              fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out.join("\n") + "\n");
+              process.exit(1);
+            }
+            const expected = Number(process.env.CASES_EXPECTED);
+            out.push("passed " + report.numPassedTests + " of at least " + expected + ", failed " + report.numFailedTests + ", skipped " + report.numPendingTests + ", " + (process.env.SECONDS_C || "?") + " s", "");
+            const cases = (report.testResults || []).flatMap((f) => f.assertionResults || []);
+            const skipped = cases.filter((c) => c.status === "skipped" || c.status === "pending");
+            const selected = skipped.filter((c) => (c.ancestorTitles || []).join(" ").includes("docker integration: "));
+            if (selected.length > 0) {
+              out.push("Skipped:", "");
+              for (const c of selected) out.push("- " + c.fullName);
+              out.push("");
+            }
+            let bad = false;
+            if (report.numPassedTests < expected) {
+              out.push("FEWER CASES PASSED THAN EXPECTED: " + report.numPassedTests + " < " + expected + " (a failing case, a skipped one, or a selection that no longer matches).", "");
+              bad = true;
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out.join("\n") + "\n");
+            if (bad) process.exit(1);
+          '

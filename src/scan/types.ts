@@ -18,6 +18,8 @@ export interface ScannerSpec {
   /** Overrides the image's entrypoint; "" clears it; absent leaves it. */
   entrypoint?: string;
   network: boolean;
+  /** Hosts the scanner may reach under containment, normalized (`host` or `host:port`, IPv6 bracketed). */
+  hosts: string[];
   timeoutSec: number;
   env: string[];
 }

@@ -1,9 +1,13 @@
 import type { Config } from "../config.js";
+import type { ContainResult, ReplaceResult } from "../network/containment.js";
+import { normalizeAgentHosts, unionHosts } from "../network/hosts.js";
+import { joinRefusals, refusalLines, refusalWarnings } from "../network/refusals.js";
 import { hostVariableNames, isUnusableValueError, launchVariables } from "../proxy/host-env.js";
 import type { McpProxy, UpstreamTool } from "../proxy/mcp-proxy.js";
 import type { Registry } from "../registry.js";
 import {
   BIN_DIR,
+  CloneFailedError,
   Docker,
   DockerUnavailableError,
   REPO_DIR,
@@ -48,11 +52,22 @@ type InstallState =
   /** The old sandbox is gone (or there was none); `sandbox` once this install made a container. */
   | { phase: "new"; sandbox?: SandboxRef };
 
+/** The install's state holder: where it is, and the `hosts` its opening added (so a failed reinstall can take them back out). */
+interface InstallProgress {
+  current: InstallState;
+  addedHosts?: string[];
+}
+
 export interface InstallParams {
   repo: RepoRef;
   ref?: string;
   /** Leave outbound network enabled after installation (default: off). */
   network?: boolean;
+  /**
+   * Hosts the project may reach under network containment, in addition to the defaults for its build system. Already
+   * validated by the caller (a bad entry here throws). Merged into the record's `hosts` when the install opens.
+   */
+  hosts?: string[];
   image?: string;
   ecosystem?: Ecosystem;
   submodules?: boolean;
@@ -115,7 +130,7 @@ export function staleInstallLimitSec(cfg: Config): number {
   return 2 * Math.max(7200, cfg.installTimeoutSec) + 10800;
 }
 
-function isStaleInstall(record: ProjectRecord, now: number, cfg: Config): boolean {
+export function isStaleInstall(record: ProjectRecord, now: number, cfg: Config): boolean {
   if (record.status !== "installing") return false;
   const started = Date.parse(record.installedAt);
   if (Number.isNaN(started) || started > now) return false;
@@ -214,6 +229,15 @@ export interface InstallHooks {
 const BLOCKED_WARNING = "A reinstall at commit";
 const CHECK_REASON_MAX = 300;
 
+/** What the installer needs of `Containment` (leg 8): the sandbox's first containment and start, and its run allowlist. */
+export interface InstallContainment {
+  contain(key: string, opts?: { start?: boolean }): Promise<ContainResult>;
+  replace(key: string): Promise<ReplaceResult>;
+}
+
+/** The most refusal warnings a successful build puts on a record. */
+const MAX_REFUSAL_WARNINGS = 5;
+
 export class Installer {
   constructor(
     private readonly cfg: Config,
@@ -224,7 +248,18 @@ export class Installer {
     private readonly choose: typeof chooseToolchain = chooseToolchain,
     /** Read at every launch, never copied: `{slug}__{NAME}` variables reach the project's MCP servers as `NAME`. */
     private readonly env: Record<string, string | undefined> = process.env,
-  ) {}
+    /** Required under `MCPE_NETWORK=contained`: an installer that was not given one never builds on the network instead. */
+    private readonly containment?: InstallContainment,
+  ) {
+    if (cfg.network.mode === "contained" && !containment) {
+      throw new Error("An installer under MCPE_NETWORK=contained needs containment; none was given.");
+    }
+  }
+
+  /** Whether this session installs under containment. */
+  private get contained(): boolean {
+    return this.cfg.network.mode === "contained";
+  }
 
   private slugsWith(project: ProjectRecord): string[] {
     return [...this.registry.list().map((p) => p.slug), project.slug];
@@ -255,6 +290,7 @@ export class Installer {
 
   async install(params: InstallParams, log: Logger = () => {}): Promise<ProjectRecord> {
     await this.docker.assertAvailable();
+    await this.docker.assertRuntime();
     this.registry.refresh();
     const existing = this.registry.findByRepo(params.repo.id);
     if (existing && existing.status === "ready" && !params.reinstall) return existing;
@@ -314,6 +350,10 @@ export class Installer {
       return { staging, probe, report: { commit: probe.commit, checks, decision, at: new Date().toISOString() } };
     } catch (e) {
       await this.dropStaging(staging);
+      // A refused clone says so first, so that the cut of a long reason is of git's own text and never of the refusal.
+      if (e instanceof CloneFailedError && e.refusals.length > 0) {
+        throw new Error(oneLine(`${joinRefusals(e.refusals, " ")} ${e.detail}`, CHECK_REASON_MAX));
+      }
       throw new Error(oneLine(e instanceof Error ? e.message : String(e), CHECK_REASON_MAX));
     }
   }
@@ -335,6 +375,7 @@ export class Installer {
    */
   async check(params: InstallParams, log: Logger = () => {}): Promise<CheckResult> {
     await this.docker.assertAvailable();
+    await this.docker.assertRuntime();
     let checked: { staging: string; probe: ProbeData; report: ScanReport };
     try {
       checked = await this.checkClone(params, log);
@@ -365,6 +406,7 @@ export class Installer {
    */
   async installChecked(params: InstallParams, log: Logger = () => {}, hooks?: InstallHooks): Promise<InstallOutcome> {
     await this.docker.assertAvailable();
+    await this.docker.assertRuntime();
     this.registry.refresh();
     const existing = this.registry.findByRepo(params.repo.id);
     if (existing && existing.status === "ready" && !params.reinstall) return { kind: "installed", record: existing };
@@ -464,14 +506,29 @@ export class Installer {
     // the removal that opens it (the previous sandbox's if the names changed, the
     // one at these names if not) has succeeded and the record holds the new
     // names; "new" from then on, and always for a first install.
-    const state: { current: InstallState } = { current: before ? { phase: "old", before } : { phase: "new" } };
+    const state: InstallProgress = { current: before ? { phase: "old", before } : { phase: "new" } };
+    // The first write merges the install's `hosts` into what the file holds at that moment (a `set_project_hosts` from
+    // another session is kept), and `record` is given the merged list, so every later write of it carries them.
+    const wanted = normalizeAgentHosts(params.hosts ?? []);
+    const write = (next: ProjectRecord): void => {
+      this.registry.update(next.slug, (cur) => {
+        const have = new Set(Array.isArray(cur?.hosts) ? cur.hosts : []);
+        state.addedHosts = wanted.filter((h) => !have.has(h));
+        const merged = unionHosts(cur?.hosts, wanted);
+        if (merged.length > 0) next.hosts = merged;
+        else delete next.hosts;
+        return next;
+      });
+    };
     if (before && renamed) {
       // The registry keeps the object it is given, so the record that carries the
       // old names is a separate one: the new names go on `record` only after the
-      // old sandbox is gone.
-      this.registry.put(structuredClone({ ...record, container: before.container, volume: before.volume }));
+      // old sandbox is gone. It carries the merged hosts too.
+      const clone = structuredClone({ ...record, container: before.container, volume: before.volume });
+      write(clone);
+      if (clone.hosts) record.hosts = [...clone.hosts];
     } else {
-      this.registry.put(record);
+      write(record);
     }
 
     return { record, slug, container, volume, before, renamed, state };
@@ -496,6 +553,8 @@ export class Installer {
     const detection = detect(probe);
     record.ecosystems = detection.ecosystems;
     record.primary = params.ecosystem ?? detection.primary;
+    // Under containment the build's hosts are chosen from these, and a caller-chosen ecosystem gets its own rows too.
+    if (this.contained) record.ecosystems = [record.primary, ...detection.ecosystems.filter((e) => e !== record.primary)];
     record.license = detection.license;
     record.warnings.push(...detection.notes);
     if (!detection.license) {
@@ -514,10 +573,22 @@ export class Installer {
     record.imageReason = choice.reason;
     log(`Detected ${detection.ecosystems.join(", ")}; building as ${record.primary}.`);
 
+    if (this.contained) {
+      // Containment builds the proxy's allowlist from the record in the registry, not from this object: write the record
+      // (still `installing`) with the ecosystems it detected before the sandbox is contained. `putKeeping` stores a
+      // snapshot, so that a later in-memory change (`status = "failed"`) cannot reach what the hook reads, and keeps
+      // the file's `hosts` (a `set_project_hosts` from another session since the install opened is not lost).
+      this.registry.putKeeping(record, ["hosts"]);
+    }
+
     const timeoutSec = params.timeoutSec ?? this.cfg.installTimeoutSec;
     const { res, tail, sandbox } = await this.buildAttempts(
       record, attempts, choice, defaultImage, params, container, volume, timeoutSec, log, state,
     );
+
+    // The one place the build's refusals are read (DD9): right after the build, before the network is taken off or the
+    // allowlist changes, so that every branch below sees them. Refusals during discovery are not read: it rarely fetches.
+    const refused = this.contained ? await this.docker.projectRefusals(container) : [];
 
     if (res.code !== 0) {
       record.status = "failed";
@@ -525,21 +596,70 @@ export class Installer {
         ? `Install timed out after ${timeoutSec}s.`
         : `Install recipe for ${record.primary} exited with code ${res.code}.`;
       record.errorLog = tail.toString().slice(-2500);
+      const lines = refusalLines(refused, "build");
+      if (lines.length > 0) {
+        record.error = `${record.error} ${joinRefusals(lines, " ")}`;
+        record.errorLog = `${record.errorLog}\n${joinRefusals(lines, "\n")}`;
+      }
       await this.takeOffline(record, "failed", sandbox);
-      this.registry.put(record);
+      this.registry.putKeeping(record, ["hosts"]);
       return record;
     }
 
     // From here on the project's code only runs with the network policy the
     // caller asked for (off unless requested).
     const wantNetwork = params.network === true;
-    await this.docker.setNetwork(sandbox, wantNetwork);
-    record.network = wantNetwork;
+    if (!this.contained) {
+      await this.docker.setNetwork(sandbox, wantNetwork ? "open" : "off");
+      record.network = wantNetwork;
+      log("Discovering commands and generating tools…");
+      await this.discover(record, sandbox, []);
+      record.status = "ready";
+      this.registry.putKeeping(record, ["hosts"]);
+      return record;
+    }
 
+    // Contained. Never `setNetwork(sandbox, "open")`: on a contained sandbox that removes the proxy and its network and
+    // joins `bridge`. The build's refusals on a build that finished are warnings: the project may be incomplete.
+    record.warnings.push(...refusalWarnings(refused, MAX_REFUSAL_WARNINGS));
+    if (!wantNetwork) {
+      await this.docker.setNetwork(sandbox, "off");
+      record.network = false;
+      log("Discovering commands and generating tools…");
+      await this.discover(record, sandbox, []);
+      record.status = "ready";
+      this.registry.putKeeping(record, ["hosts"]);
+      return record;
+    }
+
+    // Network wanted: discovery runs under the build allowlist (the record still says `installing`), then the record says
+    // `ready` and the run allowlist replaces it.
+    record.network = true;
     log("Discovering commands and generating tools…");
     await this.discover(record, sandbox, []);
     record.status = "ready";
-    this.registry.put(record);
+    this.registry.putKeeping(record, ["hosts"]);
+    try {
+      await this.containment!.replace(record.repo.id);
+      // Sessions opened during discovery hold connections made through the build's proxy.
+      await this.proxy.closeProject(container);
+      this.docker.invalidate({ sandbox: container, key: record.repo.id.toLowerCase() });
+    } catch (e) {
+      // Ready, and offline: never on `bridge`, and never left on the build's allowlist.
+      record.network = false;
+      let off = "its network was turned off";
+      try {
+        await this.docker.setNetwork(sandbox, "off");
+      } catch {
+        record.network = true;
+        off = "turning its network off also failed, so it may still be reachable through the build's proxy";
+      }
+      record.warnings.push(
+        `The run allowlist could not be applied (${oneLine(e instanceof Error ? e.message : String(e), 200)}); ${off}. Turn it on with set_project_network.`,
+      );
+      // A second write, of a snapshot (`putKeeping` stores one).
+      this.registry.putKeeping(record, ["hosts"]);
+    }
     return record;
   }
 
@@ -570,7 +690,7 @@ export class Installer {
         if (!(e instanceof SandboxRefusedError)) throw e;
         record.warnings.push(leftInPlaceWarning(e.sandboxes));
       }
-      this.registry.put(record);
+      this.registry.putKeeping(record, ["hosts"]);
       state.current = { phase: "new" };
     }
     await this.proxy.closeProject(container);
@@ -619,8 +739,21 @@ export class Installer {
         // The first attempt's container is gone: until `createContainer` returns the next one, this install holds none.
       }
       // The reference this attempt's container was made with; a rebuild replaces it.
-      const made = await this.docker.createContainer({ name: container, volume, image, project: params.repo.id });
-      state.current = { phase: "new", sandbox: made };
+      let made: SandboxRef;
+      if (!this.contained) {
+        made = await this.docker.createContainer({ name: container, volume, image, project: params.repo.id });
+        state.current = { phase: "new", sandbox: made };
+      } else {
+        // T15: created on `bridge` and not started, contained (its network, its proxy for the build's hosts), then started.
+        // A failed containment leaves the sandbox on no network (containment guarantees it) and fails the install here, with
+        // the sandbox named in `state`, so that the failure branch takes it offline again (idempotent) and the record is failed.
+        const created = await this.docker.createContainer({ name: container, volume, image, project: params.repo.id, start: false });
+        state.current = { phase: "new", sandbox: created };
+        const contained = await this.containment!.contain(params.repo.id, { start: true });
+        if (!contained.ok) throw new Error(contained.error.message);
+        made = contained.sandbox ?? created;
+        state.current = { phase: "new", sandbox: made };
+      }
       if (i > 0) await this.docker.exec(made, ["sh", "-c", CLEAN_SCRIPT], { timeoutSec: 300 });
 
       const tail = new Tail(6000);
@@ -666,7 +799,7 @@ export class Installer {
     slug: string,
     container: string,
     volume: string,
-    state: { current: InstallState },
+    state: InstallProgress,
   ): Promise<ProjectRecord> {
     const at = state.current;
     if (at.phase === "old") {
@@ -678,9 +811,20 @@ export class Installer {
       // again" can never succeed, so it gets its own words. Any other failure keeps the original warning and error.
       const held = e instanceof SandboxRefusedError;
       const warning = held ? nameHeldWarning(e.sandboxes) : OLD_SANDBOX_WARNING;
-      this.registry.put({
-        ...before,
-        warnings: before.warnings.includes(warning) ? before.warnings : [...before.warnings, warning],
+      // The file's `hosts` stay (a `set_project_hosts` from another session since the install opened is not lost), but
+      // not what this install's own parameter added: a failed reinstall does not persist it. No record in the file (an
+      // uninstall deleted it) writes nothing: a restore never brings a project back.
+      const added = new Set(state.addedHosts ?? []);
+      this.registry.update(before.slug, (cur) => {
+        if (!cur) return undefined;
+        const restored: ProjectRecord = {
+          ...before,
+          warnings: before.warnings.includes(warning) ? before.warnings : [...before.warnings, warning],
+        };
+        const kept = (Array.isArray(cur.hosts) ? cur.hosts : []).filter((h) => !added.has(h));
+        if (kept.length > 0) restored.hosts = kept;
+        else delete restored.hosts;
+        return restored;
       });
       if (held) {
         throw new Error(
@@ -698,8 +842,16 @@ export class Installer {
       // Discovery may have opened sessions to the project's MCP servers before the throw; the caller is told the
       // install failed, so none may stay open. Best effort: the original error is what is reported.
       await this.proxy.closeProject(container).catch(() => {});
+      // Under containment what the build's proxy refused is read before the network (and the proxy with it) goes. Never throws.
+      if (this.contained) {
+        const lines = refusalLines(await this.docker.projectRefusals(container), "build");
+        if (lines.length > 0) {
+          record.error = `${record.error} ${joinRefusals(lines, " ")}`;
+          record.errorLog = `${record.errorLog ?? ""}\n${joinRefusals(lines, "\n")}`.trim();
+        }
+      }
       await this.takeOffline(record, "failed", at.sandbox);
-      this.registry.put(record);
+      this.registry.putKeeping(record, ["hosts"]);
     } else {
       // Nothing usable exists (bad repository, clone or image failure):
       // leave no half-project behind. This rollback of the install's own new names
@@ -779,7 +931,7 @@ export class Installer {
    */
   private async takeOffline(record: ProjectRecord, occasion: "failed" | "interrupted", sandbox?: SandboxRef): Promise<void> {
     try {
-      await this.docker.setNetwork(sandbox ?? record.container, false);
+      await this.docker.setNetwork(sandbox ?? record.container, "off");
       record.network = false;
     } catch (e) {
       if (e instanceof SandboxRefusedError) {
@@ -812,7 +964,8 @@ export class Installer {
     record.status = "ready";
     record.error = undefined;
     record.errorLog = undefined;
-    this.registry.put(record);
+    // Discovery changes neither the network nor the hosts: the file's stay, whatever another session set meanwhile.
+    this.registry.putKeeping(record, ["hosts", "network"]);
     return record;
   }
 
@@ -895,7 +1048,7 @@ export class Installer {
   reselect(project: ProjectRecord, selection: ToolSelection | undefined): ProjectRecord {
     const record: ProjectRecord = { ...project, selection, warnings: [...project.warnings] };
     this.publish(record);
-    this.registry.put(record);
+    this.registry.putKeeping(record, ["hosts", "network"]);
     return record;
   }
 

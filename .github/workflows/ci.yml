@@ -70,5 +70,9 @@ jobs:
               console.error("dist/index.js is not in the packed files");
               process.exit(1);
             }
-            console.log("dist/index.js is packed");
+            if (!pack[0].files.some((f) => f.path === "dist/network/proxy/proxy.cjs")) {
+              console.error("dist/network/proxy/proxy.cjs is not in the packed files");
+              process.exit(1);
+            }
+            console.log("dist/index.js and dist/network/proxy/proxy.cjs are packed");
           '

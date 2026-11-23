@@ -482,6 +482,35 @@ describe("dockerConnector", () => {
     expect(fs.readdirSync(path.join(dir, "tmp"))).toEqual([]);
   });
 
+  it("adds -e flags for the sandbox's own environment after --env-file and before the container id", () => {
+    const sandbox = { ...refOf("mcpe-x"), env: { HTTP_PROXY: "http://172.30.1.254:3128", NO_PROXY: "" } };
+    const conn = dockerConnector(cfg)({
+      container: "mcpe-x",
+      sandbox,
+      server: spec({ env: { API_KEY: "s3cret" } }),
+      pidFile: "/tmp/p.pid",
+    });
+    const args = (conn.transport as unknown as { _serverParams: { args: string[] } })._serverParams.args;
+    const id = fakeSandboxId("mcpe-x");
+    // Docker gives -e precedence over --env-file whatever the order; the order is pinned only as documentation.
+    expect(args.indexOf("--env-file")).toBeGreaterThan(-1);
+    expect(args.indexOf("--env-file")).toBeLessThan(args.indexOf("-e"));
+    expect(args.slice(args.indexOf("-e"), args.indexOf(id))).toEqual(["-e", "HTTP_PROXY=http://172.30.1.254:3128", "-e", "NO_PROXY="]);
+    expect(args.join(" ")).not.toContain("s3cret");
+    conn.cleanup?.();
+  });
+
+  it("adds no -e flag when the sandbox carries no environment", () => {
+    const conn = dockerConnector(cfg)({ container: "mcpe-x", sandbox: refOf("mcpe-x"), server: spec(), pidFile: "/tmp/p.pid" });
+    expect((conn.transport as unknown as { _serverParams: { args: string[] } })._serverParams.args).not.toContain("-e");
+  });
+
+  it("throws on a sandbox variable Docker could not carry, and leaves no env file behind", () => {
+    const sandbox = { ...refOf("mcpe-x"), env: { "BAD-NAME": "x" } };
+    expect(() => dockerConnector(cfg)({ container: "mcpe-x", sandbox, server: spec({ env: { API_KEY: "s3cret" } }), pidFile: "/tmp/p.pid" })).toThrow(/environment variable/i);
+    expect(fs.readdirSync(path.join(dir, "tmp"))).toEqual([]);
+  });
+
   it("creates no env file when there is no environment", () => {
     const conn = dockerConnector(cfg)({ container: "mcpe-x", sandbox: refOf("mcpe-x"), server: spec(), pidFile: "/tmp/p.pid" });
     const params = (conn.transport as unknown as { _serverParams: { args: string[] } })._serverParams;

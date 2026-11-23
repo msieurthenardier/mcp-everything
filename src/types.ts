@@ -124,6 +124,12 @@ export interface ProjectRecord {
   primary: Ecosystem;
   /** Whether the sandbox currently has outbound network access. */
   network: boolean;
+  /**
+   * Hosts the project may reach under network containment, beyond the defaults for its build system: `host` or
+   * `host:port`, `*.` allowed, normalized by the agent-mode grammar, sorted. Recorded under every network mode; it
+   * has effect only under `MCPE_NETWORK=contained`. Written only by `set_project_hosts` and the opening of an install.
+   */
+  hosts?: string[];
   status: ProjectStatus;
   /** One-line reason when status is "failed". */
   error?: string;

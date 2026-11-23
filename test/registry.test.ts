@@ -497,3 +497,70 @@ describe("Registry.sweepTemps", () => {
     expect(fresh.list().map((p) => [p.slug, p.network])).toEqual([["a", true]]);
   });
 });
+
+describe("Registry.putKeeping (leg 9)", () => {
+  it("keeps the file's hosts over a held record's, whichever instance wrote them", () => {
+    const mine = new Registry(dir);
+    mine.put(record("a"));
+    const held = structuredClone(mine.get("a")!);
+    new Registry(dir).update("a", (cur) => ({ ...cur!, hosts: ["x.example", "y.example"] }));
+    const stored = mine.putKeeping({ ...held, warnings: ["new"] }, ["hosts"]);
+    expect(stored).toMatchObject({ warnings: ["new"], hosts: ["x.example", "y.example"] });
+    const fresh = new Registry(dir);
+    fresh.refresh();
+    expect(fresh.get("a")).toMatchObject({ hosts: ["x.example", "y.example"], warnings: ["new"] });
+  });
+
+  it("drops hosts the file does not have (a held record that has some does not write them back)", () => {
+    const reg = new Registry(dir);
+    reg.put(record("a"));
+    reg.putKeeping({ ...record("a"), hosts: ["stale.example"] }, ["hosts"]);
+    const fresh = new Registry(dir);
+    fresh.refresh();
+    expect(fresh.get("a")).not.toHaveProperty("hosts");
+  });
+
+  it("keeps the file's network only when asked", () => {
+    const reg = new Registry(dir);
+    reg.put(record("a"));
+    new Registry(dir).update("a", (cur) => ({ ...cur!, network: true }));
+    reg.putKeeping({ ...record("a"), network: false }, ["hosts"]);
+    expect(reg.get("a")!.network).toBe(false);
+    new Registry(dir).update("a", (cur) => ({ ...cur!, network: true }));
+    reg.putKeeping({ ...record("a"), network: false }, ["hosts", "network"]);
+    expect(reg.get("a")!.network).toBe(true);
+  });
+
+  it("sets the kept fields of the held record from what was stored, so what the caller returns is current", () => {
+    const reg = new Registry(dir);
+    reg.put(record("a"));
+    new Registry(dir).update("a", (cur) => ({ ...cur!, hosts: ["x.example"], network: true }));
+    const held = record("a");
+    reg.putKeeping(held, ["hosts", "network"]);
+    expect(held.hosts).toEqual(["x.example"]);
+    expect(held.network).toBe(true);
+  });
+
+  it("stores a copy: a later change to the held record does not reach what the registry holds", () => {
+    const reg = new Registry(dir);
+    reg.put(record("a"));
+    const held = record("a");
+    reg.putKeeping(held, ["hosts"]);
+    held.status = "failed";
+    held.warnings.push("later");
+    expect(reg.get("a")).toMatchObject({ status: "ready", warnings: [] });
+  });
+
+  it("writes nothing for a record the file no longer has, says so, and returns undefined", () => {
+    const lines: string[] = [];
+    const reg = new Registry(dir, (l) => lines.push(l));
+    reg.put(record("a"));
+    new Registry(dir).delete("a");
+    expect(reg.putKeeping(record("a"), ["hosts"])).toBeUndefined();
+    const fresh = new Registry(dir);
+    fresh.refresh();
+    expect(fresh.list()).toEqual([]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/a has no record any more/);
+  });
+});

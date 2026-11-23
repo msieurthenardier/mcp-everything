@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Ecosystem } from "./types.js";
 import { ConfigError } from "./errors.js";
+import { parseLocalAccess, type LocalTarget } from "./network/local-access.js";
 import { parseScannersFile } from "./scan/scanners-file.js";
 import { LEVELS, type Level, type ScannerSpec } from "./scan/types.js";
 
@@ -21,6 +22,8 @@ export interface Config {
     /** Prefix of container and volume names; lets separate registries coexist. */
     namePrefix: string;
     probeImage: string;
+    /** The image the one-shot and project proxies run (`node -e`); needs Node 22 or later. */
+    proxyImage: string;
     images: Record<Ecosystem, string>;
     /** Ecosystems whose image the operator chose; version detection leaves those alone. */
     imageOverridden: Record<Ecosystem, boolean>;
@@ -48,6 +51,12 @@ export interface Config {
     timeoutSec: number;
     scanners: ScannerSpec[];
     scannersFile?: string;
+  };
+  /** How sandboxes reach the network. */
+  network: {
+    mode: "open" | "contained";
+    /** Local services a repository's sandbox may reach under containment, by lower-cased repository id. */
+    localAccess: Record<string, LocalTarget[]>;
   };
 }
 
@@ -124,11 +133,22 @@ export function loadConfig(
   // Full (non-slim) Debian-based images: they ship git, a C toolchain and
   // coreutils `timeout`, which the install recipes rely on.
   const generic = "buildpack-deps:stable";
+  const hosts = parseHosts(env.MCPE_EXTRA_HOSTS);
+  const network: Config["network"] = { mode: parseNetworkMode(env.MCPE_NETWORK), localAccess: parseLocalAccess(env.MCPE_LOCAL_ACCESS, hosts) };
+  const scan = parseScan(env, readFile);
+  if (network.mode === "contained") {
+    const bare = scan.scanners.find((s) => s.network && s.hosts.length === 0);
+    if (bare) {
+      throw new ConfigError(
+        `MCPE_SCANNERS: scanner ${JSON.stringify(bare.name)} has "network": true and needs "hosts" under MCPE_NETWORK=contained.`,
+      );
+    }
+  }
   return {
     dataDir: env.MCPE_DATA_DIR || path.join(dataHome, "mcp-everything"),
     githubToken: env.GITHUB_TOKEN || env.GH_TOKEN || undefined,
     gitlabToken: env.GITLAB_TOKEN || undefined,
-    hosts: parseHosts(env.MCPE_EXTRA_HOSTS),
+    hosts,
     docker: {
       bin: env.MCPE_DOCKER_BIN || "docker",
       runtime: env.MCPE_DOCKER_RUNTIME || undefined,
@@ -140,6 +160,11 @@ export function loadConfig(
       // To bump: `docker buildx imagetools inspect alpine/git:latest` gives the digest and Docker Hub
       // lists the version tag that `latest` points to; then run the Docker suite and the pressure cases.
       probeImage: env.MCPE_PROBE_IMAGE || "alpine/git:2.54.1@sha256:29cff25811f790b9f72fc266bf8009a5a911714c0e03c31c47339c50909d9aef",
+      // Pinned by the index digest, with the tag it was read under: `node:22-alpine` (Docker Hub, 2026-11-22;
+      // read with `docker buildx imagetools inspect node:22-alpine`, Node 22 on Alpine). The proxy program runs
+      // under `node -e`, so any image with Node 22 or later and no other need works. To bump, read the digest the
+      // same way and run the Docker suite.
+      proxyImage: env.MCPE_PROXY_IMAGE || "node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a",
       images: {
         rust: img("rust", "rust:1"),
         go: img("go", "golang:1"),
@@ -171,8 +196,17 @@ export function loadConfig(
     sandboxIdleSec: nonNegativeInt(env.MCPE_SANDBOX_IDLE_TIMEOUT, 1800),
     maxToolsPerProject: int(env.MCPE_MAX_TOOLS_PER_PROJECT, 40),
     maxOutputBytes: int(env.MCPE_MAX_OUTPUT_BYTES, 100_000),
-    scan: parseScan(env, readFile),
+    scan,
+    network,
   };
+}
+
+/** Unset, empty or `open` gives open; `contained` gives contained; anything else is an error, not a silent fallback. */
+function parseNetworkMode(raw: string | undefined): Config["network"]["mode"] {
+  const v = (raw ?? "").trim().toLowerCase();
+  if (v === "" || v === "open") return "open";
+  if (v === "contained") return "contained";
+  throw new ConfigError(`MCPE_NETWORK=${JSON.stringify(raw)} is not valid: use open or contained.`);
 }
 
 function parseScan(env: NodeJS.ProcessEnv, readFile: (path: string) => string): Config["scan"] {

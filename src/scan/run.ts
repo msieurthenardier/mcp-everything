@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { newEnvFileName, validateEnv } from "../proxy/mcp-proxy.js";
-import { SandboxRefusedError, VolumeNotUsableError } from "../sandbox/docker.js";
-import type { RunResult } from "../util/exec.js";
+import { joinRefusals, refusalLines } from "../network/refusals.js";
+import { SandboxRefusedError, VolumeNotUsableError, type OneShotResult } from "../sandbox/docker.js";
 import { oneLine } from "../util/text.js";
 import { emptyCounts, parseSarif } from "./sarif.js";
 import type { CheckOutcome, Finding, ScannerSpec } from "./types.js";
@@ -10,7 +10,7 @@ import type { CheckOutcome, Finding, ScannerSpec } from "./types.js";
 /** The two things `runScanners` needs from Docker; the class satisfies it. */
 export interface ScanDocker {
   ensureImage(image: string, onOutput?: (chunk: string) => void, pullTimeoutMs?: number): Promise<void>;
-  runScanner(volume: string, spec: ScannerSpec, opts: { timeoutMs: number; envFile?: string }): Promise<RunResult>;
+  runScanner(volume: string, spec: ScannerSpec, opts: { timeoutMs: number; envFile?: string }): Promise<OneShotResult>;
 }
 
 export interface RunScannersOptions {
@@ -116,7 +116,7 @@ async function runOne(
         return outcome(spec, "failed", "the credentials file for the scanner could not be written");
       }
     }
-    let res: RunResult;
+    let res: OneShotResult;
     try {
       res = await docker.runScanner(volume, spec, { timeoutMs, envFile });
     } catch (e) {
@@ -135,10 +135,17 @@ async function runOne(
   }
 }
 
-function interpret(spec: ScannerSpec, res: RunResult, timeoutMs: number, redact: (text: string) => string): CheckOutcome {
+function interpret(spec: ScannerSpec, res: OneShotResult, timeoutMs: number, redact: (text: string) => string): CheckOutcome {
   // Redacted before it is cut, so a value is never half in and half out of the tail.
   const tail = oneLine(redact(res.stderr).slice(-STDERR_TAIL), STDERR_TAIL);
-  const failed = (reason: string): CheckOutcome => outcome(spec, "failed", redact(tail ? `${reason}: ${tail}` : reason));
+  // What the scanner's proxy refused (a scanner behind containment only), for a FAILED outcome: never added to a run that
+  // produced valid output. Known limit: a scanner that swallows its own refusals and exits 0 with valid SARIF shows none.
+  const refused = res.proxy && "rows" in res.proxy ? joinRefusals(refusalLines(res.proxy.rows, "scanner"), " ") : "";
+  const failed = (reason: string): CheckOutcome => {
+    const text = tail ? `${reason}: ${tail}` : reason;
+    // The refusal lines go through `redact` with the rest, and the whole stays bounded (the tail is at most 300, the lines 1,500).
+    return outcome(spec, "failed", redact(refused ? oneLine(`${text} ${refused}`, 2_000) : text));
+  };
   if (res.timedOut) return failed(`timed out after ${Math.round(timeoutMs / 1000)} s`);
   if (res.truncated) return failed("output over 8 MB");
   // The exit code is ignored: scanners exit non-zero when they find something.
