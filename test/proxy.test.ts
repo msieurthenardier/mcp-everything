@@ -483,7 +483,7 @@ describe("dockerConnector", () => {
   });
 
   it("adds -e flags for the sandbox's own environment after --env-file and before the container id", () => {
-    const sandbox = { ...refOf("mcpe-x"), env: { HTTP_PROXY: "http://mcpe-proxy:3128", NO_PROXY: "" } };
+    const sandbox = { ...refOf("mcpe-x"), env: { HTTP_PROXY: "http://172.30.1.254:3128", NO_PROXY: "" } };
     const conn = dockerConnector(cfg)({
       container: "mcpe-x",
       sandbox,
@@ -495,7 +495,7 @@ describe("dockerConnector", () => {
     // Docker gives -e precedence over --env-file whatever the order; the order is pinned only as documentation.
     expect(args.indexOf("--env-file")).toBeGreaterThan(-1);
     expect(args.indexOf("--env-file")).toBeLessThan(args.indexOf("-e"));
-    expect(args.slice(args.indexOf("-e"), args.indexOf(id))).toEqual(["-e", "HTTP_PROXY=http://mcpe-proxy:3128", "-e", "NO_PROXY="]);
+    expect(args.slice(args.indexOf("-e"), args.indexOf(id))).toEqual(["-e", "HTTP_PROXY=http://172.30.1.254:3128", "-e", "NO_PROXY="]);
     expect(args.join(" ")).not.toContain("s3cret");
     conn.cleanup?.();
   });

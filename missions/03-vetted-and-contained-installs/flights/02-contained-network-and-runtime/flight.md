@@ -560,6 +560,7 @@ Legs are cut by kind of risk (flight 1 debrief):
 - [x] `startup-containment` - Existing sandboxes contained at startup, exec waits, never loosen
 - [x] `status-and-docs` - Instructions, status lines, tool wording, README
 - [x] `gvisor-ci` - CI workflow on plain Linux with gVisor and containment
+- [x] `proxy-by-address` - Sandboxes reach their proxy by a fixed address, not Docker's embedded DNS (which gVisor cannot use); local-access names through the sandbox's hosts file; gVisor-specific skips; a native-Linux runc containment run in CI *(added after the first full gVisor run, 2026-11-23; operator)*
 - [ ] `hat-and-alignment` *(optional)* - Guided HAT (human acceptance test) session with iterative fixes
 
 ---

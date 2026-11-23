@@ -8,7 +8,10 @@ import {
   makeRef,
   networkModeOf,
   newProjectProxyName,
+  projectNetworkName,
   PROJECT_LABEL,
+  proxyAddress,
+  type AfterStartHook,
   type ContainedNetwork,
   type ContainmentHook,
   type ContainmentHookMode,
@@ -38,16 +41,17 @@ export const RECORD_LABEL = "mcp-everything.proxy-record";
 export const SESSION_LABEL = "mcp-everything.proxy-session";
 export const VERSION_LABEL = "mcp-everything.proxy-version";
 
-/** The proxy's address from the sandbox's side: its alias on the project network and the port it listens on. */
-const PROXY_URL = `http://mcpe-proxy:${PROXY_PORT}`;
-
-/** The environment a contained sandbox's commands get. */
-export function proxyEnvironment(): Record<string, string> {
+/**
+ * The environment a contained sandbox's commands get. The proxy is named by its ADDRESS on the project network
+ * (`proxyAddress` of the subnet), never by a name: a name needs Docker's embedded DNS, which gVisor cannot reach.
+ */
+export function proxyEnvironment(address: string): Record<string, string> {
+  const url = `http://${address}:${PROXY_PORT}`;
   return {
-    HTTP_PROXY: PROXY_URL,
-    HTTPS_PROXY: PROXY_URL,
-    http_proxy: PROXY_URL,
-    https_proxy: PROXY_URL,
+    HTTP_PROXY: url,
+    HTTPS_PROXY: url,
+    http_proxy: url,
+    https_proxy: url,
     NO_PROXY: "",
     no_proxy: "",
     NODE_USE_ENV_PROXY: "1",
@@ -131,7 +135,13 @@ export interface ContainmentDocker {
   findProjectNetwork(sandbox: string, project: string): Promise<ContainedNetwork | undefined>;
   attachProjectNetwork(sandbox: SandboxRef, net: { id: string; name: string }): Promise<void>;
   listProjectProxies(sandbox: string): Promise<ProjectProxy[]>;
-  projectProxyAttached(id: string, net: { id: string; name: string }): Promise<boolean>;
+  projectProxyAttached(id: string, net: { id: string; name: string; subnet: string }): Promise<boolean>;
+  /** Take a proxy off the project network (replacement's first step); gone or not attached is success. */
+  detachProjectProxy(id: string, net: { id: string }): Promise<void>;
+  /** Put a detached proxy back at its address (stop, connect, start, ready, attached); throws when any step fails. */
+  restoreProjectProxy(id: string, net: ContainedNetwork): Promise<void>;
+  /** The sandbox's local-access lines in its `/etc/hosts` (none for no names); idempotent. */
+  writeLocalAccess(ref: { id: string; name: string }, address: string, names: string[]): Promise<void>;
   createProjectProxy(sandbox: string, project: string, config: ProxyConfig, labels: Record<string, string>, opts?: { name?: string }): Promise<{ id: string; name: string }>;
   startProjectProxy(id: string): Promise<void>;
   projectProxyStatus(id: string): Promise<unknown>;
@@ -144,7 +154,7 @@ export interface ContainmentDocker {
   startForContainment(name: string): Promise<SandboxRef | undefined>;
   inspectSandbox(name: string): Promise<SandboxInspectFacts | undefined>;
   invalidate(filter?: { id?: string; sandbox?: string; key?: string }): void;
-  setContainment(hook: ContainmentHook | undefined): void;
+  setContainment(hook: ContainmentHook | undefined, afterStart?: AfterStartHook): void;
 }
 
 export interface ContainmentOptions {
@@ -296,6 +306,8 @@ export class Containment {
   private readonly statusRead = new Map<string, number>();
   private readonly newerUntil = new Map<string, number>();
   private readonly newerLogged = new Set<string>();
+  /** The subnet of each project network, by network id. A network's subnet never changes, so an entry is never invalidated. */
+  private readonly subnets = new Map<string, string>();
 
   constructor(
     private readonly cfg: Config,
@@ -307,28 +319,24 @@ export class Containment {
     this.log = opts.log ?? (() => {});
   }
 
-  /** Install this as the Docker layer's hook. */
+  /** Install this as the Docker layer's hook, with the post-start step that writes the local-access names (leg 13). */
   install(): void {
-    this.docker.setContainment((facts, mode) => this.ensureContained(facts, mode));
+    this.docker.setContainment(
+      (facts, mode) => this.ensureContained(facts, mode),
+      (facts, started) => this.afterStart(facts, started),
+    );
   }
 
   // --- the configuration and its labels --------------------------------------------------------------------------
 
   /**
    * The proxy a record needs on a network: `allow` is the phase's hosts plus the record's own, `forwards` the
-   * session's local access for the repository (a target named `mcpe-proxy` is refused with a warning), `resolvers`
-   * the upstream ones, `listenCidr` the `-net`'s subnet.
+   * session's local access for the repository, `resolvers` the upstream ones, `listenCidr` the `-net`'s subnet.
    */
   async buildConfig(record: ProjectRecord, net: { id: string; subnet: string }): Promise<ProxyPlan> {
     const allow = allowanceFor(record, this.opts.defaults);
     const warnings = [...allow.warnings];
-    // Local access applies only to the sandbox with its network on, never to a build (DD10).
-    const wanted = allow.phase === "run" ? localAccessFor(this.cfg, record.repo) : [];
-    const forwards = wanted.filter((f) => {
-      if (f.host !== "mcpe-proxy") return true;
-      warnings.push(`The local-access target ${f.host}:${f.port} was dropped: mcpe-proxy is the proxy's own name`);
-      return false;
-    });
+    const forwards = this.forwardsFor(record);
     const resolvers = await this.docker.readUpstreamResolvers();
     const config = proxyConfig({ allow: allow.entries, forwards, listenCidr: net.subnet, resolvers });
     return {
@@ -340,6 +348,11 @@ export class Containment {
       },
       warnings,
     };
+  }
+
+  /** The session's local access for a record: only the sandbox with its network on has it, never a build (DD10). */
+  private forwardsFor(record: ProjectRecord): LocalTarget[] {
+    return phaseOf(record) === "run" ? localAccessFor(this.cfg, record.repo) : [];
   }
 
   // --- the startup pass's wait -----------------------------------------------------------------------------------
@@ -644,16 +657,35 @@ export class Containment {
 
   /** The replacement, for a caller that holds the lock. */
   private async replaceLocked(lock: HeldLock, s: Subject, opts: { force?: boolean; compareSession?: boolean }): Promise<ReplaceResult> {
+    return (await this.replaceInner(lock, s, opts)).result;
+  }
+
+  /**
+   * The replacement, with the network it settled on and the names the sandbox's `/etc/hosts` should carry.
+   * Two containers cannot hold one address, so the order is (leg 13, superseding DD2's overlap): under the lock, take
+   * EVERY current proxy off the network; `assertLive`; create the new proxy at the address (it is connected before it
+   * starts) and wait for it; check that it is attached at the address; then remove the old ones. A tightening is
+   * therefore effective at once, and a connection through an old proxy drops. On any failure the new proxy is removed by
+   * name, then an old one is put back (stopped, connected at the address, started, ready, attached); if that fails too the
+   * project has no proxy, which fails closed, and `assess` calls for a replacement on the next use.
+   */
+  private async replaceInner(
+    lock: HeldLock,
+    s: Subject,
+    opts: { force?: boolean; compareSession?: boolean },
+  ): Promise<{ result: ReplaceResult; net: ContainedNetwork; names: string[] }> {
     const record = this.fresh(s.key, s.sandbox);
     const net = await this.docker.ensureProjectNetwork(s.sandbox, s.project);
+    this.subnets.set(net.id, net.subnet);
+    const names = this.namesOf(this.forwardsFor(record));
     // The version is compared before the configuration is built: a newer proxy costs no resolver read.
     const first = await this.docker.listProjectProxies(s.sandbox);
     const keptEarly = await this.keepNewer(s, first);
-    if (keptEarly) return keptEarly;
+    if (keptEarly) return { result: keptEarly, net, names };
     const plan = await this.buildConfig(record, net);
     const current = await this.docker.listProjectProxies(s.sandbox);
     const keptLate = await this.keepNewer(s, current);
-    if (keptLate) return { ...keptLate, warnings: plan.warnings };
+    if (keptLate) return { result: { ...keptLate, warnings: plan.warnings }, net, names };
     if (!opts.force && current.length === 1) {
       const p = current[0]!;
       const equal =
@@ -661,30 +693,129 @@ export class Containment {
         proxyVersionOf(p) === OUR_VERSION &&
         p.labels[RECORD_LABEL] === plan.labels[RECORD_LABEL] &&
         (!opts.compareSession || p.labels[SESSION_LABEL] === plan.labels[SESSION_LABEL]);
-      if (equal && (await this.docker.projectProxyAttached(p.id, net))) return { kind: "unchanged", proxy: { id: p.id, name: p.name }, warnings: plan.warnings };
+      if (equal && (await this.docker.projectProxyAttached(p.id, net))) {
+        return { result: { kind: "unchanged", proxy: { id: p.id, name: p.name }, warnings: plan.warnings }, net, names };
+      }
     }
     // The name is chosen here, so that it can be removed by name whatever happens to the call that creates it.
     const name = newProjectProxyName(s.sandbox);
+    const olds = current.filter((p) => proxyVersionOf(p) <= OUR_VERSION); // a newer proxy was kept above, never removed, not even by force
+    const detached: ProjectProxy[] = [];
     let keep = false;
+    let lockLost = false;
     try {
+      for (const p of olds) {
+        detached.push(p); // before the call: a disconnect that failed half way is put back too
+        await this.docker.detachProjectProxy(p.id, net);
+      }
+      lock.assertLive();
       const made = await this.docker.createProjectProxy(s.sandbox, s.project, plan.config, plan.labels, { name });
       lock.assertLive();
+      if (!(await this.docker.projectProxyAttached(made.id, net))) {
+        throw new ContainmentError(`The new proxy for ${s.key} is not attached to its network at the proxy address.`);
+      }
       keep = true;
       let removed = 0;
-      for (const p of current) {
-        if (proxyVersionOf(p) > OUR_VERSION) continue; // never removed, not even by force
+      for (const p of olds) {
         await this.docker.removeProjectProxy(p.id);
         removed++;
       }
-      return { kind: "replaced", proxy: made, removed, warnings: plan.warnings };
+      // The names are the same when only hosts changed (the address is fixed); they are written again when there are any, and
+      // taken out when the session's forwards changed and none are left.
+      if (names.length > 0 || olds.some((p) => p.labels[SESSION_LABEL] !== plan.labels[SESSION_LABEL])) await this.syncLocalAccess(s, net, names);
+      return { result: { kind: "replaced", proxy: made, removed, warnings: plan.warnings }, net, names };
+    } catch (e) {
+      if (e instanceof ContainmentLockLostError) lockLost = true;
+      throw e;
     } finally {
-      try {
-        if (!keep) await this.docker.removeProjectProxyNamed(s.sandbox, name);
-      } catch (e) {
-        this.log(`containment: could not remove the new proxy ${name} after a failure: ${(e as Error).message}`);
-      }
+      if (!keep) await this.rollbackReplace(s, net, name, detached, lockLost);
       this.docker.invalidate({ sandbox: s.sandbox, key: s.key });
     }
+  }
+
+  /**
+   * After a replacement failed: remove the new proxy by name, then put one old proxy back (never two: they share the
+   * address). A lock that was taken over means someone else may be replacing it now, so nothing is restored. Never throws.
+   */
+  private async rollbackReplace(s: Subject, net: ContainedNetwork, name: string, detached: ProjectProxy[], lockLost: boolean): Promise<void> {
+    try {
+      await this.docker.removeProjectProxyNamed(s.sandbox, name);
+    } catch (e) {
+      this.log(`containment: could not remove the new proxy ${name} after a failure: ${(e as Error).message}`);
+    }
+    if (lockLost) {
+      if (detached.length > 0) this.log(`containment: ${s.key} had its lock taken over; its old proxy was not put back.`);
+      return;
+    }
+    for (const p of detached) {
+      try {
+        await this.docker.restoreProjectProxy(p.id, net);
+        return;
+      } catch (e) {
+        this.log(`containment: could not put the old proxy ${p.name} back after a failed replacement: ${(e as Error).message}`);
+      }
+    }
+    if (detached.length > 0) this.log(`containment: ${s.key} has no proxy now; its sandbox fails closed until the next use repairs it.`);
+  }
+
+  /** The distinct host names of a list of forwards, in order. */
+  private namesOf(forwards: readonly LocalTarget[]): string[] {
+    return [...new Set(forwards.map((f) => f.host))];
+  }
+
+  /**
+   * Write the sandbox's local-access names into its `/etc/hosts` now (after a contain or a replacement changed what they
+   * should be), when it is running and on its project network. Never throws: a failure is logged, and the sandbox is then
+   * contained but without the names. The hook's cache plays no part (the write is always made).
+   */
+  private async syncLocalAccess(s: Subject, net: ContainedNetwork, names: string[]): Promise<void> {
+    try {
+      const f = await this.docker.inspectSandbox(s.sandbox);
+      if (!f || !f.running || networkModeOf(f.name, f.networks) !== "contained") return;
+      await this.docker.writeLocalAccess({ id: f.id, name: f.name }, proxyAddress(net.subnet), names);
+    } catch (e) {
+      this.log(`containment: could not write the local-access names of ${s.sandbox}: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * The Docker layer's post-start step (`afterStart`): after a start, or when a running sandbox is acquired, write the
+   * project's local-access names into its `/etc/hosts` (Docker rewrites that file on every start). Skipped at once for a
+   * project with no forwards (most projects), under another session mode, and for a sandbox that is not contained. The
+   * write itself is idempotent and checks for the lines first, so a running sandbox that has them costs one exec. Never throws.
+   */
+  async afterStart(facts: SandboxInspectFacts, _started: boolean): Promise<void> {
+    try {
+      const label = facts.labels?.[PROJECT_LABEL];
+      if (label === undefined || label === "" || this.cfg.network.mode !== "contained") return;
+      const key = label.toLowerCase();
+      if ((this.cfg.network.localAccess[key] ?? []).length === 0) return;
+      if (networkModeOf(facts.name, facts.networks) !== "contained") return;
+      const record = this.peek(key);
+      if (!record || record.container !== facts.name) return;
+      const names = this.namesOf(this.forwardsFor(record));
+      if (names.length === 0) return;
+      const address = await this.addressFor(facts, label);
+      if (address === undefined) return;
+      await this.docker.writeLocalAccess({ id: facts.id, name: facts.name }, address, names);
+    } catch (e) {
+      this.log(`containment: could not write the local-access names of ${facts.name}: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * The proxy's address for a sandbox, from its project network's subnet. A network's subnet never changes, so it is kept
+   * by network id and never invalidated: the facts carry the id, and only an id not seen yet costs one inspect of the network.
+   * Undefined when the network cannot be found.
+   */
+  private async addressFor(facts: SandboxInspectFacts, label: string): Promise<string | undefined> {
+    const id = facts.networkIds?.[projectNetworkName(facts.name)];
+    const known = id !== undefined ? this.subnets.get(id) : undefined;
+    if (known !== undefined) return proxyAddress(known);
+    const net = await this.docker.findProjectNetwork(facts.name, label);
+    if (!net) return undefined;
+    this.subnets.set(net.id, net.subnet);
+    return proxyAddress(net.subnet);
   }
 
   /** When a proxy of a newer program is among these, keep it (starting it if none runs) and say so; else undefined. */
@@ -754,16 +885,20 @@ export class Containment {
    */
   private async containLocked(lock: HeldLock, subject: Subject, opts: { start?: boolean }): Promise<{ result: ReplaceResult; sandbox?: SandboxRef }> {
     try {
-      const replaced = await this.replaceLocked(lock, subject, {}); // makes the network first, then the proxy
+      const { result: replaced, net, names } = await this.replaceInner(lock, subject, {}); // makes the network first, then the proxy
       await this.docker.setNetwork(subject.sandbox, "contained");
       this.docker.invalidate({ sandbox: subject.sandbox, key: subject.key });
       let started: SandboxRef | undefined;
       if (opts.start) {
         // The first start of a sandbox that was created stopped (T15): after it is contained, never before. The unhooked start,
         // because this is containment's own step; the lock is held and the network and the proxy were just made.
+        // The start's own post-start step writes the local-access names.
         started = await this.docker.startForContainment(subject.sandbox);
         if (!started) throw new ContainmentError(`The sandbox ${subject.sandbox} is gone: it could not be started.`);
       }
+      // A sandbox that was already running was just moved onto its network and gets its names now (a second write after a
+      // start is a no-op: the write checks for the lines first).
+      if (names.length > 0) await this.syncLocalAccess(subject, net, names);
       return { result: replaced, ...(started ? { sandbox: started } : {}) };
     } catch (e) {
       if (typeof e === "object" && e !== null) this.offDone.add(e); // attempted here, once, whatever the outcome
@@ -824,8 +959,20 @@ export class Containment {
 
   // --- repair and the hook ---------------------------------------------------------------------------------------
 
-  private envIfContained(facts: SandboxInspectFacts): Record<string, string> | undefined {
-    return networkModeOf(facts.name, facts.networks) === "contained" ? proxyEnvironment() : undefined;
+  /**
+   * The environment when the facts say contained, read-only (it repairs nothing): the proxy's address comes from the
+   * network's subnet, remembered by network id. When the network cannot be read the answer is no environment, and the
+   * command fails closed (a contained sandbox has no other route).
+   */
+  private async envIfContained(facts: SandboxInspectFacts): Promise<Record<string, string> | undefined> {
+    if (networkModeOf(facts.name, facts.networks) !== "contained") return undefined;
+    try {
+      const address = await this.addressFor(facts, facts.labels?.[PROJECT_LABEL] ?? "");
+      return address === undefined ? undefined : proxyEnvironment(address);
+    } catch (e) {
+      this.log(`containment: the proxy address of ${facts.name} could not be read: ${(e as Error).message}`);
+      return undefined;
+    }
   }
 
   /**
@@ -884,28 +1031,32 @@ export class Containment {
     }
     if (!record) return undefined; // leg 10's pass removes orphans; with no proxy environment this fails closed
     // A sandbox that is not the record's (the old one of a renamed reinstall): observe only, never the record's configuration.
-    if (record.container !== f.name) return proxyEnvironment();
+    if (record.container !== f.name) return this.envIfContained(f);
     const s: Subject = { key, sandbox: f.name, project: label };
-    const verdict = await this.checkUnlocked(s, record);
-    if (verdict === "fine") {
+    const looked = await this.checkUnlocked(s, record);
+    if (looked.verdict === "fine") {
       this.clearFailedStartup(key); // checked and right: a failed gate no longer applies to this key
-      return proxyEnvironment();
+      return proxyEnvironment(proxyAddress(looked.net!.subnet));
     }
     // Only a repair needs the proxy image, and it is ensured outside the lock.
-    if (verdict !== "start") await this.docker.ensureImage(this.cfg.docker.proxyImage);
-    await this.withProjectLock(key, (lock) => this.repairLocked(lock, s, f, { resolverTrouble: verdict === "resolvers" }));
+    if (looked.verdict !== "start") await this.docker.ensureImage(this.cfg.docker.proxyImage);
+    const repaired = await this.withProjectLock(key, (lock) => this.repairLocked(lock, s, f, { resolverTrouble: looked.verdict === "resolvers" }));
     this.clearFailedStartup(key);
-    return proxyEnvironment();
+    return proxyEnvironment(proxyAddress(repaired.net.subnet));
   }
 
-  /** The cheap, lock-free look: "fine", "start" (a stopped proxy), "resolvers" (many resolver failures) or "repair". */
-  private async checkUnlocked(s: Subject, record: ProjectRecord): Promise<"fine" | "start" | "resolvers" | "repair"> {
+  /**
+   * The cheap, lock-free look: "fine", "start" (a stopped proxy), "resolvers" (many resolver failures) or "repair".
+   * The network it read comes with it (never for "repair" when the network is missing); its subnet is remembered by id.
+   */
+  private async checkUnlocked(s: Subject, record: ProjectRecord): Promise<{ verdict: "fine" | "start" | "resolvers" | "repair"; net?: ContainedNetwork }> {
     const net = await this.docker.findProjectNetwork(s.sandbox, s.project);
-    if (!net) return "repair";
+    if (!net) return { verdict: "repair" };
+    this.subnets.set(net.id, net.subnet);
     const a = await this.assess(record, net, await this.docker.listProjectProxies(s.sandbox), s.key);
-    if (a.kind === "replace") return "repair";
-    if (a.kind === "start") return "start";
-    return (await this.resolversFailing(s.key, a.proxy)) ? "resolvers" : "fine";
+    if (a.kind === "replace") return { verdict: "repair", net };
+    if (a.kind === "start") return { verdict: "start", net };
+    return { verdict: (await this.resolversFailing(s.key, a.proxy)) ? "resolvers" : "fine", net };
   }
 
   private async assess(record: ProjectRecord, net: ContainedNetwork, proxies: ProjectProxy[], key: string): Promise<Assessment> {
@@ -945,23 +1096,24 @@ export class Containment {
     s: Subject,
     f: SandboxInspectFacts,
     opts: { resolverTrouble?: boolean; compareSession?: boolean },
-  ): Promise<ReplaceResult | undefined> {
+  ): Promise<{ result: ReplaceResult | undefined; net: ContainedNetwork }> {
     const record = this.fresh(s.key, s.sandbox);
     const net = await this.docker.ensureProjectNetwork(s.sandbox, s.project);
+    this.subnets.set(net.id, net.subnet);
     // A network made again leaves the sandbox on the old one's name: attach it to the new one (T14).
     if (net.created) await this.docker.attachProjectNetwork(makeRef(f.id, f.name), net);
-    if (opts.compareSession) return this.replaceLocked(lock, s, { compareSession: true });
+    if (opts.compareSession) return { result: await this.replaceLocked(lock, s, { compareSession: true }), net };
     const a = await this.assess(record, net, await this.docker.listProjectProxies(s.sandbox), s.key);
-    if (a.kind === "replace") return this.replaceLocked(lock, s, {});
+    if (a.kind === "replace") return { result: await this.replaceLocked(lock, s, {}), net };
     if (a.kind === "start") {
       await this.docker.startProjectProxy(a.proxy.id);
-      return undefined;
+      return { result: undefined, net };
     }
     if (opts.resolverTrouble && !a.newer) {
       this.docker.invalidateResolvers();
-      return this.replaceLocked(lock, s, { force: true });
+      return { result: await this.replaceLocked(lock, s, { force: true }), net };
     }
-    return undefined;
+    return { result: undefined, net };
   }
 
   // --- the startup step (leg 10) ---------------------------------------------------------------------------------
@@ -1002,7 +1154,7 @@ export class Containment {
           }
           return { action, settles };
         case "repair": {
-          const r = await this.repairLocked(lock, subject, facts, { compareSession: true });
+          const r = (await this.repairLocked(lock, subject, facts, { compareSession: true })).result;
           if (r?.kind === "kept-newer") {
             this.startupWarning(record!, "kept-newer-proxy", "A proxy built by a newer program version was kept as it is; it is used under its own allowlist.");
           }

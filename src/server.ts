@@ -525,7 +525,7 @@ export class App {
     this.log = opts.log ?? (() => {});
     this.instructions = buildInstructions(this.cfg);
     this.registry = new Registry(this.cfg.dataDir, this.log);
-    this.docker = opts.docker ?? new Docker(this.cfg, loadInstallationId(this.cfg.dataDir));
+    this.docker = opts.docker ?? new Docker(this.cfg, loadInstallationId(this.cfg.dataDir), this.log);
     this.proxy = opts.proxy ?? new McpProxy(this.cfg, this.docker);
     // Every sandbox start and exec of the Docker layer passes through this (leg 7). Under MCPE_NETWORK=open the hook only
     // reads the facts it is given. Built before the installer, which contains each new sandbox through it (leg 8).

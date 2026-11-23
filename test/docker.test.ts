@@ -18,6 +18,7 @@ import {
   DockerUnavailableError,
   envFlags,
   isStoppedExecFailure,
+  LOCAL_ACCESS_SCRIPT,
   makeRef,
   MANIFESTS,
   ONE_SHOT_ROLES,
@@ -26,6 +27,7 @@ import {
   parseProxyReport,
   parseResolvConf,
   projectNetworkName,
+  proxyAddress,
   ProxyStartError,
   PROBE_SCRIPT,
   RuntimeMismatchError,
@@ -67,6 +69,8 @@ interface FakeContainer {
   runtime?: string | null;
   /** State.ExitCode for the readiness inspect. */
   exitCode?: number;
+  /** The address each network was connected with (`network connect --ip`), by network name. */
+  ips?: Record<string, string>;
 }
 
 interface FakeNet {
@@ -77,6 +81,8 @@ interface FakeNet {
   ipv6: boolean;
   ipam: Array<Record<string, string>> | null;
   created: string;
+  /** The `--ip-range` it was made with. */
+  ipRange?: string;
 }
 /** What the proxy's `/status` says when it is ready, with no refusals. */
 const READY = { version: "1", ready: true, listening: { address: "172.30.0.2", ports: [3128] }, startedAt: "t", configHash: "h", refusals: [], resolverFailures: 0, total: 0 };
@@ -117,6 +123,8 @@ class ScriptedDocker extends Docker {
   resolvConf = "nameserver 192.0.2.53\n";
   /** The subnet of the next network `network create` makes; a counter makes them differ. */
   private subnetN = 0;
+  /** How many pinned `network create`s still fail with "Pool overlaps" (another network took the probed subnet). */
+  overlaps = 0;
 
   /** A network the double has made, by the name the call used (the id is derived from it). */
   net(namePart: string): FakeNet {
@@ -171,11 +179,10 @@ class ScriptedDocker extends Docker {
         if (!found) return { code: 1, stderr: `Error response from daemon: No such container: ${target}\n` };
         const [, c] = found;
         const format = args[args.indexOf("--format") + 1]!;
-        // The networks of a container with their ids and aliases (a project proxy is on its network under `mcpe-proxy`).
+        // The networks of a container with their ids and the address each was connected with (`IPAMConfig`, as Docker has it).
         if (format === "{{json .NetworkSettings.Networks}}") {
-          const isProxy = c.labels?.["mcp-everything.role"] === "project-proxy";
           return {
-            stdout: `${JSON.stringify(Object.fromEntries(c.networks.map((n) => [n, { NetworkID: this.networks.get(n)?.id ?? "", Aliases: isProxy ? ["mcpe-proxy"] : [] }])))}\n`,
+            stdout: `${JSON.stringify(Object.fromEntries(c.networks.map((n) => [n, { NetworkID: this.networks.get(n)?.id ?? "", IPAMConfig: c.ips?.[n] ? { IPv4Address: c.ips[n] } : null }])))}\n`,
           };
         }
         if (format.includes('"exitCode"')) return { stdout: `${JSON.stringify({ running: c.running, exitCode: c.exitCode ?? 0 })}\n` };
@@ -233,11 +240,19 @@ class ScriptedDocker extends Docker {
               labels[k!] = v.join("=");
             }
           });
+          // A pinned subnet (`--subnet`) is the one asked for; without it the daemon's pools choose (the probe's case).
+          // `overlaps` makes the next pinned creates fail the way Docker does when another network took the subnet.
+          const pinned = args.includes("--subnet") ? args[args.indexOf("--subnet") + 1]! : undefined;
+          if (pinned !== undefined && this.overlaps > 0) {
+            this.overlaps--;
+            return { code: 1, stderr: "Error response from daemon: invalid pool request: Pool overlaps with other one on this address space\n" };
+          }
           const id = idFor(`net:${last}`);
           this.subnetN++;
           this.networks.set(last, {
             id, name: last, labels, internal: args.includes("--internal"), ipv6: false,
-            ipam: [{ Subnet: `172.30.${this.subnetN}.0/24` }], created: new Date().toISOString().replace("Z", "123456Z"),
+            ipam: [{ Subnet: pinned ?? `172.30.${this.subnetN}.0/24` }], created: new Date().toISOString().replace("Z", "123456Z"),
+            ...(args.includes("--ip-range") ? { ipRange: args[args.indexOf("--ip-range") + 1]! } : {}),
           });
           return { stdout: `${id}\n` };
         }
@@ -257,17 +272,24 @@ class ScriptedDocker extends Docker {
           return {};
         }
         if (args[1] === "ls") return { stdout: [...this.networks.values()].map((n) => `${n.id}\n`).join("") };
-        // connect [--alias a]... <net> <container>; disconnect [-f] <net> <container>. Membership is per network, by name.
+        // connect [--ip a] <net> <container>; disconnect [-f] <net> <container>. Membership is per network, by name.
         const found = this.find(last);
         const netArg = args[args.length - 2]!;
         const netName = [...this.networks.values()].find((x) => x.id === netArg)?.name ?? netArg;
         if (!found) return { code: 1, stderr: `Error response from daemon: No such container: ${last}\n` };
         if (args[1] === "connect") {
+          const ip = args.includes("--ip") ? args[args.indexOf("--ip") + 1]! : undefined;
+          // Two containers cannot hold one address on a network.
+          if (ip !== undefined && [...this.containers.values()].some((c) => c !== found[1] && c.networks.includes(netName) && c.ips?.[netName] === ip)) {
+            return { code: 1, stderr: `Error response from daemon: Address already in use\n` };
+          }
           if (!found[1].networks.includes(netName)) found[1].networks = [...found[1].networks, netName];
+          if (ip !== undefined) found[1].ips = { ...found[1].ips, [netName]: ip };
           return {};
         }
         if (!found[1].networks.includes(netName)) return { code: 1, stderr: `Error response from daemon: container ${found[1].id} is not connected to network ${netName}\n` };
         found[1].networks = found[1].networks.filter((n) => n !== netName);
+        if (found[1].ips) delete found[1].ips[netName];
         return {};
       }
       case "volume": {
@@ -1370,6 +1392,13 @@ describe("the guard cannot be skipped unnoticed", () => {
     // themselves, by owner, role and the sandbox's name (a read-only inspect for the first two).
     "setContainment", "invalidate", "clock", "hooked", "hookCached", "setNetworkNow", "destroyNow",
     "findProjectNetwork", "projectProxyAttached", "removeProjectProxyNamed",
+    // Leg 13 (proxy by address). `probeSubnet` and `networkCreateFailure` are helpers of the network create: the probe acts only
+    // on the throwaway network it just made (by the random name or the id it was given). `detachProjectProxy` and
+    // `restoreProjectProxy` classify the project's proxy themselves (this installation's, role project-proxy) before they act.
+    // `writeLocalAccess` is given a container's id by containment and classifies it again (mine or from before) before its one
+    // root exec; `clearLocalAccess` is its best-effort call from `setNetworkNow`, on the container that guarded method resolved.
+    // `afterStarted` only calls the post-start step it was handed, with facts it was given.
+    "probeSubnet", "networkCreateFailure", "detachProjectProxy", "restoreProjectProxy", "writeLocalAccess", "clearLocalAccess", "afterStarted",
   ];
   /**
    * Methods that report instead of refusing: they never throw and issue only read-only commands, which the
@@ -2561,17 +2590,26 @@ describe("the network wording of 'not there'", () => {
 });
 
 describe("createContainedNetwork", () => {
-  it("creates with the isolated, internal, no-IPv6 flags and the owner and role labels, then inspects by id", async () => {
+  // Leg 13: every network is made by probe, then pin. A throwaway network (no --subnet) says which subnet the daemon's pools
+  // would give; it is removed; the real one is made with that subnet and an --ip-range in its lower half.
+  it("probes a subnet with a throwaway network, removes it, then makes the real one with --subnet and --ip-range (the lower half)", async () => {
     const d = mk();
     const n = await d.createContainedNetwork({ role: "oneshot-net" });
-    const create = d.argvs.find((a) => a[0] === "network" && a[1] === "create")!;
-    const name = create.at(-1)!;
+    const creates = d.argvs.filter((a) => a[0] === "network" && a[1] === "create");
+    expect(creates).toHaveLength(2);
+    const [probe, real] = creates as [string[], string[]];
+    const flags = ["network", "create", "--internal", "-o", "com.docker.network.bridge.gateway_mode_ipv4=isolated", "--ipv6=false"];
+    expect(probe.slice(0, -1)).toEqual([...flags, "--label", `${OWNER_L}=${ID}`, "--label", `${ROLE_L}=oneshot-net`]);
+    expect(probe).not.toContain("--subnet");
+    expect(probe.at(-1)).toMatch(new RegExp(`^mcpe-${ID}-oneshot-net-[0-9a-f]{8}$`));
+    const name = real.at(-1)!;
     expect(name).toMatch(new RegExp(`^mcpe-${ID}-oneshot-net-[0-9a-f]{8}$`));
-    expect(create.slice(0, -1)).toEqual([
-      "network", "create", "--internal", "-o", "com.docker.network.bridge.gateway_mode_ipv4=isolated", "--ipv6=false",
-      "--label", `${OWNER_L}=${ID}`, "--label", `${ROLE_L}=oneshot-net`,
-    ]);
-    const inspect = d.argvs.find((a) => a[0] === "network" && a[1] === "inspect")!;
+    expect(name).not.toBe(probe.at(-1));
+    expect(real.slice(0, -1)).toEqual([...flags, "--subnet", "172.30.1.0/24", "--ip-range", "172.30.1.0/25", "--label", `${OWNER_L}=${ID}`, "--label", `${ROLE_L}=oneshot-net`]);
+    // Order: probe create, probe inspect, probe remove (by id), real create, real inspect (by id).
+    expect(d.verbs.filter((v) => v.startsWith("network"))).toEqual(["network create", "network inspect", "network rm", "network create", "network inspect"]);
+    expect(d.argvs.find((a) => a[0] === "network" && a[1] === "rm")).toEqual(["network", "rm", idFor(`net:${probe.at(-1)}`)]);
+    const inspect = d.argvs.filter((a) => a[0] === "network" && a[1] === "inspect").at(-1)!;
     expect(inspect.slice(0, 3)).toEqual(["network", "inspect", "--format"]);
     for (const f of ["json .Id", "json .Internal", "json .EnableIPv6", "json .IPAM.Config", "json .Labels", "json .Created"]) expect(inspect[3]).toContain(f);
     expect(inspect[4]).toBe(n.id);
@@ -2579,13 +2617,77 @@ describe("createContainedNetwork", () => {
     expect(d.networks.size).toBe(1);
   });
 
-  it("uses a name it is given and adds the project label when it has one (leg 6)", async () => {
+  it("uses a name it is given and adds the project label when it has one (leg 6); the probe is still a random one-shot network", async () => {
     const d = mk();
     const n = await d.createContainedNetwork({ role: "project-net", name: "mcpe-0123abcd-gron-net", project: "gron" });
-    const create = d.argvs.find((a) => a[0] === "network" && a[1] === "create")!;
+    const creates = d.argvs.filter((a) => a[0] === "network" && a[1] === "create");
+    const real = creates.at(-1)!;
     expect(n.name).toBe("mcpe-0123abcd-gron-net");
-    expect(create.at(-1)).toBe("mcpe-0123abcd-gron-net");
-    expect(sub(create, "--label")).toEqual([`${OWNER_L}=${ID}`, `${ROLE_L}=project-net`, `${PROJECT_L}=gron`]);
+    expect(real.at(-1)).toBe("mcpe-0123abcd-gron-net");
+    expect(sub(real, "--label")).toEqual([`${OWNER_L}=${ID}`, `${ROLE_L}=project-net`, `${PROJECT_L}=gron`]);
+    // The probe never carries the project's name or labels: nothing of the project is left behind if it leaks.
+    expect(creates[0]!.at(-1)).toMatch(new RegExp(`^mcpe-${ID}-oneshot-net-[0-9a-f]{8}$`));
+    expect(sub(creates[0]!, "--label")).toEqual([`${OWNER_L}=${ID}`, `${ROLE_L}=oneshot-net`]);
+  });
+
+  it("pins whatever subnet the probe found, and the ip-range is the lower half of it (/16, /24 and /20)", async () => {
+    for (const [found, range] of [["172.22.0.0/16", "172.22.0.0/17"], ["10.9.8.0/24", "10.9.8.0/25"], ["192.168.16.0/20", "192.168.16.0/21"]] as const) {
+      const d = mk();
+      d.script.push((a) => {
+        if (a[0] !== "network" || a[1] !== "create" || a.includes("--subnet")) return undefined;
+        d.networks.set(a.at(-1)!, { id: idFor(`net:${a.at(-1)}`), name: a.at(-1)!, labels: { [OWNER_L]: ID, [ROLE_L]: "oneshot-net" }, internal: true, ipv6: false, ipam: [{ Subnet: found }], created: "2026-01-01T00:00:00.123456Z" });
+        return { stdout: `${idFor(`net:${a.at(-1)}`)}\n` };
+      });
+      const n = await d.createContainedNetwork({ role: "oneshot-net" });
+      const real = d.argvs.filter((a) => a[1] === "create").at(-1)!;
+      expect(real[real.indexOf("--subnet") + 1]).toBe(found);
+      expect(real[real.indexOf("--ip-range") + 1]).toBe(range);
+      expect(n.subnet).toBe(found);
+    }
+  });
+
+  it("on 'Pool overlaps' probes again and retries, up to three times", async () => {
+    const d = mk();
+    d.overlaps = 3;
+    const n = await d.createContainedNetwork({ role: "oneshot-net" });
+    expect(d.count("network create")).toBe(8); // four probes and four real creates
+    expect(d.networks.size).toBe(1);
+    expect(n.subnet).toBe("172.30.4.0/24"); // the fourth probe's subnet (a counter makes each differ)
+    const e = mk();
+    e.overlaps = 4;
+    const err = await settle(e.createContainedNetwork({ role: "oneshot-net" }));
+    expect(err).toBeInstanceOf(ContainmentUnavailableError);
+    expect(lastLine(err)).toContain("Pool overlaps");
+    expect(e.count("network create")).toBe(8);
+    expect(e.networks.size).toBe(0); // every probe was removed
+  });
+
+  it("removes the probe even when its inspect fails, and a probe that is too small to hold the proxy is refused", async () => {
+    const small = mk();
+    small.script.push((a) => (a[0] === "network" && a[1] === "inspect" ? { stdout: JSON.stringify({ id: idFor(`net:${small.argvs.find((x) => x[1] === "create")!.at(-1)}`), internal: true, ipv6: false, ipam: [{ Subnet: "172.30.9.0/31" }], labels: { [OWNER_L]: ID, [ROLE_L]: "oneshot-net" } }) } : undefined));
+    const e = await settle(small.createContainedNetwork({ role: "oneshot-net" }));
+    expect(e).toBeInstanceOf(ContainmentUnavailableError);
+    expect(lastLine(e)).toContain("too small");
+    expect(small.count("network create")).toBe(1); // the real network was never made
+    expect(small.count("network rm")).toBe(1);
+  });
+
+  it("a real network that fails its check after a good probe is removed by its id", async () => {
+    const d = mk();
+    let inspects = 0;
+    d.script.push((a) => {
+      if (a[0] !== "network" || a[1] !== "inspect") return undefined;
+      inspects++;
+      if (inspects === 1) return undefined; // the probe is fine
+      const name = d.argvs.filter((x) => x[1] === "create").at(-1)!.at(-1)!;
+      return { stdout: JSON.stringify({ id: idFor(`net:${name}`), internal: false, ipv6: false, ipam: [{ Subnet: "172.30.1.0/24" }], labels: { [OWNER_L]: ID, [ROLE_L]: "oneshot-net" } }) };
+    });
+    const e = await settle(d.createContainedNetwork({ role: "oneshot-net" }));
+    expect(e).toBeInstanceOf(ContainmentUnavailableError);
+    expect(lastLine(e)).toContain("not internal");
+    const real = d.argvs.filter((a) => a[1] === "create").at(-1)!.at(-1)!;
+    expect(d.argvs.filter((a) => a[0] === "network" && a[1] === "rm").at(-1)).toEqual(["network", "rm", idFor(`net:${real}`)]);
+    expect(d.networks.size).toBe(0);
   });
 
   it("times out: removes by the random name, tolerantly, and throws", async () => {
@@ -2774,7 +2876,8 @@ class EgressDocker extends OneShotDocker {
 const mkEgress = (env: Record<string, string> = {}) => new EgressDocker(loadConfig(env), TEST_INSTALLATION_ID);
 /** The contained network a finished call made (it is gone from the double by then): its name, id and subnet, from the commands that were issued. */
 const netOf = (d: EgressDocker) => {
-  const create = d.argvs.find((a) => a[0] === "network" && a[1] === "create")!;
+  // The last create is the real network (leg 13: a throwaway probe is made and removed before it).
+  const create = d.argvs.filter((a) => a[0] === "network" && a[1] === "create").at(-1)!;
   const name = create.at(-1)!;
   const proxyCreate = d.argvs.find(isProxyCreate);
   const cidr = proxyCreate ? (JSON.parse(proxyCreate.at(-1)!) as { listenCidr: string }).listenCidr : "";
@@ -2816,7 +2919,8 @@ describe("a one-shot behind its proxy", () => {
     expect(d.verbs).toEqual([
       "image inspect", "image inspect", // the proxy image and the one-shot's
       "image inspect", "create", "start", "rm", // the probe image, the resolver read
-      "network create", "network inspect",
+      "network create", "network inspect", "network rm", // the probe: a throwaway network says which subnet the pools would give
+      "network create", "network inspect", // the real network, pinned to it
       "create", "network connect", "start", "inspect", "exec", // the proxy: created, joined before it starts, started, ready
       "create", "start", "rm", // the one-shot
       "rm", "network rm", // teardown: proxy, network
@@ -2865,14 +2969,14 @@ describe("a one-shot behind its proxy", () => {
     expect(conf.allow.map((e) => e.local)).toEqual([true]);
   });
 
-  it("joins the contained network under the alias before it starts, and starts it by id", async () => {
+  it("joins the contained network at the proxy address (no alias) before it starts, and starts it by id", async () => {
     const d = mkEgress();
     await d.once(EGRESS);
     const proxyId = d.created.find((c) => c.labels[ROLE_L] === "oneshot-proxy")!.id;
     const net = netOf(d);
     const connect = d.argvs.findIndex((a) => a[0] === "network" && a[1] === "connect");
     const start = d.argvs.findIndex((a) => a[0] === "start" && a[1] === proxyId);
-    expect(d.argvs[connect]).toEqual(["network", "connect", "--alias", "mcpe-proxy", net.id, proxyId]);
+    expect(d.argvs[connect]).toEqual(["network", "connect", "--ip", "172.30.1.254", net.id, proxyId]);
     expect(d.argvs[start]).toEqual(["start", proxyId]);
     expect(connect).toBeLessThan(start);
   });
@@ -2884,7 +2988,7 @@ describe("a one-shot behind its proxy", () => {
     const net = netOf(d);
     expect(sub(c, "--network")).toEqual([net.name]);
     expect(sub(c, "-e")).toEqual([
-      "HTTP_PROXY=http://mcpe-proxy:3128", "HTTPS_PROXY=http://mcpe-proxy:3128", "http_proxy=http://mcpe-proxy:3128", "https_proxy=http://mcpe-proxy:3128",
+      "HTTP_PROXY=http://172.30.1.254:3128", "HTTPS_PROXY=http://172.30.1.254:3128", "http_proxy=http://172.30.1.254:3128", "https_proxy=http://172.30.1.254:3128",
       "NO_PROXY=", "NODE_USE_ENV_PROXY=1",
     ]);
     expect(c.slice(0, 3)).toEqual(["create", "--rm", "--name"]);
@@ -3107,7 +3211,7 @@ describe("a one-shot behind its proxy: teardown on every path", () => {
     expect(tail(d, 4)).toEqual(["rm", "exec", "rm", "network rm"]);
     const oneShot = d.created.find((c) => c.labels[ROLE_L] === "clone")!;
     const proxy = d.created.find((c) => c.labels[ROLE_L] === "oneshot-proxy")!;
-    const netName = d.argvs.find((a) => a[0] === "network" && a[1] === "create")!.at(-1)!;
+    const netName = d.argvs.filter((a) => a[0] === "network" && a[1] === "create").at(-1)!.at(-1)!; // the real network, not the probe
     expect(d.argvs.slice(-4)).toEqual([
       ["rm", "-f", "-v", oneShot.id],
       d.argvs.at(-3)!,
@@ -3185,7 +3289,7 @@ describe("a one-shot behind its proxy: teardown on every path", () => {
     await d.once(EGRESS);
     const proxy = d.created.find((c) => c.labels[ROLE_L] === "oneshot-proxy")!;
     const proxyRm = d.argvs.findIndex((a) => a[0] === "rm" && a.at(-1) === proxy.id);
-    const netRm = d.argvs.findIndex((a) => a[0] === "network" && a[1] === "rm");
+    const netRm = d.argvs.length - 1 - [...d.argvs].reverse().findIndex((a) => a[0] === "network" && a[1] === "rm"); // the last: the first is the probe's
     const oneRm = d.argvs.findIndex((a) => a[0] === "rm" && a.at(-1) === d.created.find((c) => c.labels[ROLE_L] === "clone")!.id);
     expect(oneRm).toBeGreaterThan(-1);
     expect(oneRm).toBeLessThan(proxyRm);
@@ -3485,14 +3589,18 @@ describe("projectNetworkName", () => {
 });
 
 describe("ensureProjectNetwork", () => {
-  it("makes the network when it is not there: contained, owner, role, project and sandbox labels, a fixed name", async () => {
+  /** The `network rm` commands after the probe's own (every create by probe-then-pin removes its throwaway network first). */
+  const rmsAfterProbe = (d: EgressDocker) => d.argvs.filter((a) => a[0] === "network" && a[1] === "rm").slice(1);
+  it("makes the network when it is not there: contained, owner, role, project and sandbox labels, a fixed name, pinned to a probed subnet", async () => {
     const d = mkEgress();
     const net = await d.ensureProjectNetwork(PS, PROJ);
     expect(net).toEqual({ id: idFor(`net:${PNET}`), name: PNET, subnet: "172.30.1.0/24", created: true });
-    expect(d.verbs).toEqual(["network inspect", "network create", "network inspect"]);
-    const create = d.argvs[1]!;
+    expect(d.verbs).toEqual(["network inspect", "network create", "network inspect", "network rm", "network create", "network inspect"]);
+    const create = d.argvs[4]!;
     expect(create.at(-1)).toBe(PNET);
     expect(create).toContain("--internal");
+    expect(sub(create, "--subnet")).toEqual(["172.30.1.0/24"]);
+    expect(sub(create, "--ip-range")).toEqual(["172.30.1.0/25"]);
     expect(sub(create, "--label")).toEqual([`${OWNER_L}=${ID}`, `${ROLE_L}=project-net`, `${PROJECT_L}=${PROJ}`, `${SANDBOX_L}=${PS}`]);
   });
 
@@ -3543,11 +3651,11 @@ describe("ensureProjectNetwork", () => {
         first = false;
         return { code: 1, stderr: `Error response from daemon: network ${PNET} not found` };
       }
-      if (a[0] === "network" && a[1] === "create") return { code: 1, stderr: `Error response from daemon: network with name ${PNET} already exists` };
+      if (a[0] === "network" && a[1] === "create" && a.at(-1) === PNET) return { code: 1, stderr: `Error response from daemon: network with name ${PNET} already exists` };
       return undefined;
     });
     expect(await d.ensureProjectNetwork(PS, PROJ)).toMatchObject({ name: PNET, created: false });
-    expect(d.count("network rm")).toBe(0);
+    expect(rmsAfterProbe(d)).toEqual([]);
   });
 
   it("refuses the network of a creator it lost the race to when it is someone else's, and removes nothing", async () => {
@@ -3559,11 +3667,11 @@ describe("ensureProjectNetwork", () => {
         first = false;
         return { code: 1, stderr: `Error response from daemon: network ${PNET} not found` };
       }
-      if (a[0] === "network" && a[1] === "create") return { code: 1, stderr: "already exists" };
+      if (a[0] === "network" && a[1] === "create" && a.at(-1) === PNET) return { code: 1, stderr: "already exists" };
       return undefined;
     });
     expect(await settle(d.ensureProjectNetwork(PS, PROJ))).toBeInstanceOf(SandboxRefusedError);
-    expect(d.count("network rm")).toBe(0);
+    expect(rmsAfterProbe(d)).toEqual([]);
   });
 
   it("a failed create that left nothing behind throws the create's own error (pools used up)", async () => {
@@ -3582,16 +3690,16 @@ describe("ensureProjectNetwork", () => {
         first = false;
         return { code: 1, stderr: `network ${PNET} not found` };
       }
-      if (a[0] === "network" && a[1] === "create") return { code: null as unknown as number, timedOut: true };
+      if (a[0] === "network" && a[1] === "create" && a.at(-1) === PNET) return { code: null as unknown as number, timedOut: true };
       return undefined;
     });
     expect(await adopt.ensureProjectNetwork(PS, PROJ)).toMatchObject({ created: false });
-    expect(adopt.count("network rm")).toBe(0);
+    expect(rmsAfterProbe(adopt)).toEqual([]);
 
     const nothing = mkEgress();
-    nothing.script.push((a) => (a[0] === "network" && a[1] === "create" ? { code: null as unknown as number, timedOut: true } : undefined));
+    nothing.script.push((a) => (a[0] === "network" && a[1] === "create" && a.at(-1) === PNET ? { code: null as unknown as number, timedOut: true } : undefined));
     await expect(nothing.ensureProjectNetwork(PS, PROJ)).rejects.toThrow(/timed out/);
-    expect(nothing.count("network rm")).toBe(0);
+    expect(rmsAfterProbe(nothing)).toEqual([]);
   });
 
   it("a network it made that fails the check is removed by its id, never by the fixed name", async () => {
@@ -3599,14 +3707,14 @@ describe("ensureProjectNetwork", () => {
     const id = idFor(`net:${PNET}`);
     d.script.push((a) => (a[0] === "network" && a[1] === "inspect" && a.at(-1) === id ? { stdout: netJson(id, { internal: false, labels: netLabels() }) } : undefined));
     await expect(d.ensureProjectNetwork(PS, PROJ)).rejects.toBeInstanceOf(ContainmentUnavailableError);
-    expect(d.argvs.filter((a) => a[0] === "network" && a[1] === "rm")).toEqual([["network", "rm", id]]);
+    expect(rmsAfterProbe(d)).toEqual([["network", "rm", id]]);
   });
 
   it("a created network whose answer is about another network, or has no usable id, is removed by id (or not at all, for a fixed name without an id)", async () => {
     const noId = mkEgress();
-    noId.script.push((a) => (a[0] === "network" && a[1] === "create" ? { stdout: "nope\n" } : undefined));
+    noId.script.push((a) => (a[0] === "network" && a[1] === "create" && a.at(-1) === PNET ? { stdout: "nope\n" } : undefined));
     await expect(noId.ensureProjectNetwork(PS, PROJ)).rejects.toThrow(/no usable id/);
-    expect(noId.count("network rm")).toBe(0);
+    expect(rmsAfterProbe(noId)).toEqual([]);
   });
 });
 
@@ -3640,7 +3748,7 @@ describe("createProjectProxy", () => {
     return { d, net };
   };
 
-  it("makes a hardened proxy: the name, the labels, the host gateway, the aliases before start, readiness, no --rm and no restart policy", async () => {
+  it("makes a hardened proxy: the name, the labels, the host gateway, its address before start, readiness, no --rm and no restart policy", async () => {
     const { d, net } = await make();
     const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
     expect(p.name).toMatch(new RegExp(`^${PS}-proxy-[0-9a-f]{8}$`));
@@ -3662,19 +3770,35 @@ describe("createProjectProxy", () => {
     expect(create).not.toContain("-p");
     expect(create.slice(-3)).toEqual(proxyLaunchArgs(PCONFIG));
     const connect = d.argvs.find((a) => a[0] === "network" && a[1] === "connect")!;
-    expect(connect).toEqual(["network", "connect", "--alias", "mcpe-proxy", "--alias", "db.lan", "--alias", "host.docker.internal", net.id, p.id]);
+    // At the last usable host address of 172.30.50.0/24, and no alias: forward names reach the proxy through the sandbox's /etc/hosts.
+    expect(connect).toEqual(["network", "connect", "--ip", "172.30.50.254", net.id, p.id]);
+    expect(d.containers.get(p.name)!.ips).toEqual({ [PNET]: "172.30.50.254" });
     expect(d.verbs.indexOf("network connect")).toBeLessThan(d.verbs.indexOf("start"));
     expect(d.containers.get(p.name)!.running).toBe(true);
     expect(d.containers.get(p.name)!.networks).toEqual(["bridge", PNET]);
     expect(d.count("rm")).toBe(0);
   });
 
-  it("refuses a forward target named mcpe-proxy, and creates nothing", async () => {
+  // Leg 13 removed "refuses a forward target named mcpe-proxy" (and the alias grammar check): there are no aliases, so no name collides.
+  it("makes a proxy whatever the forward target is called: the names are not network aliases any more", async () => {
     const { d } = await make();
     const cfg = proxyConfig({ allow: ALLOW, listenCidr: "172.30.50.0/24", resolvers: ["192.0.2.53"], forwards: [{ host: "mcpe-proxy", port: 80 }] });
-    await expect(d.createProjectProxy(PS, PROJ, cfg, {})).rejects.toThrow(/mcpe-proxy/);
-    expect(d.count("create")).toBe(0);
-    expect(d.count("network connect")).toBe(0);
+    await d.createProjectProxy(PS, PROJ, cfg, {});
+    const connect = d.argvs.find((a) => a[0] === "network" && a[1] === "connect")!;
+    expect(connect).not.toContain("--alias");
+    expect(connect.slice(0, 4)).toEqual(["network", "connect", "--ip", "172.30.50.254"]);
+  });
+
+  it("an address that is taken fails the join with the address named, removes the proxy, and never falls back to a name", async () => {
+    const { d } = await make();
+    putProxy(d, proxyName(2), proxyLabels(), { networks: ["bridge", PNET] });
+    d.containers.get(proxyName(2))!.ips = { [PNET]: "172.30.50.254" };
+    const e = await settle(d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS));
+    expect(e).toBeInstanceOf(ProxyStartError);
+    expect((e as Error).message).toContain("172.30.50.254");
+    expect(d.count("start")).toBe(0);
+    for (const a of d.argvs) expect(a).not.toContain("--alias");
+    expect([...d.containers.keys()]).toEqual([proxyName(2)]); // the new one is gone
   });
 
   it.each([["mcp-everything.owner"], ["mcp-everything.role"], ["mcp-everything.project"], ["mcp-everything.sandbox"], ["mcp-everything"], ["com.example.x"], ["mcp-everything.A"]])(
@@ -4250,8 +4374,8 @@ describe("the environment of an exec", () => {
   it("adds -e NAME=value before the container id, the caller's then the reference's", async () => {
     const d = mk();
     const id = d.put(N, "mine");
-    await d.exec(makeRef(id, N, { HTTP_PROXY: "http://mcpe-proxy:3128" }), ["true"], { ...OPTS, cwd: "/w", env: { A: "1" } });
-    expect(d.execs[0]).toEqual(["exec", "-i", "-w", "/w", "-e", "A=1", "-e", "HTTP_PROXY=http://mcpe-proxy:3128", id, "timeout", "-k", "5", "10", "true"]);
+    await d.exec(makeRef(id, N, { HTTP_PROXY: "http://172.30.1.254:3128" }), ["true"], { ...OPTS, cwd: "/w", env: { A: "1" } });
+    expect(d.execs[0]).toEqual(["exec", "-i", "-w", "/w", "-e", "A=1", "-e", "HTTP_PROXY=http://172.30.1.254:3128", id, "timeout", "-k", "5", "10", "true"]);
     await d.exec(makeRef(id, N), ["true"], OPTS);
     expect(d.execs[1]).toEqual(["exec", "-i", id, "timeout", "-k", "5", "10", "true"]);
   });
@@ -4259,9 +4383,9 @@ describe("the environment of an exec", () => {
   it("the reference's environment wins over the caller's, and a caller cannot remove it", async () => {
     const d = mk();
     const id = d.put(N, "mine");
-    await d.exec(makeRef(id, N, { HTTP_PROXY: "http://mcpe-proxy:3128" }), ["true"], { ...OPTS, env: { HTTP_PROXY: "http://evil:1", NO_PROXY: "*" } });
+    await d.exec(makeRef(id, N, { HTTP_PROXY: "http://172.30.1.254:3128" }), ["true"], { ...OPTS, env: { HTTP_PROXY: "http://evil:1", NO_PROXY: "*" } });
     const e = d.execs[0]!.flatMap((x, i, a) => (a[i - 1] === "-e" ? [x] : []));
-    expect(e).toEqual(["HTTP_PROXY=http://mcpe-proxy:3128", "NO_PROXY=*"]);
+    expect(e).toEqual(["HTTP_PROXY=http://172.30.1.254:3128", "NO_PROXY=*"]);
   });
 
   it("an exec by name carries only the caller's variables", async () => {
@@ -4317,7 +4441,7 @@ class TimedDocker extends ScriptedDocker {
 }
 
 describe("the containment hook (leg 7)", () => {
-  const PROXY_ENV = { HTTP_PROXY: "http://mcpe-proxy:3128", NODE_USE_ENV_PROXY: "1" };
+  const PROXY_ENV = { HTTP_PROXY: "http://172.30.1.254:3128", NODE_USE_ENV_PROXY: "1" };
   const timed = (env: Record<string, string> = {}) => new TimedDocker(loadConfig(env), TEST_INSTALLATION_ID);
 
   /** A hook that records what it is given and answers what the test says (or throws). */
@@ -4455,7 +4579,7 @@ describe("the containment hook (leg 7)", () => {
       await d.exec(N, ["true"], OPTS);
       expect(s.calls.map((c) => c.mode)).toEqual(["full"]);
       expect(d.verbs).toEqual(["inspect", "exec"]);
-      expect(execEnv(d.execs[0]!)).toEqual(expect.arrayContaining(["HTTP_PROXY=http://mcpe-proxy:3128", "NODE_USE_ENV_PROXY=1"]));
+      expect(execEnv(d.execs[0]!)).toEqual(expect.arrayContaining(["HTTP_PROXY=http://172.30.1.254:3128", "NODE_USE_ENV_PROXY=1"]));
     });
 
     it("with restart: false asks in observe mode, by name and by reference, and compares no runtime", async () => {
@@ -4752,7 +4876,8 @@ describe("the containment hook (leg 7)", () => {
       await d.exec(makeRef(id, N), ["true"], OPTS);
       expect(entries()).toBe(1);
       expect(d.created.filter((c) => c.labels["mcp-everything.role"] === "project-proxy")).toHaveLength(1);
-      expect(execEnv(d.execs.at(-1)!)).toEqual(expect.arrayContaining(Object.entries(proxyEnvironment()).map(([k, v]) => `${k}=${v}`)));
+      expect(execEnv(d.execs.at(-1)!)).toEqual(expect.arrayContaining(Object.entries(proxyEnvironment(proxyAddress(net.subnet))).map(([k, v]) => `${k}=${v}`)));
+      expect(execEnv(d.execs.at(-1)!)).toContain(`HTTP_PROXY=http://${proxyAddress(net.subnet)}:3128`);
     });
 
     it("acquire of a contained sandbox with no proxy repairs it with one hook entry and returns the environment on the reference", async () => {
@@ -4762,7 +4887,7 @@ describe("the containment hook (leg 7)", () => {
       d.containers.get(N)!.labels = { ...LABELS.mine, "mcp-everything.project": PROJECT };
       const ref = await d.acquire(N);
       expect(entries()).toBe(1);
-      expect(ref!.env).toEqual(proxyEnvironment());
+      expect(ref!.env).toEqual(proxyEnvironment(proxyAddress(net.subnet)));
       expect(d.containers.get(N)!.running).toBe(true);
     });
 
@@ -4874,27 +4999,58 @@ describe("what containment asks of the Docker layer (leg 7)", () => {
   });
 
   describe("projectProxyAttached", () => {
-    it("is true for a proxy on the network under mcpe-proxy, false for one that is not, and reads only", async () => {
+    const withSubnet = (n: FakeNet) => ({ id: n.id, name: n.name, subnet: "172.30.50.0/24" });
+
+    it("is true for a proxy on the network at the proxy address, false for one that is not, and reads only", async () => {
       const d = mkEgress();
-      const net = putNet(d);
+      const net = withSubnet(putNet(d));
       const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
       d.argvs.length = 0;
       expect(await d.projectProxyAttached(p.id, net)).toBe(true);
       expect(d.verbs).toEqual(["inspect"]);
       d.containers.get(p.name)!.networks = ["bridge"];
       expect(await d.projectProxyAttached(p.id, net)).toBe(false);
-      expect(await d.projectProxyAttached(p.id, { id: "other", name: PNET })).toBe(false);
+      expect(await d.projectProxyAttached(p.id, { id: "other", name: PNET, subnet: net.subnet })).toBe(false);
       expect(await d.projectProxyAttached(idFor("gone"), net)).toBe(false);
       await expect(d.projectProxyAttached("not-an-id", net)).rejects.toThrow(/full id/);
     });
 
-    it("needs the alias, not just the network", async () => {
+    it("is true for a STOPPED proxy: the configured address is read (IPAMConfig), not the running one", async () => {
       const d = mkEgress();
-      const net = putNet(d);
+      const net = withSubnet(putNet(d));
       const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+      d.containers.get(p.name)!.running = false;
+      expect(await d.projectProxyAttached(p.id, net)).toBe(true);
+      // The answer would carry an IPAddress only while running; it never matters.
       d.script.push((a) =>
         a[0] === "inspect" && a[a.indexOf("--format") + 1] === "{{json .NetworkSettings.Networks}}"
-          ? { stdout: JSON.stringify({ [PNET]: { NetworkID: net.id, Aliases: ["db.lan"] } }) }
+          ? { stdout: JSON.stringify({ [PNET]: { NetworkID: net.id, IPAddress: "", IPAMConfig: { IPv4Address: "172.30.50.254" } } }) }
+          : undefined,
+      );
+      expect(await d.projectProxyAttached(p.id, net)).toBe(true);
+    });
+
+    it("needs the address, not just the network: another address, a running address without IPAMConfig and an alias do not count", async () => {
+      const d = mkEgress();
+      const net = withSubnet(putNet(d));
+      const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+      for (const entry of [
+        { NetworkID: net.id, IPAMConfig: { IPv4Address: "172.30.50.10" } },
+        { NetworkID: net.id, IPAddress: "172.30.50.254", IPAMConfig: null },
+        { NetworkID: net.id, IPAddress: "172.30.50.254" },
+        { NetworkID: net.id, Aliases: ["mcpe-proxy", "db.lan"], IPAMConfig: null },
+      ]) {
+        d.script.length = 0;
+        d.script.push((a) =>
+          a[0] === "inspect" && a[a.indexOf("--format") + 1] === "{{json .NetworkSettings.Networks}}" ? { stdout: JSON.stringify({ [PNET]: entry }) } : undefined,
+        );
+        expect(await d.projectProxyAttached(p.id, net), JSON.stringify(entry)).toBe(false);
+      }
+      // Right address, wrong network id.
+      d.script.length = 0;
+      d.script.push((a) =>
+        a[0] === "inspect" && a[a.indexOf("--format") + 1] === "{{json .NetworkSettings.Networks}}"
+          ? { stdout: JSON.stringify({ [PNET]: { NetworkID: "f".repeat(64), IPAMConfig: { IPv4Address: "172.30.50.254" } } }) }
           : undefined,
       );
       expect(await d.projectProxyAttached(p.id, net)).toBe(false);
@@ -4902,7 +5058,7 @@ describe("what containment asks of the Docker layer (leg 7)", () => {
 
     it("says it cannot tell when Docker cannot answer, rather than false", async () => {
       const d = mkEgress();
-      const net = putNet(d);
+      const net = withSubnet(putNet(d));
       const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
       d.script.push((a) => (a[0] === "inspect" ? { code: 1, stderr: "Cannot connect to the Docker daemon" } : undefined));
       await expect(d.projectProxyAttached(p.id, net)).rejects.toBeInstanceOf(DockerUnavailableError);
@@ -5192,5 +5348,469 @@ describe("projectRefusals (leg 8)", () => {
     d.script.push((a) => (a[0] === "exec" ? { stdout: JSON.stringify(READY) } : undefined));
     await d.projectRefusals(PS);
     expect(d.violations.filter((v) => v[0] !== "exec")).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Proxy by address (flight 02, leg 13)
+// ---------------------------------------------------------------------------
+
+describe("proxyAddress", () => {
+  it.each([
+    ["172.22.0.0/16", "172.22.255.254"],
+    ["10.1.2.0/24", "10.1.2.254"],
+    ["192.168.16.0/20", "192.168.31.254"],
+    ["10.0.0.0/30", "10.0.0.2"],
+    ["10.0.0.0/29", "10.0.0.6"],
+    ["10.0.0.0/8", "10.255.255.254"],
+    ["172.22.5.7/16", "172.22.255.254"], // a base that is not the network address is masked first
+  ])("%s gives the last usable host, %s", (subnet, address) => {
+    expect(proxyAddress(subnet)).toBe(address);
+  });
+
+  it("is never the broadcast address, and always inside the subnet", () => {
+    for (const p of [8, 12, 16, 20, 24, 28, 29, 30]) {
+      const subnet = `10.64.0.0/${p}`;
+      const a = proxyAddress(subnet).split(".").map(Number);
+      const n = ((a[0]! << 24) >>> 0) + (a[1]! << 16) + (a[2]! << 8) + a[3]!;
+      const size = 2 ** (32 - p);
+      const base = (((10 << 24) >>> 0) + (64 << 16)) >>> 0;
+      const start = base - (base % size);
+      expect(n).toBe(start + size - 2);
+    }
+  });
+
+  it.each([["10.0.0.0/31"], ["10.0.0.0/32"], ["10.0.0.0/0"], ["10.0.0.0/33"], ["10.0.0.0"], ["fd00::/64"], ["300.0.0.0/24"], ["a.b.c.d/24"], [""], ["10.0.0.0/24 "]])(
+    "refuses %j",
+    (subnet) => {
+      expect(() => proxyAddress(subnet)).toThrow();
+    },
+  );
+});
+
+describe("no embedded DNS anywhere (leg 13)", () => {
+  const read = (rel: string) => fs.readFileSync(path.join(__dirname, "..", rel), "utf8");
+
+  it("no `network connect` in docker.ts carries --alias, and the file has no alias at all", () => {
+    const src = read("src/sandbox/docker.ts");
+    expect(src).not.toMatch(/--alias/);
+    expect(src).not.toMatch(/PROXY_ALIAS/);
+    // Every connect of a PROXY is `--ip <address>`; the only other connect is the sandbox's own attach to its network (no address, no alias).
+    const connects = [...src.matchAll(/\[\s*"network",\s*"connect"[^\]]*\]/g)].map((m) => m[0]);
+    expect(connects.length).toBeGreaterThanOrEqual(4);
+    for (const c of connects) if (!c.includes("sandbox.id") && !c.includes('"bridge"')) expect(c).toMatch(/"--ip"/);
+    expect(connects.filter((c) => c.includes('"--ip"'))).toHaveLength(3); // the one-shot's proxy, a project proxy, a restored proxy
+  });
+
+  it("no source file names the proxy by host name", () => {
+    expect(read("src/sandbox/docker.ts")).not.toMatch(/mcpe-proxy/);
+    expect(read("src/network/containment.ts")).not.toMatch(/mcpe-proxy/);
+  });
+
+  it("the proxy environment holds an address and no host name, for every subnet shape", () => {
+    for (const subnet of ["172.22.0.0/16", "10.1.2.0/24", "192.168.16.0/20"]) {
+      const env = proxyEnvironment(proxyAddress(subnet));
+      for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) expect(env[k]).toMatch(/^http:\/\/\d{1,3}(\.\d{1,3}){3}:3128$/);
+    }
+  });
+
+  it("a one-shot's proxy variables, a project proxy's connect and a restored proxy's connect all carry --ip and no --alias", async () => {
+    const d = mkEgress();
+    await d.once(EGRESS);
+    const e = mkEgress();
+    putNet(e);
+    const p = await e.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+    await e.restoreProjectProxy(p.id, { id: idFor(`net:${PNET}`), name: PNET, subnet: "172.30.50.0/24" });
+    for (const x of [d, e]) {
+      for (const a of x.argvs) expect(a).not.toContain("--alias");
+      for (const a of x.argvs.filter((y) => y[0] === "network" && y[1] === "connect")) expect(a).toContain("--ip");
+    }
+  });
+});
+
+describe("taking a proxy off its network and putting it back (leg 13)", () => {
+  const NETREF = { id: idFor(`net:${PNET}`), name: PNET, subnet: "172.30.50.0/24" };
+  const setup = async () => {
+    const d = mkEgress();
+    putNet(d);
+    const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+    d.argvs.length = 0;
+    return { d, p };
+  };
+
+  it("detach disconnects the proxy from the network by id, with -f, after classifying it", async () => {
+    const { d, p } = await setup();
+    await d.detachProjectProxy(p.id, NETREF);
+    expect(d.argvs.filter((a) => a[0] === "network")).toEqual([["network", "disconnect", "-f", NETREF.id, p.id]]);
+    expect(d.containers.get(p.name)!.networks).toEqual(["bridge"]);
+    expect(d.containers.get(p.name)!.ips).toEqual({});
+    expect(await d.projectProxyAttached(p.id, NETREF)).toBe(false);
+    // a proxy that is already off the network, or gone, is success
+    await d.detachProjectProxy(p.id, NETREF);
+    await d.detachProjectProxy(idFor("gone"), NETREF);
+  });
+
+  it("detach refuses another installation's proxy and a container that is not a proxy, and disconnects nothing", async () => {
+    const d = mkEgress();
+    putNet(d);
+    const other = putProxy(d, proxyName(3), proxyLabels(PS, { [OWNER_L]: OTHER_ID }));
+    const notProxy = putProxy(d, proxyName(4), proxyLabels(PS, { [ROLE_L]: "clone" }));
+    await expect(d.detachProjectProxy(other.id, NETREF)).rejects.toBeInstanceOf(SandboxRefusedError);
+    await expect(d.detachProjectProxy(notProxy.id, NETREF)).rejects.toBeInstanceOf(SandboxRefusedError);
+    await expect(d.detachProjectProxy("not-an-id", NETREF)).rejects.toThrow(/full id/);
+    expect(d.count("network disconnect")).toBe(0);
+  });
+
+  it("restore stops the proxy, connects it at the address, starts it, waits for readiness and checks the attachment, in that order", async () => {
+    const { d, p } = await setup();
+    await d.detachProjectProxy(p.id, NETREF);
+    d.argvs.length = 0;
+    await d.restoreProjectProxy(p.id, NETREF);
+    const order = d.argvs.map((a) => (a[0] === "network" ? `network ${a[1]}` : a[0]!));
+    expect(order.slice(0, 4)).toEqual(["inspect", "stop", "network connect", "start"]); // classified first
+    expect(order.indexOf("exec")).toBeGreaterThan(order.indexOf("start")); // readiness
+    expect(order.at(-1)).toBe("inspect"); // the attachment check
+    expect(d.argvs[2]).toEqual(["network", "connect", "--ip", "172.30.50.254", NETREF.id, p.id]);
+    expect(d.containers.get(p.name)!.running).toBe(true);
+    expect(await d.projectProxyAttached(p.id, NETREF)).toBe(true);
+  });
+
+  it("restore fails with ProxyStartError when the address is taken, and when the proxy is gone", async () => {
+    const { d, p } = await setup();
+    await d.detachProjectProxy(p.id, NETREF);
+    putProxy(d, proxyName(5), proxyLabels(), { networks: ["bridge", PNET] });
+    d.containers.get(proxyName(5))!.ips = { [PNET]: "172.30.50.254" };
+    const e = await settle(d.restoreProjectProxy(p.id, NETREF));
+    expect(e).toBeInstanceOf(ProxyStartError);
+    expect((e as Error).message).toContain("172.30.50.254");
+    expect(await settle(d.restoreProjectProxy(idFor("gone"), NETREF))).toBeInstanceOf(ProxyStartError);
+  });
+
+  it("restore fails when the proxy does not become ready", async () => {
+    const { d, p } = await setup();
+    await d.detachProjectProxy(p.id, NETREF);
+    d.statusBody = { ...READY, ready: false };
+    (d as unknown as { proxyReadiness: { budgetMs: number; pollMs: number } }).proxyReadiness = { budgetMs: 20, pollMs: 5 };
+    expect(await settle(d.restoreProjectProxy(p.id, NETREF))).toBeInstanceOf(ProxyStartError);
+  });
+});
+
+describe("the sandbox's /etc/hosts (leg 13)", () => {
+  const MARK = "# mcpe-local-access";
+  const run = (want: string, file: string) => execFileSync("sh", ["-c", LOCAL_ACCESS_SCRIPT, "sh", want, file], { stdio: "pipe" });
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const tmp = (content: string): string => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-hosts-"));
+    tmpDirs.push(dir);
+    const file = path.join(dir, "hosts");
+    fs.writeFileSync(file, content);
+    return file;
+  };
+  const BASE = "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n172.30.1.2\tsandbox\n";
+  const lines = (address: string, ...names: string[]) => names.map((n) => `${address} ${n}   ${MARK}`).join("\n");
+
+  describe("the script", () => {
+    it("writes the lines after the sandbox's own, and keeps every one of those", () => {
+      const f = tmp(BASE);
+      run(lines("172.30.1.254", "db.lan", "host.docker.internal"), f);
+      expect(fs.readFileSync(f, "utf8")).toBe(`${BASE}${lines("172.30.1.254", "db.lan", "host.docker.internal")}\n`);
+    });
+
+    it("is idempotent: written twice, there is one set of lines", () => {
+      const f = tmp(BASE);
+      const want = lines("172.30.1.254", "db.lan", "host.docker.internal");
+      run(want, f);
+      const once = fs.readFileSync(f, "utf8");
+      run(want, f);
+      expect(fs.readFileSync(f, "utf8")).toBe(once);
+      expect(once.split("\n").filter((l) => l.endsWith(MARK))).toHaveLength(2);
+    });
+
+    it("writes nothing when the lines are already right (a read-only file does not make it fail)", () => {
+      const f = tmp(BASE);
+      const want = lines("172.30.1.254", "db.lan");
+      run(want, f);
+      fs.chmodSync(f, 0o444);
+      expect(() => run(want, f)).not.toThrow();
+      // A change would have to write (root ignores the mode, so this half only says something for another user).
+      if (process.getuid?.() !== 0) expect(() => run(lines("172.30.1.254", "other.lan"), f)).toThrow();
+    });
+
+    it("replaces earlier marked lines (another address, other names) and leaves unmarked lines alone", () => {
+      const f = tmp(`${BASE}10.9.9.9 keepme.lan\n${lines("172.30.1.254", "old.lan")}\n`);
+      run(lines("172.30.7.254", "db.lan"), f);
+      expect(fs.readFileSync(f, "utf8")).toBe(`${BASE}10.9.9.9 keepme.lan\n${lines("172.30.7.254", "db.lan")}\n`);
+    });
+
+    it("removes the marked lines when there are none wanted, and is then idempotent too", () => {
+      const f = tmp(`${BASE}${lines("172.30.1.254", "db.lan", "host.docker.internal")}\n`);
+      run("", f);
+      expect(fs.readFileSync(f, "utf8")).toBe(BASE);
+      run("", f);
+      expect(fs.readFileSync(f, "utf8")).toBe(BASE);
+    });
+
+    it("writes with one printf into the file and uses neither sed -i nor mv (a bind mount cannot be replaced)", () => {
+      expect(LOCAL_ACCESS_SCRIPT).not.toMatch(/\bsed\b/);
+      expect(LOCAL_ACCESS_SCRIPT).not.toMatch(/\bmv\b/);
+      expect(LOCAL_ACCESS_SCRIPT).not.toMatch(/\bcp\b/);
+      expect(LOCAL_ACCESS_SCRIPT.match(/> "\$file"/g)).toHaveLength(1);
+      expect(LOCAL_ACCESS_SCRIPT.match(/\bprintf\b/g)).toHaveLength(2); // one per branch of one if, one redirect after it
+    });
+  });
+
+  describe("writeLocalAccess", () => {
+    const ID64 = idFor(PS);
+    const put = (d: ScriptedDocker, cls: SandboxClass = "mine") => d.put(PS, cls, { networks: [PNET] });
+
+    it("is one root exec of the script with the lines and the file as arguments, and not through the hook", async () => {
+      const d = mkEgress();
+      put(d);
+      let hooked = 0;
+      d.setContainment(async () => {
+        hooked++;
+        return undefined;
+      });
+      await d.writeLocalAccess({ id: ID64, name: PS }, "172.30.50.254", ["db.lan", "host.docker.internal", "db.lan"]);
+      expect(d.execs).toEqual([
+        ["exec", "-u", "0", ID64, "sh", "-c", LOCAL_ACCESS_SCRIPT, "sh", `172.30.50.254 db.lan   ${MARK}\n172.30.50.254 host.docker.internal   ${MARK}`, "/etc/hosts"],
+      ]);
+      expect(hooked).toBe(0);
+    });
+
+    it("writes an empty set of lines for no names", async () => {
+      const d = mkEgress();
+      put(d);
+      await d.writeLocalAccess({ id: ID64, name: PS }, "172.30.50.254", []);
+      expect(d.execs[0]!.slice(-2)).toEqual(["", "/etc/hosts"]);
+    });
+
+    it.each([["localhost"], ["sandbox"], ["ip6-localhost"], [idFor(PS).slice(0, 12)], ["UPPER.case"], ["a b.lan"], ["db.lan\n10.0.0.1 evil"], ["-x.lan"], ["a".repeat(254)]])(
+      "refuses the name %j: the sandbox's own, or not a plain host name, and executes nothing",
+      async (name) => {
+        const d = mkEgress();
+        put(d);
+        await expect(d.writeLocalAccess({ id: ID64, name: PS }, "172.30.50.254", ["ok.lan", name])).rejects.toThrow();
+        expect(d.count("exec")).toBe(0);
+      },
+    );
+
+    it("refuses a bad address and an id that is not a full one", async () => {
+      const d = mkEgress();
+      put(d);
+      await expect(d.writeLocalAccess({ id: ID64, name: PS }, "172.30.50.999", [])).rejects.toThrow(/IPv4/);
+      await expect(d.writeLocalAccess({ id: ID64, name: PS }, "db.lan", [])).rejects.toThrow(/IPv4/);
+      await expect(d.writeLocalAccess({ id: "abc", name: PS }, "172.30.50.254", [])).rejects.toThrow(/full id/);
+      expect(d.count("exec")).toBe(0);
+    });
+
+    it.each<SandboxClass>(["another", "not-ours"])("refuses a sandbox that is %s with inspects only", async (cls) => {
+      const d = mkEgress();
+      put(d, cls);
+      await expect(d.writeLocalAccess({ id: ID64, name: PS }, "172.30.50.254", ["db.lan"])).rejects.toBeInstanceOf(SandboxRefusedError);
+      for (const v of d.verbs) expect(v).toBe("inspect");
+    });
+
+    it("does nothing for a sandbox that is gone, and throws when the exec fails or times out", async () => {
+      const gone = mkEgress();
+      await gone.writeLocalAccess({ id: ID64, name: PS }, "172.30.50.254", ["db.lan"]);
+      expect(gone.count("exec")).toBe(0);
+      for (const r of [{ code: 1, stderr: "sh: can't create /etc/hosts: Read-only file system" }, { code: null as unknown as number, timedOut: true }]) {
+        const d = mkEgress();
+        put(d);
+        d.execReplies = [r as Reply];
+        await expect(d.writeLocalAccess({ id: ID64, name: PS }, "172.30.50.254", ["db.lan"])).rejects.toThrow(/Could not write the local-access names/);
+      }
+    });
+  });
+
+  describe("a sandbox named a forward target is refused by the grammar as well", () => {
+    it("`localhost` and the sandbox's hostname cannot be local-access targets at all", () => {
+      for (const name of ["localhost", "sandbox"]) {
+        expect(() => loadConfig({ MCPE_NETWORK: "contained", MCPE_LOCAL_ACCESS: `owner/app=${name}:8080` })).toThrow(/at least two labels/);
+      }
+    });
+  });
+
+  describe("the post-start step", () => {
+    type Seen = { name: string; running: boolean; started: boolean; networks: string[]; networkIds?: Record<string, string> };
+    const hooked = (d: ScriptedDocker) => {
+      const seen: Seen[] = [];
+      d.setContainment(async () => undefined, async (f, started) => {
+        seen.push({ name: f.name, running: f.running, started, networks: f.networks, ...(f.networkIds ? { networkIds: f.networkIds } : {}) });
+      });
+      return seen;
+    };
+
+    it("runs after acquire starts a stopped sandbox (started), and after acquire of a running one (not started)", async () => {
+      const d = mk();
+      d.put(N, "mine", { running: false });
+      const seen = hooked(d);
+      await d.acquire(N);
+      expect(seen).toEqual([{ name: N, running: true, started: true, networks: [] }]);
+      await d.acquire(N);
+      expect(seen.at(-1)).toMatchObject({ started: false, running: true });
+      // and it comes after the start, never before
+      expect(d.verbs.indexOf("start")).toBeGreaterThan(-1);
+    });
+
+    it("runs after ensureRunning starts a sandbox, and not when it was running", async () => {
+      const d = mk();
+      d.put(N, "mine", { running: false });
+      const seen = hooked(d);
+      await d.ensureRunning(N);
+      expect(seen).toHaveLength(1);
+      await d.ensureRunning(N);
+      expect(seen).toHaveLength(1);
+    });
+
+    it("runs in exec's restart path, after the start, and not on an ordinary exec", async () => {
+      const d = mk();
+      const id = d.put(N, "mine", { running: false });
+      const seen = hooked(d);
+      d.execReplies = [{ code: 1, stderr: DAEMON }, { code: 0, stdout: "ok" }];
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      expect(seen).toEqual([{ name: N, running: true, started: true, networks: [] }]);
+      const plain = mk();
+      const id2 = plain.put(N, "mine");
+      const none = hooked(plain);
+      await plain.exec(makeRef(id2, N), ["true"], OPTS);
+      await plain.exec(N, ["true"], OPTS);
+      expect(none).toEqual([]);
+    });
+
+    it("runs after startForContainment starts a sandbox, with the facts' network ids, and not when it was running", async () => {
+      const d = mk();
+      d.put(N, "mine", { running: false, networks: ["x-net"] });
+      d.script.push((a) =>
+        a[0] === "inspect" && a[a.indexOf("--format") + 1] !== undefined && a[a.indexOf("--format") + 1]!.includes('"networks"') && false
+          ? undefined
+          : undefined,
+      );
+      const seen = hooked(d);
+      await d.startForContainment(N);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({ started: true, networks: ["x-net"] });
+      await d.startForContainment(N);
+      expect(seen).toHaveLength(1);
+    });
+
+    it("carries the network ids the inspect gives, by network name", async () => {
+      const d = mk();
+      d.put(N, "mine", { running: false });
+      d.script.push((a) =>
+        a[0] === "inspect" && a.at(-1) === N
+          ? { stdout: JSON.stringify({ id: idFor(N), name: `/${N}`, running: false, labels: LABELS.mine, networks: { [`${N}-net`]: { NetworkID: "c".repeat(64) }, bridge: { NetworkID: "d".repeat(64) }, odd: { NetworkID: "short" } } }) }
+          : undefined,
+      );
+      const seen = hooked(d);
+      await d.acquire(N);
+      expect(seen[0]!.networkIds).toEqual({ [`${N}-net`]: "c".repeat(64), bridge: "d".repeat(64) });
+    });
+
+    it("is not installed without a hook, and is removed with it", async () => {
+      const d = mk();
+      d.put(N, "mine", { running: false });
+      let called = 0;
+      d.setContainment(undefined, async () => {
+        called++;
+      });
+      await d.acquire(N);
+      expect(called).toBe(0);
+    });
+  });
+
+  describe("leaving the network takes the lines out", () => {
+    const sandboxOnNet = (running = true) => {
+      const d = mkEgress();
+      putNet(d);
+      d.put(PS, "mine", { networks: [PNET], running });
+      return d;
+    };
+    const writes = (d: ScriptedDocker) => d.execs.filter((a) => a[1] === "-u");
+
+    it.each<["off" | "open"]>([["off"], ["open"]])("%s: a running sandbox gets one write with no names, after the network is gone", async (mode) => {
+      const d = sandboxOnNet();
+      await d.setNetwork(PS, mode);
+      expect(writes(d)).toHaveLength(1);
+      expect(writes(d)[0]!.slice(-2)).toEqual(["", "/etc/hosts"]);
+      expect(d.argvs.findIndex((a) => a[0] === "exec")).toBeGreaterThan(d.argvs.findIndex((a) => a[0] === "network" && a[1] === "rm"));
+    });
+
+    it("a stopped sandbox is not written to (Docker rewrites its /etc/hosts at the next start)", async () => {
+      const d = sandboxOnNet(false);
+      await d.setNetwork(PS, "off");
+      expect(d.count("exec")).toBe(0);
+    });
+
+    it("a failed write is logged and never fails the network change", async () => {
+      const lines: string[] = [];
+      const d = new EgressDocker(loadConfig({}), TEST_INSTALLATION_ID, (l) => lines.push(l));
+      putNet(d);
+      d.put(PS, "mine", { networks: [PNET] });
+      d.execReplies = [{ code: 1, stderr: "sh: read-only" }];
+      await d.setNetwork(PS, "off");
+      expect(d.containers.get(PS)!.networks).toEqual([]);
+      expect(lines.join("\n")).toMatch(/could not take the local-access names out/);
+    });
+
+    it("a sandbox that was never on its network is not written to", async () => {
+      const d = mkEgress();
+      d.put(PS, "mine", { networks: ["bridge"] });
+      await d.setNetwork(PS, "off");
+      expect(d.count("exec")).toBe(0);
+    });
+  });
+});
+
+describe("runsc must be registered with --overlay2=none (leg 13)", () => {
+  const withRuntime = (entry: unknown, name = "runsc") => {
+    const lines: string[] = [];
+    const d = new ScriptedDocker(loadConfig({ MCPE_DOCKER_RUNTIME: name }), TEST_INSTALLATION_ID, (l) => lines.push(l));
+    d.script.push((a) =>
+      a[0] === "info" ? { stdout: `${JSON.stringify({ runtimes: { runc: {}, [name]: entry }, default: "runc" })}\n` } : undefined,
+    );
+    return { d, lines };
+  };
+
+  it("passes quietly when runtimeArgs carries --overlay2=none", async () => {
+    const { d, lines } = withRuntime({ path: "/usr/local/bin/runsc", runtimeArgs: ["--overlay2=none"] });
+    await d.assertRuntime();
+    expect(lines).toEqual([]);
+  });
+
+  it("accepts it among other arguments and with one dash", async () => {
+    for (const args of [["--network=host", "--overlay2=none"], ["-overlay2=none"]]) {
+      const { d, lines } = withRuntime({ path: "/usr/local/bin/runsc", runtimeArgs: args });
+      await d.assertRuntime();
+      expect(lines).toEqual([]);
+    }
+  });
+
+  it.each([
+    ["no runtimeArgs", { path: "/usr/local/bin/runsc" }],
+    ["empty runtimeArgs", { path: "/usr/local/bin/runsc", runtimeArgs: [] }],
+    ["other arguments", { path: "/usr/local/bin/runsc", runtimeArgs: ["--network=host"] }],
+    ["the default overlay", { path: "/usr/local/bin/runsc", runtimeArgs: ["--overlay2=root:self"] }],
+    ["an entry that is not an object", null],
+  ])("logs one warning, and does not refuse, with %s", async (_n, entry) => {
+    const { d, lines } = withRuntime(entry);
+    await d.assertRuntime(); // a warning, not a refusal
+    await d.assertRuntime(); // and the check is cached: still one line
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("--overlay2=none");
+    expect(lines[0]).toContain("runsc install -- --overlay2=none");
+  });
+
+  it("says nothing for another runtime, or when no runtime is named", async () => {
+    const other = withRuntime({ runtimeArgs: [] }, "runc");
+    await other.d.assertRuntime();
+    expect(other.lines).toEqual([]);
+    const none = new ScriptedDocker(loadConfig({}), TEST_INSTALLATION_ID, (l) => none.argvs.push([l]));
+    await none.assertRuntime();
+    expect(none.argvs).toEqual([]);
   });
 });

@@ -8,7 +8,7 @@ import { Installer } from "../../src/install/installer.js";
 import { McpProxy } from "../../src/proxy/mcp-proxy.js";
 import { loadInstallationId } from "../../src/installation.js";
 import { Registry } from "../../src/registry.js";
-import { Docker, MANIFESTS, parseProbeOutput, ProxyStartError, WALK_SCRIPT, walkArguments, type ExecOptions, type ExecResult, type OneShotSpec, type ProxyRefusalRow, type SandboxRef } from "../../src/sandbox/docker.js";
+import { Docker, MANIFESTS, parseProbeOutput, proxyAddress, ProxyStartError, WALK_SCRIPT, walkArguments, type ExecOptions, type ExecResult, type OneShotSpec, type ProxyRefusalRow, type SandboxRef } from "../../src/sandbox/docker.js";
 import { Containment } from "../../src/network/containment.js";
 import { buildHosts, sandboxHosts } from "../../src/network/defaults.js";
 import { refusalLines } from "../../src/network/refusals.js";
@@ -50,6 +50,26 @@ const prefix = `mcpe-it-${process.pid}-`;
 const text = (res: Awaited<ReturnType<App["callTool"]>>) => (res.content[0] as { text: string }).text;
 
 const HEX8 = /^[0-9a-f]{8}$/;
+
+/**
+ * The names of a sandbox's network interfaces, one per line, from /proc/net/dev (header lines skipped). gVisor implements
+ * /proc/net/dev and leaves /sys/class/net empty, so the same assertion runs under runc and runsc.
+ */
+const IFACES = "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | sort";
+
+/**
+ * The URL a contained sandbox's proxy variables carry (leg 13): the proxy's ADDRESS on the network, the last usable host of the
+ * network's subnet, read from the network itself. The sandbox names the proxy by this address, never by a name.
+ */
+async function proxyUrlOf(netName: string): Promise<string> {
+  const res = await run("docker", ["network", "inspect", "--format", "{{range .IPAM.Config}}{{.Subnet}} {{end}}", netName], { timeoutMs: 30_000 });
+  const subnet = res.stdout.trim().split(/\s+/).find((s) => /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(s));
+  if (!subnet) throw new Error(`network ${netName} has no IPv4 subnet: ${res.stderr}`);
+  return `http://${proxyAddress(subnet)}:3128`;
+}
+
+/** A raw CONNECT script's first line: the proxy's host and port come from the HTTPS_PROXY the sandbox was given (no name is ever looked up). */
+const PROXY_HOST_JS = `const P=new URL(process.env.HTTPS_PROXY);`;
 
 /**
  * `alpine`, for the test scanner of later legs, pinned by the index digest with the tag it was read under
@@ -218,9 +238,12 @@ describe.skipIf(!enabled)("docker integration", () => {
     const out = await app.callTool("gron__gron", { stdin: '{"a":[1,2]}' });
     expect(text(out)).toContain("json.a[1] = 2;");
 
+    // Offline name resolution waits instead of failing at once under gVisor, so the command needs longer than the 5 s default there
+    // (the measured difference of the first full gVisor run); it still ends in DOWN.
     const net = await app.callTool("sandbox_exec", {
       project: "gron",
       command: "getent hosts github.com >/dev/null && echo UP || echo DOWN",
+      ...(process.env.MCPE_DOCKER_RUNTIME === "runsc" ? { timeout_seconds: 90 } : {}),
     });
     expect(text(net)).toContain("DOWN");
 
@@ -402,9 +425,10 @@ describe.skipIf(!enabled)("docker integration", () => {
     try {
       const vol = await run("docker", ["volume", "create", "--label", "mcp-everything=1", name], { timeoutMs: 30_000 });
       expect(vol.code).toBe(0);
+      // Under a named runtime the sandbox is made under it, as an earlier version would have: a sandbox of another runtime is rightly refused.
       const ctr = await run(
         "docker",
-        ["run", "-d", "--name", name, "--label", "mcp-everything=1", "-v", `${name}:/workspace`, cfg.docker.images.generic, "sleep", "infinity"],
+        ["run", "-d", "--name", name, "--label", "mcp-everything=1", ...(cfg.docker.runtime ? ["--runtime", cfg.docker.runtime] : []), "-v", `${name}:/workspace`, cfg.docker.images.generic, "sleep", "infinity"],
         { timeoutMs: 300_000 },
       );
       expect(ctr.code).toBe(0);
@@ -613,7 +637,9 @@ describe.skipIf(!enabled)("docker integration: sandbox idle timeout", () => {
     expect(await docker.ensureRunning(name)).toBe(true);
     expect(await docker.state(name)).toBe("running");
     expect((await docker.networkState(name)) !== "off").toBe(false);
-    const after = await sh(name, "cat /opt/mcpe/bin/t /workspace/work/w; ls /sys/class/net");
+    // The interface names come from /proc/net/dev (gVisor leaves /sys/class/net empty). Under runsc the idle stop discards what
+    // is outside volumes unless runsc was registered with --overlay2=none (the CI registration, and the README's requirement).
+    const after = await sh(name, `cat /opt/mcpe/bin/t /workspace/work/w; ${IFACES}`);
     expect(after.stdout.trim().split("\n")).toEqual(["tool", "data", "lo"]);
 
     // An exec against the stopped sandbox restarts it on the way.
@@ -633,7 +659,7 @@ describe.skipIf(!enabled)("docker integration: sandbox idle timeout", () => {
     expect(await docker.state(name)).toBe("stopped");
     await docker.ensureRunning(name);
     expect((await docker.networkState(name)) !== "off").toBe(false);
-    expect((await sh(name, "ls /sys/class/net")).stdout.trim()).toBe("lo");
+    expect((await sh(name, IFACES)).stdout.trim()).toBe("lo");
   }, 120_000);
 
   it("does not stop a sandbox during an exec longer than the timeout", async () => {
@@ -1635,10 +1661,10 @@ describe.skipIf(!enabled)("docker integration: contained networks and the one-sh
     `const net=require("net");const T=${JSON.stringify(targets)};let i=0;(function next(){if(i>=T.length)process.exit(0);const [h,p]=T[i++];` +
     `const s=net.connect({host:h,port:p});s.setTimeout(4000);let done=false;const fin=(r)=>{if(done)return;done=true;console.log(h+":"+p+"="+r);s.destroy();next()};` +
     `s.on("connect",()=>fin("CONNECTED"));s.on("timeout",()=>fin("TIMEOUT"));s.on("error",(e)=>fin("ERR "+e.code))})()`;
-  /** A CONNECT script: a raw `CONNECT host:port` to the proxy by its alias for each target; prints `host:port=<status>`. */
+  /** A CONNECT script: a raw `CONNECT host:port` to the proxy, at the address in HTTPS_PROXY, for each target; prints `host:port=<status>`. */
   const connectScript = (targets: Array<[string, number]>) =>
-    `const net=require("net");const T=${JSON.stringify(targets)};let i=0;(function next(){if(i>=T.length)process.exit(0);const [h,p]=T[i++];` +
-    `const s=net.connect({host:"mcpe-proxy",port:3128});s.setTimeout(8000);let buf="";let done=false;const fin=(r)=>{if(done)return;done=true;console.log(h+":"+p+"="+r);s.destroy();next()};` +
+    `${PROXY_HOST_JS}const net=require("net");const T=${JSON.stringify(targets)};let i=0;(function next(){if(i>=T.length)process.exit(0);const [h,p]=T[i++];` +
+    `const s=net.connect({host:P.hostname,port:Number(P.port)});s.setTimeout(8000);let buf="";let done=false;const fin=(r)=>{if(done)return;done=true;console.log(h+":"+p+"="+r);s.destroy();next()};` +
     `s.on("connect",()=>s.write("CONNECT "+h+":"+p+" HTTP/1.1\\r\\nHost: "+h+":"+p+"\\r\\n\\r\\n"));` +
     `s.on("data",(d)=>{buf+=d;const m=/^HTTP\\/1\\.[01] (\\d{3})/.exec(buf);if(m)fin(m[1])});s.on("timeout",()=>fin("TIMEOUT"));s.on("error",(e)=>fin("ERR "+e.code));s.on("close",()=>fin("CLOSED"))})()`;
   const results = (stdout: string) =>
@@ -1975,15 +2001,19 @@ describe.skipIf(!enabled)("docker integration: project network primitives", () =
       expect(network.created).toBe(true);
       // The proxy is on bridge (the way out) and on the project network, under its alias, and it is ours.
       expect(await networksOf(proxy.name)).toEqual(["bridge", netName].sort());
+      // At the last usable address of the network's subnet, given with `network connect --ip` (IPAMConfig), and under no alias.
+      const configured = (await lines(["inspect", "--format", `{{json (index .NetworkSettings.Networks "${netName}").IPAMConfig}}`, proxy.name])).join("");
+      expect(JSON.parse(configured)).toMatchObject({ IPv4Address: proxyAddress(network.subnet) });
+      expect(await docker.projectProxyAttached(proxy.id, network)).toBe(true);
       const aliases = (await lines(["inspect", "--format", `{{json (index .NetworkSettings.Networks "${netName}").Aliases}}`, proxy.name])).join("");
-      expect(aliases).toContain("mcpe-proxy");
+      expect(aliases).not.toContain("mcpe-proxy");
       expect((await docker.listProjectProxies(name)).map((p) => p.id)).toEqual([proxy.id]);
 
       await docker.setNetwork(name, "contained");
       expect(await networksOf(name)).toEqual([netName]);
       expect(await docker.networkState(name)).toBe("contained");
       expect(await docker.networkState(ref)).toBe("contained");
-      expect((await docker.exec(ref, ["sh", "-c", "ls /sys/class/net"], { timeoutSec: 30 })).stdout.trim().split(/\s+/).sort()).toEqual([expect.stringMatching(/^eth\d$/), "lo"]);
+      expect((await docker.exec(ref, ["sh", "-c", IFACES], { timeoutSec: 30 })).stdout.trim().split(/\s+/).sort()).toEqual([expect.stringMatching(/^eth\d$/), "lo"]);
 
       await docker.setNetwork(name, "open");
       expect(await networksOf(name)).toEqual(["bridge"]);
@@ -2029,7 +2059,10 @@ describe.skipIf(!enabled)("docker integration: project network primitives", () =
       expect(again.created).toBe(true);
       expect(again.id).not.toBe(network.id);
       await docker.attachProjectNetwork(ref, again);
-      expect((await run("docker", ["start", name], { timeoutMs: 60_000 })).code).toBe(0);
+      // Under gVisor this start failed in the first full run with no reason given: print Docker's own words and the container's state.
+      const restarted = await run("docker", ["start", name], { timeoutMs: 60_000 });
+      const state = await run("docker", ["inspect", "--format", "{{json .State}} networks={{json .NetworkSettings.Networks}}", name], { timeoutMs: 30_000 });
+      expect(restarted.code, `docker start: ${restarted.stderr.trim()} | ${restarted.stdout.trim()}\ninspect: ${state.stdout.trim().slice(0, 1500)}`).toBe(0);
       expect(await docker.state(name)).toBe("running");
       expect(await networksOf(name)).toEqual([netName]);
     } finally {
@@ -2143,15 +2176,28 @@ describe.skipIf(!enabled)("docker integration: containment hook (leg 7)", () => 
     `const net=require("net");const T=${JSON.stringify(targets)};let i=0;(function next(){if(i>=T.length)process.exit(0);const [h,p]=T[i++];` +
     `const s=net.connect({host:h,port:p});s.setTimeout(4000);let done=false;const fin=(r)=>{if(done)return;done=true;console.log(h+":"+p+"="+r);s.destroy();next()};` +
     `s.on("connect",()=>fin("CONNECTED"));s.on("timeout",()=>fin("TIMEOUT"));s.on("error",(e)=>fin("ERR "+e.code))})()`;
-  /** A raw `CONNECT host:port` to the proxy by its alias for each target; prints `host:port=<status>`. */
+  /** A raw `CONNECT host:port` to the proxy, at the address in HTTPS_PROXY (pass it with `-e` for a raw docker exec), for each target; prints `host:port=<status>`. */
   const connectScript = (targets: Array<[string, number]>) =>
-    `const net=require("net");const T=${JSON.stringify(targets)};let i=0;(function next(){if(i>=T.length)process.exit(0);const [h,p]=T[i++];` +
-    `const s=net.connect({host:"mcpe-proxy",port:3128});s.setTimeout(8000);let buf="";let done=false;const fin=(r)=>{if(done)return;done=true;console.log(h+":"+p+"="+r);s.destroy();next()};` +
+    `${PROXY_HOST_JS}const net=require("net");const T=${JSON.stringify(targets)};let i=0;(function next(){if(i>=T.length)process.exit(0);const [h,p]=T[i++];` +
+    `const s=net.connect({host:P.hostname,port:Number(P.port)});s.setTimeout(8000);let buf="";let done=false;const fin=(r)=>{if(done)return;done=true;console.log(h+":"+p+"="+r);s.destroy();next()};` +
     `s.on("connect",()=>s.write("CONNECT "+h+":"+p+" HTTP/1.1\\r\\nHost: "+h+":"+p+"\\r\\n\\r\\n"));` +
     `s.on("data",(d)=>{buf+=d;const m=/^HTTP\\/1\\.[01] (\\d{3})/.exec(buf);if(m)fin(m[1])});s.on("timeout",()=>fin("TIMEOUT"));s.on("error",(e)=>fin("ERR "+e.code));s.on("close",()=>fin("CLOSED"))})()`;
   const results = (stdout: string) =>
     Object.fromEntries(stdout.split("\n").filter(Boolean).map((l) => [l.slice(0, l.lastIndexOf("=")), l.slice(l.lastIndexOf("=") + 1)])) as Record<string, string>;
   const REFUSED = /^(ERR (ENETUNREACH|EHOSTUNREACH|ETIMEDOUT)|TIMEOUT)$/;
+  /**
+   * The CONNECT status for `host:443` through the sandbox's proxy, asked again a few times until it is `want`: the first connect after a
+   * proxy swap can be slow (the neighbour's ARP entry for the address is the old proxy's), and a retry is bounded (6 tries, 1 s apart).
+   */
+  const statusEventually = async (name: string, host: string, want = "200"): Promise<string> => {
+    let got = "";
+    for (let i = 0; i < 6; i++) {
+      got = (await inside(name, connectScript([[host, 443]])))[`${host}:443`] ?? "";
+      if (got === want) return got;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    return got;
+  };
 
   /**
    * A sandbox on the proxy image (Node inside), with a record for it in this describe's own registry. Left running on `bridge`:
@@ -2211,7 +2257,8 @@ describe.skipIf(!enabled)("docker integration: containment hook (leg 7)", () => 
       await listen(b.name);
       const bAddress = await addressOn(b.name, `${b.name}-net`);
       const refA = (await docker.acquire(a.name))!;
-      expect(refA.env).toMatchObject({ HTTPS_PROXY: "http://mcpe-proxy:3128", NODE_USE_ENV_PROXY: "1" });
+      expect(refA.env).toMatchObject({ HTTPS_PROXY: await proxyUrlOf(`${a.name}-net`), NODE_USE_ENV_PROXY: "1" });
+      expect(refA.env!.HTTPS_PROXY).toMatch(/^http:\/\/\d{1,3}(\.\d{1,3}){3}:3128$/);
       const direct = await inside(refA, probeScript([[bAddress, 9100]]));
       expect(direct[`${bAddress}:9100`]).toMatch(REFUSED);
       const viaProxy = await inside(refA, connectScript([[bAddress, 9100]]));
@@ -2229,26 +2276,69 @@ describe.skipIf(!enabled)("docker integration: containment hook (leg 7)", () => 
       const before = await proxiesOf(p.name);
       expect(before).toHaveLength(1);
       expect((await inside(p.name, connectScript([["github.com", 443]])))["github.com:443"]).toBe("403");
+      const url = await proxyUrlOf(`${p.name}-net`);
 
       const rec = registry.get(p.slug)!;
       registry.put({ ...rec, hosts: ["github.com"] } as ProjectRecord);
-      // Which proxy answered during the overlap is recorded, not asserted.
+      // Leg 13: there is no overlap any more (the old proxy leaves the network before the new one is made), so while it
+      // replaces a connection is refused by the old proxy or fails for want of one, and the first answer of the new proxy is
+      // the allowed one. A raw exec carries the proxy variable by hand (a raw `docker exec` is not hooked).
       const seen: string[] = [];
       let finished = false;
       const replacing = containment.replace(p.project).finally(() => {
         finished = true;
       });
       while (!finished && seen.length < 20) {
-        const r = await run("docker", ["exec", p.name, "node", "-e", connectScript([["github.com", 443]])], { timeoutMs: 60_000 });
+        const r = await run("docker", ["exec", "-e", `HTTPS_PROXY=${url}`, p.name, "node", "-e", connectScript([["github.com", 443]])], { timeoutMs: 60_000 });
         seen.push(results(r.stdout)["github.com:443"] ?? `exit ${r.code}`);
       }
       const result = await replacing;
-      console.log(`leg 7 overlap: statuses seen while replacing: ${seen.join(",") || "(none)"}`);
+      console.log(`leg 13 replacement: statuses seen while replacing: ${seen.join(",") || "(none)"}`);
       expect(result.kind).toBe("replaced");
       const after = await proxiesOf(p.name);
       expect(after).toHaveLength(1);
       expect(after[0]).not.toBe(before[0]);
-      expect((await inside(p.name, connectScript([["github.com", 443]])))["github.com:443"]).toBe("200");
+      // The same address: nothing about the environment changed, so nothing had to be restarted for addressing.
+      expect(await proxyUrlOf(`${p.name}-net`)).toBe(url);
+      expect(await statusEventually(p.name, "github.com")).toBe("200");
+    } finally {
+      await sweepOwn();
+    }
+    expect(await remaining()).toEqual(NONE);
+  }, 600_000);
+
+  it("leg 13: a replacement keeps the proxy's address and the sandbox's environment; a failed replacement puts the old proxy back at that address", async () => {
+    /** A Docker whose new proxy never becomes ready: the old one has already left the network when this throws. */
+    class FailingCreate extends Docker {
+      override async createProjectProxy(): Promise<{ id: string; name: string }> {
+        throw new ProxyStartError("injected: the new proxy never became ready");
+      }
+    }
+    try {
+      const p = await makeProject({ hosts: ["github.com"] });
+      expect((await containment.contain(p.project)).ok).toBe(true);
+      const net = (await docker.findProjectNetwork(p.name, p.project))!;
+      const url = await proxyUrlOf(`${p.name}-net`);
+      expect(url).toBe(`http://${proxyAddress(net.subnet)}:3128`);
+      expect((await docker.exec(p.name, ["sh", "-c", "echo $HTTPS_PROXY"], { timeoutSec: 60 })).stdout.trim()).toBe(url);
+
+      // A forced replacement: another proxy, at the same address, and the same environment (nothing to restart for addressing).
+      const [first] = await proxiesOf(p.name);
+      expect((await containment.replace(p.project, { force: true })).kind).toBe("replaced");
+      const [second] = await proxiesOf(p.name);
+      expect(second).not.toBe(first);
+      expect(await docker.projectProxyAttached(second!, net)).toBe(true);
+      expect((await docker.exec(p.name, ["sh", "-c", "echo $HTTPS_PROXY"], { timeoutSec: 60 })).stdout.trim()).toBe(url);
+      expect(await statusEventually(p.name, "github.com")).toBe("200");
+
+      // A replacement whose new proxy fails: the old one is stopped, connected at the address, started and ready again.
+      const failing = new Containment(cfg, registry, new FailingCreate(cfg, id), { dataDir });
+      await expect(failing.replace(p.project, { force: true })).rejects.toThrow(/injected/);
+      expect(await proxiesOf(p.name)).toEqual([second]);
+      expect(await docker.projectProxyAttached(second!, net)).toBe(true);
+      expect((await docker.listProjectProxies(p.name))[0]!.running).toBe(true);
+      expect(await statusEventually(p.name, "github.com")).toBe("200");
+      expect((await remaining()).containers.filter((n) => n.includes("-proxy-"))).toHaveLength(1);
     } finally {
       await sweepOwn();
     }
@@ -2265,7 +2355,7 @@ describe.skipIf(!enabled)("docker integration: containment hook (leg 7)", () => 
       await removeContainerWithVolumesChecked(oldName, []);
       expect(await proxiesOf(p.name)).toEqual([]);
       const echoed = await docker.exec(p.name, ["sh", "-c", "echo $HTTPS_PROXY"], { timeoutSec: 60 });
-      expect(echoed.stdout.trim()).toBe("http://mcpe-proxy:3128");
+      expect(echoed.stdout.trim()).toBe(await proxyUrlOf(`${p.name}-net`));
       const again = await proxiesOf(p.name);
       expect(again).toHaveLength(1);
       expect(again[0]).not.toBe(old);
@@ -2459,9 +2549,10 @@ describe.skipIf(!enabled)("docker integration: the contained install (leg 8)", (
       expect(await networksOf(record.container)).toEqual([`${record.container}-net`]);
       const proxies = await docker.listProjectProxies(record.container);
       expect(proxies).toHaveLength(1);
-      // The run allowlist: Go's rows (proxy.golang.org) and not the build's (github.com). bash's /dev/tcp, since the Go image has no Node.
+      // The run allowlist: Go's rows (proxy.golang.org) and not the build's (github.com). bash's /dev/tcp, since the Go image has no Node;
+      // the proxy's address is the one in HTTPS_PROXY, which every exec of the sandbox carries (http://<address>:3128).
       const connect = (host: string) =>
-        `exec 3<>/dev/tcp/mcpe-proxy/3128 && printf 'CONNECT ${host}:443 HTTP/1.1\\r\\nHost: ${host}:443\\r\\n\\r\\n' >&3 && head -n 1 <&3`;
+        `P=\${HTTPS_PROXY#http://}; exec 3<>/dev/tcp/\${P%:*}/\${P##*:} && printf 'CONNECT ${host}:443 HTTP/1.1\\r\\nHost: ${host}:443\\r\\n\\r\\n' >&3 && head -n 1 <&3`;
       const status = async (host: string) => (await docker.exec(record.container, ["timeout", "20", "bash", "-c", connect(host)], { timeoutSec: 60 })).stdout.trim();
       expect(await status("proxy.golang.org")).toMatch(/ 200 /);
       expect(await status("github.com")).toMatch(/ 403 /);
@@ -2598,10 +2689,10 @@ describe.skipIf(!enabled)("docker integration: network tools and local access (l
   };
   const results = (stdout: string) =>
     Object.fromEntries(stdout.split("\n").filter(Boolean).map((l) => [l.slice(0, l.lastIndexOf("=")), l.slice(l.lastIndexOf("=") + 1)])) as Record<string, string>;
-  /** A raw `CONNECT host:port` to the proxy by its alias for each target; prints `host:port=<status>`. */
+  /** A raw `CONNECT host:port` to the proxy, at the address in HTTPS_PROXY, for each target; prints `host:port=<status>`. */
   const connectScript = (targets: Array<[string, number]>) =>
-    `const net=require("net");const T=${JSON.stringify(targets)};let i=0;(function next(){if(i>=T.length)process.exit(0);const [h,p]=T[i++];` +
-    `const s=net.connect({host:"mcpe-proxy",port:3128});s.setTimeout(8000);let buf="";let done=false;const fin=(r)=>{if(done)return;done=true;console.log(h+":"+p+"="+r);s.destroy();next()};` +
+    `${PROXY_HOST_JS}const net=require("net");const T=${JSON.stringify(targets)};let i=0;(function next(){if(i>=T.length)process.exit(0);const [h,p]=T[i++];` +
+    `const s=net.connect({host:P.hostname,port:Number(P.port)});s.setTimeout(8000);let buf="";let done=false;const fin=(r)=>{if(done)return;done=true;console.log(h+":"+p+"="+r);s.destroy();next()};` +
     `s.on("connect",()=>s.write("CONNECT "+h+":"+p+" HTTP/1.1\\r\\nHost: "+h+":"+p+"\\r\\n\\r\\n"));` +
     `s.on("data",(d)=>{buf+=d;const m=/^HTTP\\/1\\.[01] (\\d{3})/.exec(buf);if(m)fin(m[1])});s.on("timeout",()=>fin("TIMEOUT"));s.on("error",(e)=>fin("ERR "+e.code));s.on("close",()=>fin("CLOSED"))})()`;
   /** A raw connect that writes `ping` and reads it back from an echo server; prints `host:port=ECHO <text>|TIMEOUT|ERR <code>`. Ignores the proxy variables. */
@@ -2647,6 +2738,19 @@ describe.skipIf(!enabled)("docker integration: network tools and local access (l
     return results(res.stdout);
   };
   const proxiesOf = async (d: Docker, name: string) => (await d.listProjectProxies(name)).map((p) => p.id);
+  /** The CONNECT status for `host:443` through the sandbox's proxy, asked again (6 tries, 1 s apart) until it is `want`: the first connect after a proxy swap can be slow (ARP). */
+  const statusEventually = async (d: Docker, name: string, host: string, want: string): Promise<string> => {
+    let got = "";
+    for (let i = 0; i < 6; i++) {
+      got = (await inside(d, name, connectScript([[host, 443]])))[`${host}:443`] ?? "";
+      if (got === want) return got;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    return got;
+  };
+  /** The sandbox's /etc/hosts lines that mcp-everything wrote (everything ending in the mark), as text. */
+  const markedHosts = async (d: Docker, name: string) =>
+    (await d.exec(name, ["sh", "-c", "grep '# mcpe-local-access$' /etc/hosts || true"], { timeoutSec: 30 })).stdout.trim();
 
   /** What the measurement found; undefined until it has run. */
   let reach: { resolved: string; connected: boolean; reason: string } | undefined;
@@ -2724,6 +2828,56 @@ describe.skipIf(!enabled)("docker integration: network tools and local access (l
     expect(await remaining()).toEqual(NONE);
   }, 600_000);
 
+  it("leg 13: the local-access names are in the sandbox's /etc/hosts at the proxy address, survive a stop and a start, and go when the forwards become empty", async () => {
+    try {
+      const slug = `c9${hex()}`;
+      const project = parseRepoRef(`github:o/${slug}`, cfg.hosts).id;
+      const localCfg = loadConfig({ ...base, MCPE_LOCAL_ACCESS: `${project}=db.lan:5432,host.docker.internal:9000` });
+      const docker = new Docker(localCfg, id);
+      const registry = new Registry(dataDir);
+      const containment = new Containment(localCfg, registry, docker, { dataDir });
+      containment.install();
+      const name = docker.sandboxName(slug);
+      expect(mayRemove(name, [])).toBe(true);
+      await docker.createSandboxVolume(name);
+      await docker.createContainer({ name, volume: name, image: localCfg.docker.proxyImage, project, start: false });
+      await docker.startForContainment(name);
+      registry.put({ ...record(slug), container: name, volume: name, ecosystems: ["generic"], repo: parseRepoRef(`github:o/${slug}`, localCfg.hosts) } as ProjectRecord);
+      const made = await containment.contain(project);
+      expect(made.ok, made.ok ? "" : String(made.error)).toBe(true);
+
+      const address = (await proxyUrlOf(`${name}-net`)).replace(/^http:\/\//, "").replace(/:3128$/, "");
+      const wanted = [`${address} db.lan   # mcpe-local-access`, `${address} host.docker.internal   # mcpe-local-access`].sort();
+      const marked = async () => (await markedHosts(docker, name)).split("\n").filter(Boolean).sort();
+      expect(await marked()).toEqual(wanted);
+      // The names resolve to the proxy through /etc/hosts alone (no DNS server is asked for them).
+      const resolve = await docker.exec(name, ["node", "-e", `require("dns").lookup("db.lan",(e,a)=>console.log(e?"ERR "+e.code:a))`], { timeoutSec: 60 });
+      expect(resolve.stdout.trim()).toBe(address);
+      // The sandbox's own entries are still there.
+      expect((await docker.exec(name, ["sh", "-c", "grep -c localhost /etc/hosts"], { timeoutSec: 30 })).stdout.trim()).not.toBe("0");
+
+      // Docker rewrites /etc/hosts on a start: the lines are written again after it (by acquire's post-start step), once each.
+      await run("docker", ["stop", checkedForRemoval(name, [])], { timeoutMs: 60_000 });
+      expect(await docker.state(name)).toBe("stopped");
+      expect(await docker.acquire(name)).toBeDefined();
+      expect(await docker.state(name)).toBe("running");
+      expect(await marked()).toEqual(wanted);
+      // A sandbox that was already running is checked, and not written twice.
+      expect(await docker.acquire(name)).toBeDefined();
+      expect(await marked()).toEqual(wanted);
+
+      // The forwards become empty (another session's configuration, with the session label compared): the lines are taken out.
+      const plain = loadConfig({ ...base, MCPE_LOCAL_ACCESS: "" });
+      const result = await new Containment(plain, registry, docker, { dataDir }).replace(project, { compareSession: true });
+      expect(result.kind).toBe("replaced");
+      expect(await marked()).toEqual([]);
+      expect((await docker.exec(name, ["sh", "-c", "grep -c localhost /etc/hosts"], { timeoutSec: 30 })).stdout.trim()).not.toBe("0");
+    } finally {
+      await sweepOwn();
+    }
+    expect(await remaining()).toEqual(NONE);
+  }, 600_000);
+
   it("set_project_network(true) under containment on an offline sandbox contains it, and its proxy allows the run hosts", async () => {
     const docker = new Docker(cfg, id);
     const app = new App({ cfg, docker });
@@ -2765,12 +2919,13 @@ describe.skipIf(!enabled)("docker integration: network tools and local access (l
       const afterAdd = await proxiesOf(docker, p.name);
       expect(afterAdd).toHaveLength(1);
       expect(afterAdd[0]).not.toBe(before[0]);
-      expect((await inside(docker, p.name, connectScript([["github.com", 443]])))["github.com:443"]).toBe("200");
+      expect(await statusEventually(docker, p.name, "github.com", "200")).toBe("200");
 
       const removed = await app.callTool("set_project_hosts", { project: p.slug, remove: ["github.com"] });
       expect(removed.isError, text(removed)).toBeFalsy();
       expect(await proxiesOf(docker, p.name)).toHaveLength(1);
-      expect((await inside(docker, p.name, connectScript([["github.com", 443]])))["github.com:443"]).toBe("403");
+      // A tightening is effective at once (no overlap: the old proxy left the network first).
+      expect(await statusEventually(docker, p.name, "github.com", "403")).toBe("403");
     } finally {
       await app.shutdown();
       await sweepOwn();
@@ -2861,7 +3016,7 @@ describe.skipIf(!enabled)("docker integration: startup containment (leg 10)", ()
       // At once: the key is not yet registered (the listing has not returned), so this meets the gate.
       const res = await docker.exec(p.name, ["sh", "-c", "echo $HTTPS_PROXY"], { timeoutSec: 90 });
       expect(res.code, res.stderr).toBe(0);
-      expect(res.stdout.trim()).toBe("http://mcpe-proxy:3128");
+      expect(res.stdout.trim()).toBe(await proxyUrlOf(`${p.name}-net`));
       expect(await networksOf(p.name)).toEqual([`${p.name}-net`]);
       await app.startup;
       expect(await proxiesOf(docker, p.name)).toHaveLength(1);

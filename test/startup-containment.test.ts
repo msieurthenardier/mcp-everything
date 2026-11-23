@@ -167,6 +167,17 @@ class FakeLayer implements ContainmentDocker {
     const p = this.proxies.find((x) => x.id === id);
     return p?.netId === net.id && p.alias;
   }
+  /** Leg 13: replacement takes the old proxy off its network first, and puts it back when the new one fails. */
+  async detachProjectProxy(id: string) {
+    const p = this.proxies.find((x) => x.id === id);
+    if (p) p.alias = false;
+  }
+  async restoreProjectProxy(id: string) {
+    const p = this.proxies.find((x) => x.id === id);
+    if (!p) throw new Error("it no longer exists");
+    p.alias = true;
+  }
+  async writeLocalAccess() {}
   async createProjectProxy(sandbox: string, project: string, _config: ProxyConfig, labels: Record<string, string>, opts: { name?: string } = {}) {
     this.log(`createProjectProxy:${sandbox}`);
     const net = this.nets.get(`${sandbox}-net`);

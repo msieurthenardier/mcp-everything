@@ -33,6 +33,8 @@ import {
   makeRef,
   networkModeOf,
   PROJECT_LABEL,
+  proxyAddress,
+  type AfterStartHook,
   type ContainedNetwork,
   type ContainmentHook,
   type NetworkMode,
@@ -100,6 +102,7 @@ class FakeClock implements Clock {
 
 interface FakeProxy extends ProjectProxy {
   netId?: string;
+  /** Attached to its network at the proxy address (leg 13: there is no alias any more; the name is kept from before). */
   alias: boolean;
   config?: ProxyConfig;
 }
@@ -143,8 +146,10 @@ class FakeLayer implements ContainmentDocker {
     const had = this.nets.has(`${sandbox}-net`);
     return { ...this.net(sandbox), created: !had };
   }
+  findError?: Error;
   async findProjectNetwork(sandbox: string) {
     this.log("findProjectNetwork");
+    if (this.findError) throw this.findError;
     return this.nets.get(`${sandbox}-net`);
   }
   async attachProjectNetwork(ref: SandboxRef, net: { id: string; name: string }) {
@@ -161,11 +166,40 @@ class FakeLayer implements ContainmentDocker {
     const p = this.proxies.find((x) => x.id === id);
     return p?.netId === net.id && p.alias;
   }
+  /** Leg 13. Replacement's first step: the proxy leaves the network (and so its address). */
+  detachError?: Error;
+  async detachProjectProxy(id: string) {
+    this.log("detachProjectProxy");
+    if (this.detachError) throw this.detachError;
+    const p = this.proxies.find((x) => x.id === id);
+    if (p) p.alias = false;
+  }
+  /** Leg 13. Rollback: the old proxy comes back at the address; `restoreError` makes it fail, and an address held by another proxy is refused. */
+  restoreError?: Error;
+  async restoreProjectProxy(id: string) {
+    this.log("restoreProjectProxy");
+    if (this.restoreError) throw this.restoreError;
+    const p = this.proxies.find((x) => x.id === id);
+    if (!p) throw new Error("it no longer exists");
+    if (this.proxies.some((x) => x !== p && x.alias && x.netId === p.netId)) throw new Error("Address already in use");
+    p.alias = true;
+    p.running = true;
+  }
+  /** Leg 13: each write of the sandbox's local-access lines, as `address names...`; `writeError` makes it fail. */
+  writes: Array<{ id: string; address: string; names: string[] }> = [];
+  writeError?: Error;
+  async writeLocalAccess(ref: { id: string; name: string }, address: string, names: string[]) {
+    this.log(`writeLocalAccess:${ref.name}`);
+    if (this.writeError) throw this.writeError;
+    this.writes.push({ id: ref.id, address, names: [...names] });
+  }
   async createProjectProxy(sandbox: string, project: string, config: ProxyConfig, labels: Record<string, string>, opts: { name?: string } = {}) {
     this.log(`createProjectProxy:${opts.name}`);
     const net = this.nets.get(`${sandbox}-net`);
     if (this.createGate) await this.createGate.promise;
     if (this.createError) throw this.createError;
+    // Two containers cannot hold one address: a proxy still attached to the network refuses the new one.
+    if (this.proxies.some((x) => x.alias && x.netId === net?.id)) throw new Error("Address already in use");
     const name = opts.name ?? `${sandbox}-proxy-${String(++this.proxyN).padStart(8, "0")}`;
     const p: FakeProxy = { id: idOf(name), name, running: true, labels: { [PROJECT_LABEL]: project, ...labels }, netId: net?.id, alias: true, config };
     this.proxies.push(p);
@@ -233,8 +267,10 @@ class FakeLayer implements ContainmentDocker {
   invalidate(f?: { id?: string; sandbox?: string; key?: string }) {
     this.log(`invalidate:${f?.sandbox ?? ""}`);
   }
-  setContainment(hook: ContainmentHook | undefined) {
+  afterStart?: AfterStartHook;
+  setContainment(hook: ContainmentHook | undefined, afterStart?: AfterStartHook) {
     this.hook = hook;
+    this.afterStart = afterStart;
   }
 }
 
@@ -264,6 +300,9 @@ function sandbox(networks: string[], labels: Record<string, string> = { [PROJECT
   layer.sandboxes.set(SANDBOX, { running: true, networks, labels });
   return { id: idOf(SANDBOX), name: SANDBOX, running: true, labels, networks, runtime: undefined };
 }
+
+/** The environment the sandbox's network calls for (leg 13): the proxy's ADDRESS, from the network's subnet. */
+const envNow = () => proxyEnvironment(proxyAddress(layer.nets.get(NET)!.subnet));
 
 const lockFiles = () => fs.readdirSync(dir).filter((n) => n.endsWith(".lock") && n.includes(".proxy-"));
 const lockPath = (key = KEY) => path.join(dir, `registry.json.proxy-${sha(key.toLowerCase()).slice(0, 16)}.lock`);
@@ -315,13 +354,13 @@ describe("the configuration", () => {
     expect(r.warnings.join("\n")).toMatch(/10\.0\.0\.1/);
   });
 
-  it("takes the forwards from local access, refuses one named mcpe-proxy, reads the resolvers and listens on the subnet", async () => {
+  // Leg 13 removed "refuses a forward target named mcpe-proxy": the proxy has no name on the network any more, so nothing collides with it.
+  it("takes the forwards from local access, reads the resolvers and listens on the subnet", async () => {
     const c2 = loadConfig({ MCPE_NETWORK: "contained", MCPE_DATA_DIR: dir, MCPE_LOCAL_ACCESS: "owner/app=db.lan:5432" });
-    c2.network.localAccess["github:owner/app"] = [...c2.network.localAccess["github:owner/app"]!, { host: "mcpe-proxy", port: 9000 }];
     const c = make(registryWith(rec()), c2);
     const r = await c.buildConfig(rec(), net);
     expect(r.config.forwards).toEqual([{ host: "db.lan", port: 5432 }]);
-    expect(r.warnings.join("\n")).toMatch(/mcpe-proxy/);
+    expect(r.warnings).toEqual([]);
     expect(r.config.resolvers).toEqual(["192.0.2.53"]);
     expect(r.config.listenCidr).toBe("172.30.9.0/24");
   });
@@ -396,10 +435,14 @@ describe("the labels", () => {
     expect(proxyVersionOf({ labels: { [VERSION_LABEL]: "1.5" } })).toBe(0);
   });
 
-  it("the proxy environment names mcpe-proxy in both cases and turns on Node's env proxy", () => {
-    const e = proxyEnvironment();
-    expect(e.HTTP_PROXY).toBe("http://mcpe-proxy:3128");
-    expect(e.https_proxy).toBe("http://mcpe-proxy:3128");
+  it("the proxy environment names the proxy by its address in both cases, holds no host name, and turns on Node's env proxy", () => {
+    const e = proxyEnvironment("172.22.255.254");
+    expect(e.HTTP_PROXY).toBe("http://172.22.255.254:3128");
+    expect(e.HTTPS_PROXY).toBe("http://172.22.255.254:3128");
+    expect(e.http_proxy).toBe("http://172.22.255.254:3128");
+    expect(e.https_proxy).toBe("http://172.22.255.254:3128");
+    for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) expect(e[k]).toMatch(/^http:\/\/\d{1,3}(\.\d{1,3}){3}:3128$/);
+    expect(JSON.stringify(e)).not.toMatch(/mcpe-proxy/);
     expect(e.NO_PROXY).toBe("");
     expect(e.no_proxy).toBe("");
     expect(e.NODE_USE_ENV_PROXY).toBe("1");
@@ -418,13 +461,16 @@ describe("replace", () => {
     const r = await make().replace(KEY);
     expect(r.kind).toBe("replaced");
     const order = layer.calls.map((c) => c.split(":")[0]);
+    // Leg 13: the old proxy leaves the network before the new one is made (two containers cannot hold one address).
     expect(order).toEqual([
       "ensureImage",
       "ensureProjectNetwork",
       "listProjectProxies",
       "readUpstreamResolvers",
       "listProjectProxies",
+      "detachProjectProxy",
       "createProjectProxy",
+      "projectProxyAttached",
       "removeProjectProxy",
       "invalidate",
     ]);
@@ -900,7 +946,7 @@ describe("the default-table seam (leg 8)", () => {
     expect(layer.proxies[0]!.config!.allow.map((a) => a.host)).not.toContain("registry.npmjs.org");
     layer.calls = [];
     const env = await c.ensureContained({ id: idOf(SANDBOX), name: SANDBOX, running: true, labels: { [PROJECT_LABEL]: PROJECT }, networks: [NET], runtime: undefined }, "full");
-    expect(env).toEqual(proxyEnvironment());
+    expect(env).toEqual(envNow());
     expect(layer.count("createProjectProxy")).toBe(0);
     expect(layer.count("removeProjectProxy")).toBe(0);
     // Without the seam the same proxy would be stale: a Containment that reads the real table replaces it.
@@ -965,45 +1011,76 @@ describe("the hook", () => {
 
     it("a sandbox that is not the record's (a renamed reinstall's old one) gets the environment only, never the record's configuration", async () => {
       registryWith(rec());
+      layer.nets.set("mcpe-app-old-net", { id: idOf("old-net"), name: "mcpe-app-old-net", subnet: "172.30.7.0/24" });
       const env = await make().ensureContained(facts({ name: "mcpe-app-old", networks: ["mcpe-app-old-net"] }), "full");
-      expect(env).toEqual(proxyEnvironment());
-      expect(layer.calls).toEqual([]);
+      expect(env).toEqual(proxyEnvironment("172.30.7.254"));
+      // Only the network is read (for its subnet): no listing, no registry write, no lock, nothing changed.
+      expect(layer.calls).toEqual(["findProjectNetwork"]);
     });
   });
 
+  // Leg 13: the environment names the proxy by its address, so even a read-only answer needs the network's subnet. It is read
+  // once per network (its id) and then kept: a network's subnet never changes.
   describe("observe mode", () => {
-    it("returns the environment for a contained sandbox and makes no Docker call, listing or registry read", async () => {
+    /** The project network in the layer, with its id in the facts as Docker's inspect gives it. */
+    const withNet = () => {
+      layer.nets.set(NET, { id: idOf("the-net"), name: NET, subnet: "172.30.9.0/24" });
+      return { networkIds: { [NET]: idOf("the-net") } };
+    };
+
+    it("returns the environment for a contained sandbox with one read of its network, no listing, no registry read and no change", async () => {
+      withNet();
       const c = make();
-      expect(await c.ensureContained(facts(), "observe")).toEqual(proxyEnvironment());
+      expect(await c.ensureContained(facts(), "observe")).toEqual(proxyEnvironment("172.30.9.254"));
       expect(await c.ensureContained(facts({ networks: ["bridge"] }), "observe")).toBeUndefined();
       expect(await c.ensureContained(facts({ networks: [] }), "observe")).toBeUndefined();
-      expect(layer.calls).toEqual([]);
+      expect(layer.calls).toEqual(["findProjectNetwork"]);
       expect(lockFiles()).toEqual([]);
     });
 
+    it("reads a network once: later answers for the same network id make no Docker call", async () => {
+      const ids = withNet();
+      const c = make();
+      for (let i = 0; i < 4; i++) expect(await c.ensureContained(facts(ids), "observe")).toEqual(proxyEnvironment("172.30.9.254"));
+      expect(layer.count("findProjectNetwork")).toBe(1);
+      // A different network id is read once more.
+      layer.nets.set(NET, { id: idOf("other-net"), name: NET, subnet: "172.30.10.0/24" });
+      expect(await c.ensureContained(facts({ networkIds: { [NET]: idOf("other-net") } }), "observe")).toEqual(proxyEnvironment("172.30.10.254"));
+      expect(layer.count("findProjectNetwork")).toBe(2);
+    });
+
+    it("gives no environment, and does not fail, when the network cannot be read", async () => {
+      const c = make();
+      expect(await c.ensureContained(facts(), "observe")).toBeUndefined(); // no network in the layer
+      layer.findError = new Error("daemon gone");
+      expect(await c.ensureContained(facts(), "observe")).toBeUndefined();
+    });
+
     it("does not wait for a startup step and ignores a missing or unreadable registry", async () => {
+      withNet();
       fs.writeFileSync(path.join(dir, "registry.json"), "{ not json");
       const c = make();
       c.registerStartup(KEY, new Promise(() => {}));
-      expect(await c.ensureContained(facts(), "observe")).toEqual(proxyEnvironment());
+      expect(await c.ensureContained(facts(), "observe")).toEqual(envNow());
     });
   });
 
   describe("under open", () => {
     it("never waits, never repairs, and returns the environment only when the facts say contained", async () => {
       registryWith(rec());
+      layer.nets.set(NET, { id: idOf("the-net"), name: NET, subnet: "172.30.9.0/24" });
       const c = make(undefined, loadConfig({ MCPE_NETWORK: "open", MCPE_DATA_DIR: dir }));
       c.registerStartup(KEY, new Promise(() => {}));
-      expect(await c.ensureContained(facts(), "full")).toEqual(proxyEnvironment());
+      expect(await c.ensureContained(facts(), "full")).toEqual(envNow());
       expect(await c.ensureContained(facts({ networks: ["bridge"] }), "full")).toBeUndefined();
-      expect(layer.calls).toEqual([]);
+      expect(layer.calls).toEqual(["findProjectNetwork"]);
     });
   });
 
   describe("a contained sandbox, full mode", () => {
     it("with everything in place returns the environment, creates nothing and takes no lock", async () => {
       const c = await contained();
-      expect(await c.ensureContained(facts(), "full")).toEqual(proxyEnvironment());
+      expect(await c.ensureContained(facts(), "full")).toEqual(envNow());
       expect(layer.count("createProjectProxy")).toBe(0);
       expect(layer.calls.map((x) => x.split(":")[0])).toEqual(["findProjectNetwork", "listProjectProxies", "projectProxyAttached", "projectProxyStatus"]);
       expect(lockFiles()).toEqual([]);
@@ -1012,7 +1089,7 @@ describe("the hook", () => {
     it("makes a proxy when there is none, and returns the environment", async () => {
       const c = await contained();
       layer.proxies = [];
-      expect(await c.ensureContained(facts(), "full")).toEqual(proxyEnvironment());
+      expect(await c.ensureContained(facts(), "full")).toEqual(envNow());
       expect(layer.proxies.length).toBe(1);
       expect(lockFiles()).toEqual([]);
     });
@@ -1054,7 +1131,7 @@ describe("the hook", () => {
       const c = await contained();
       layer.proxies[0]!.labels[VERSION_LABEL] = "5";
       layer.proxies[0]!.labels[RECORD_LABEL] = "whatever";
-      expect(await c.ensureContained(facts(), "full")).toEqual(proxyEnvironment());
+      expect(await c.ensureContained(facts(), "full")).toEqual(envNow());
       expect(layer.count("createProjectProxy")).toBe(0);
       expect(layer.count("removeProjectProxy")).toBe(0);
     });
@@ -1117,8 +1194,8 @@ describe("the hook", () => {
       const c = await contained();
       layer.proxies = [];
       const [a, b] = await Promise.all([c.ensureContained(facts(), "full"), c.ensureContained(facts(), "full")]);
-      expect(a).toEqual(proxyEnvironment());
-      expect(b).toEqual(proxyEnvironment());
+      expect(a).toEqual(envNow());
+      expect(b).toEqual(envNow());
       expect(layer.proxies.length).toBe(1);
       expect(layer.count("createProjectProxy")).toBe(1);
       expect(lockFiles()).toEqual([]);
@@ -1177,7 +1254,7 @@ describe("the hook", () => {
       expect(settled).toBe(false);
       expect(layer.calls).toEqual([]);
       gate.resolve();
-      expect(await p).toEqual(proxyEnvironment());
+      expect(await p).toEqual(envNow());
       expect(layer.sandboxes.get(SANDBOX)!.networks).toEqual([NET]);
       expect(layer.count("inspectSandbox")).toBe(1);
     });
@@ -1202,9 +1279,10 @@ describe("the hook", () => {
       await expect(c.ensureContained(facts(), "full")).rejects.toThrow(/could not contain it/);
       await expect(c.ensureContained(facts(), "full")).rejects.toBeInstanceOf(ContainmentStartupError);
       // Observe mode (cleanup) is never refused.
-      expect(await c.ensureContained(facts(), "observe")).toEqual(proxyEnvironment());
+      layer.nets.set(NET, { id: idOf("the-net"), name: NET, subnet: "172.30.9.0/24" });
+      expect(await c.ensureContained(facts(), "observe")).toEqual(envNow());
       expect((await c.replace(KEY)).kind).toBe("replaced");
-      expect(await c.ensureContained(facts(), "full")).toEqual(proxyEnvironment());
+      expect(await c.ensureContained(facts(), "full")).toEqual(envNow());
     });
 
     it("registering a promise attaches a no-op catch at once: a rejection nobody waits for is not unhandled", async () => {
@@ -1225,6 +1303,294 @@ describe("the hook", () => {
       const c = make();
       c.registerStartup("github:Owner/App", Promise.reject(new Error("x")));
       await expect(c.waitFor("GITHUB:owner/app")).rejects.toBeInstanceOf(ContainmentStartupError);
+    });
+  });
+});
+
+describe("replacement by address (leg 13)", () => {
+  const stale = () => {
+    layer.proxies[0]!.labels[RECORD_LABEL] = "stale";
+  };
+  const sandboxFacts = (): SandboxInspectFacts => ({ id: idOf(SANDBOX), name: SANDBOX, running: true, labels: { [PROJECT_LABEL]: PROJECT }, networks: [NET], runtime: undefined });
+  const names = (): string[] => layer.calls.filter((c) => /^(detach|restore|createProject|removeProject)/.test(c)).map((c) => c.split(":")[0]!);
+
+  it("takes the old proxy off the network, creates the new one at the address, checks it, and only then removes the old one", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make().replace(KEY);
+    stale();
+    layer.calls = [];
+    const r = await make().replace(KEY);
+    expect(r.kind).toBe("replaced");
+    // The fake refuses a second proxy on the network while one is attached (one address): so this order is the only one that works.
+    expect(names()).toEqual(["detachProjectProxy", "createProjectProxy", "removeProjectProxy"]);
+    expect(layer.calls.indexOf("projectProxyAttached")).toBeGreaterThan(layer.calls.findIndex((c) => c.startsWith("createProjectProxy")));
+    expect(layer.proxies.length).toBe(1);
+    expect(layer.proxies[0]!.alias).toBe(true);
+  });
+
+  it("takes EVERY current proxy off the network, then removes them all", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make().replace(KEY);
+    const net = layer.nets.get(NET)!;
+    layer.proxies.push({ id: idOf("extra"), name: `${SANDBOX}-proxy-ffffffff`, running: true, labels: { [PROJECT_LABEL]: PROJECT }, netId: net.id, alias: true });
+    layer.calls = [];
+    expect((await make().replace(KEY)).kind).toBe("replaced");
+    expect(names()).toEqual(["detachProjectProxy", "detachProjectProxy", "createProjectProxy", "removeProjectProxy", "removeProjectProxy"]);
+    expect(layer.proxies.length).toBe(1);
+  });
+
+  it("a failed readiness removes the new proxy by name, then puts the old one back at the address", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make().replace(KEY);
+    const old = layer.proxies[0]!;
+    stale();
+    layer.calls = [];
+    layer.createError = new Error("proxy never became ready");
+    await expect(make().replace(KEY)).rejects.toThrow(/never became ready/);
+    const order = layer.calls.map((c) => c.split(":")[0]);
+    expect(order.indexOf("removeProjectProxyNamed")).toBeGreaterThan(order.indexOf("createProjectProxy"));
+    expect(order.indexOf("restoreProjectProxy")).toBeGreaterThan(order.indexOf("removeProjectProxyNamed"));
+    expect(layer.count("removeProjectProxy")).toBe(0); // the old proxy was never removed
+    expect(layer.proxies.map((p) => p.id)).toEqual([old.id]);
+    expect(old.alias).toBe(true); // old reconnected
+    expect(lockFiles()).toEqual([]);
+  });
+
+  it("a new proxy that is not attached at the address is rolled back too, and the old one is put back", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make().replace(KEY);
+    const old = layer.proxies[0]!;
+    stale();
+    const real = layer.projectProxyAttached.bind(layer);
+    let lied = false;
+    layer.projectProxyAttached = async (id: string, net: { id: string }) => {
+      if (id !== old.id && !lied) {
+        lied = true;
+        return false;
+      }
+      return real(id, net);
+    };
+    await expect(make().replace(KEY)).rejects.toThrow(/not attached/);
+    expect(layer.proxies.map((p) => p.id)).toEqual([old.id]);
+    expect(old.alias).toBe(true);
+    expect(layer.count("removeProjectProxy")).toBe(0);
+  });
+
+  it("when the old proxy cannot be put back either, the project has no proxy: the next use repairs it", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    const lines: string[] = [];
+    const c = new Containment(cfg, new Registry(dir), layer, { dataDir: dir, clock, log: (l) => lines.push(l) });
+    await c.replace(KEY);
+    stale();
+    layer.createError = new Error("proxy never became ready");
+    layer.restoreError = new Error("Address already in use");
+    await expect(c.replace(KEY)).rejects.toThrow(/never became ready/);
+    expect(lines.join("\n")).toMatch(/no proxy now/);
+    // No attached proxy is left: the detached old one stands, off the network, and the sandbox has no route.
+    expect(layer.proxies.every((p) => !p.alias)).toBe(true);
+    // The next use of the sandbox finds that and replaces it.
+    layer.createError = undefined;
+    layer.restoreError = undefined;
+    const env = await c.ensureContained(sandboxFacts(), "full");
+    expect(env).toEqual(envNow());
+    expect(layer.proxies.length).toBe(1);
+    expect(layer.proxies[0]!.alias).toBe(true);
+  });
+
+  it("a lock that was taken over puts nothing back (someone else may be replacing it now)", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make().replace(KEY);
+    stale();
+    layer.calls = [];
+    layer.afterCreate = () => fs.writeFileSync(lockPath(), "thief:token");
+    await expect(make().replace(KEY)).rejects.toBeInstanceOf(ContainmentLockLostError);
+    expect(layer.count("removeProjectProxyNamed")).toBe(1);
+    expect(layer.count("restoreProjectProxy")).toBe(0);
+  });
+
+  it("only one of two old proxies is put back: they share the address", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make().replace(KEY);
+    const net = layer.nets.get(NET)!;
+    layer.proxies.push({ id: idOf("extra"), name: `${SANDBOX}-proxy-ffffffff`, running: true, labels: { [PROJECT_LABEL]: PROJECT }, netId: net.id, alias: true });
+    layer.createError = new Error("no");
+    await expect(make().replace(KEY)).rejects.toThrow(/no/);
+    expect(layer.count("restoreProjectProxy")).toBe(1);
+    expect(layer.proxies.filter((p) => p.alias).length).toBe(1);
+  });
+
+  it("a proxy on the network but not attached at the address is replaced when the sandbox is used", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    const c = make();
+    await c.replace(KEY);
+    layer.proxies[0]!.alias = false;
+    layer.calls = [];
+    expect(await c.ensureContained(sandboxFacts(), "full")).toEqual(envNow());
+    expect(layer.count("createProjectProxy")).toBe(1);
+    expect(layer.proxies.length).toBe(1);
+  });
+});
+
+describe("local access names in the sandbox's /etc/hosts (leg 13)", () => {
+  const FWD = "owner/app=db.lan:5432,host.docker.internal:8080";
+  const withForwards = (extra = "") => loadConfig({ MCPE_NETWORK: "contained", MCPE_DATA_DIR: dir, MCPE_LOCAL_ACCESS: `${FWD}${extra}` });
+  const sfacts = (over: Partial<SandboxInspectFacts> = {}): SandboxInspectFacts => ({
+    id: idOf(SANDBOX), name: SANDBOX, running: true, labels: { [PROJECT_LABEL]: PROJECT }, networks: [NET], runtime: undefined, ...over,
+  });
+  const address = () => proxyAddress(layer.nets.get(NET)!.subnet);
+
+  it("a replacement that makes a proxy writes the names once, at the proxy's address", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make(undefined, withForwards()).replace(KEY);
+    expect(layer.writes).toEqual([{ id: idOf(SANDBOX), address: address(), names: ["db.lan", "host.docker.internal"] }]);
+  });
+
+  it("a replacement that changes nothing writes nothing, and a project with no forwards is never written to", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    const c = make(undefined, withForwards());
+    await c.replace(KEY);
+    layer.writes = [];
+    expect((await c.replace(KEY)).kind).toBe("unchanged");
+    expect(layer.writes).toEqual([]);
+  });
+
+  it("a project with no forwards is never written to, however often its proxy is replaced", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    const plain = make();
+    await plain.replace(KEY);
+    layer.proxies[0]!.labels[RECORD_LABEL] = "stale"; // a hosts-only change
+    await plain.replace(KEY, { force: true });
+    expect(layer.calls.some((x) => x.startsWith("writeLocalAccess"))).toBe(false);
+  });
+
+  it("when the forwards become empty the lines are taken out (a write with no names)", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make(undefined, withForwards()).replace(KEY);
+    layer.writes = [];
+    await make().replace(KEY, { compareSession: true }); // the session label differs: the proxy is replaced
+    expect(layer.writes).toEqual([{ id: idOf(SANDBOX), address: address(), names: [] }]);
+  });
+
+  it("a build has no forwards, so none are written", async () => {
+    registryWith(rec({ status: "installing" }));
+    sandbox([NET]);
+    await make(undefined, withForwards()).replace(KEY);
+    expect(layer.writes).toEqual([]);
+  });
+
+  it("contain writes the names to a sandbox that was already running, after it is on its network", async () => {
+    registryWith(rec());
+    sandbox(["bridge"]);
+    const r = await make(undefined, withForwards()).contain(KEY);
+    expect(r.ok).toBe(true);
+    expect(layer.writes.length).toBeGreaterThanOrEqual(1);
+    expect(layer.writes.at(-1)).toEqual({ id: idOf(SANDBOX), address: address(), names: ["db.lan", "host.docker.internal"] });
+    expect(layer.calls.lastIndexOf("setNetwork:contained")).toBeLessThan(layer.calls.findIndex((x) => x.startsWith("writeLocalAccess")));
+  });
+
+  it("a write that fails is logged and never fails the replacement", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    const lines: string[] = [];
+    layer.writeError = new Error("exec failed");
+    const c = new Containment(withForwards(), new Registry(dir), layer, { dataDir: dir, clock, log: (l) => lines.push(l) });
+    expect((await c.replace(KEY)).kind).toBe("replaced");
+    expect(lines.join("\n")).toMatch(/could not write the local-access names.*exec failed/);
+  });
+
+  describe("the post-start step", () => {
+    it("is installed with the hook", () => {
+      make().install();
+      expect(layer.afterStart).toBeTypeOf("function");
+    });
+
+    it("writes the names after a start, at the address read from the network", async () => {
+      registryWith(rec());
+      sandbox([NET]);
+      const c = make(undefined, withForwards());
+      await c.replace(KEY);
+      layer.writes = [];
+      layer.calls = [];
+      await c.afterStart(sfacts(), true);
+      expect(layer.writes).toEqual([{ id: idOf(SANDBOX), address: address(), names: ["db.lan", "host.docker.internal"] }]);
+    });
+
+    it("also checks a sandbox that was already running (started: false): the same idempotent write", async () => {
+      registryWith(rec());
+      sandbox([NET]);
+      const c = make(undefined, withForwards());
+      await c.replace(KEY);
+      layer.writes = [];
+      await c.afterStart(sfacts(), false);
+      await c.afterStart(sfacts(), false);
+      expect(layer.writes.length).toBe(2); // the write is idempotent inside the sandbox; no state is kept here
+      expect(layer.writes[0]).toEqual(layer.writes[1]);
+    });
+
+    it("is skipped entirely for a project with no forwards: no call, no registry read", async () => {
+      registryWith(rec());
+      sandbox([NET]);
+      layer.calls = [];
+      await make().afterStart(sfacts(), true);
+      expect(layer.calls).toEqual([]);
+    });
+
+    it.each([
+      ["a sandbox that is not contained", { networks: ["bridge"] }],
+      ["a sandbox with no project label", { labels: {} }],
+      ["a sandbox that is not the record's", { name: "mcpe-app-old", networks: ["mcpe-app-old-net"] }],
+    ])("does nothing for %s", async (_n, over) => {
+      registryWith(rec());
+      sandbox([NET]);
+      layer.nets.set("mcpe-app-old-net", { id: idOf("old"), name: "mcpe-app-old-net", subnet: "172.30.7.0/24" });
+      await make(undefined, withForwards()).afterStart(sfacts(over), true);
+      expect(layer.writes).toEqual([]);
+    });
+
+    it("does nothing when the session does not contain", async () => {
+      registryWith(rec());
+      sandbox([NET]);
+      const open = loadConfig({ MCPE_NETWORK: "open", MCPE_DATA_DIR: dir, MCPE_LOCAL_ACCESS: FWD });
+      await make(undefined, open).afterStart(sfacts(), true);
+      expect(layer.writes).toEqual([]);
+    });
+
+    it("reads a network's subnet once (by id) across many starts", async () => {
+      registryWith(rec());
+      sandbox([NET]);
+      const c = make(undefined, withForwards());
+      await c.replace(KEY);
+      layer.calls = [];
+      const ids = { [NET]: layer.nets.get(NET)!.id };
+      for (let i = 0; i < 3; i++) await c.afterStart(sfacts({ networkIds: ids }), true);
+      expect(layer.count("findProjectNetwork")).toBe(0); // the replacement had already read it
+      const fresh = make(undefined, withForwards());
+      layer.calls = [];
+      for (let i = 0; i < 3; i++) await fresh.afterStart(sfacts({ networkIds: ids }), true);
+      expect(layer.count("findProjectNetwork")).toBe(1);
+    });
+
+    it("never throws: a failed write is logged", async () => {
+      registryWith(rec());
+      sandbox([NET]);
+      const lines: string[] = [];
+      const c = new Containment(withForwards(), new Registry(dir), layer, { dataDir: dir, clock, log: (l) => lines.push(l) });
+      await c.replace(KEY);
+      layer.writeError = new Error("exec failed");
+      await expect(c.afterStart(sfacts(), true)).resolves.toBeUndefined();
+      expect(lines.join("\n")).toMatch(/exec failed/);
     });
   });
 });

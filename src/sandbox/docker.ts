@@ -419,6 +419,8 @@ export interface SandboxInspectFacts {
   running: boolean;
   labels: Record<string, string> | null;
   networks: string[];
+  /** The id of each network the sandbox is on, by name; absent when the answer did not carry them (a scripted double). */
+  networkIds?: Record<string, string>;
   runtime: string | undefined;
 }
 
@@ -439,6 +441,14 @@ export type ContainmentHookMode = "full" | "observe";
  * primitives that do not pass through the hook itself (a test counts the entries).
  */
 export type ContainmentHook = (facts: SandboxInspectFacts, mode: ContainmentHookMode) => Promise<Record<string, string> | undefined>;
+
+/**
+ * The post-start step (leg 13): called after a sandbox is running, with its facts and whether Docker started it just
+ * now (`started`) or it was already running. It writes the sandbox's local-access names into its `/etc/hosts`, which
+ * Docker rewrites on every start. It must never throw (a failure is logged by the step itself), and it may use only
+ * primitives that do not pass through the hook.
+ */
+export type AfterStartHook = (facts: SandboxInspectFacts, started: boolean) => Promise<void>;
 
 /** A fresh name for a project's proxy: `<sandbox name>-proxy-<8 hex>`. */
 export function newProjectProxyName(sandbox: string): string {
@@ -603,8 +613,67 @@ const EXTRA_CAPS: readonly string[] = ["CHOWN", "FOWNER", "DAC_OVERRIDE", "FSETI
 const ONESHOT_NET_ROLE = "oneshot-net";
 /** What the message of a refused network says a Docker needs. No number until one has been measured (leg 4 measured 29.4.2 and 29.8.2 as working, no lower bound). */
 const ISOLATED_BRIDGE_NEEDS = "a Docker version whose bridge driver supports gateway_mode_ipv4=isolated";
-/** The proxy's name on the contained network: what `HTTP_PROXY` names. */
-const PROXY_ALIAS = "mcpe-proxy";
+/**
+ * The proxy's address on a contained network: the last usable host address of its IPv4 subnet (for `172.22.0.0/16`,
+ * `172.22.255.254`), never the broadcast address. Contained containers reach the proxy at this address and not by a
+ * name, because a name needs Docker's embedded DNS, which gVisor's network stack cannot reach. The networks are made
+ * with an `--ip-range` in their lower half, so the daemon never hands this address out. Pure. A `/31`, a `/32` and
+ * anything that is not an IPv4 CIDR have no such address and are refused.
+ */
+export function proxyAddress(subnet: string): string {
+  const { base, prefix } = parseSubnet(subnet);
+  return dotted(base + 2 ** (32 - prefix) - 2);
+}
+
+function parseSubnet(subnet: string): { base: number; prefix: number } {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/.exec(subnet);
+  if (!m) throw new Error(`Not an IPv4 subnet: ${oneLine(subnet, 80)}`);
+  const octets = m.slice(1, 5).map(Number);
+  if (octets.some((o) => o > 255)) throw new Error(`Not an IPv4 subnet: ${oneLine(subnet, 80)}`);
+  const prefix = Number(m[5]);
+  if (prefix < 1 || prefix > 30) throw new Error(`The subnet ${oneLine(subnet, 80)} has no room for a proxy address (it needs a prefix of /1 to /30)`);
+  const ip = ((octets[0]! << 24) >>> 0) + (octets[1]! << 16) + (octets[2]! << 8) + octets[3]!;
+  const mask = (0xffffffff << (32 - prefix)) >>> 0;
+  return { base: (ip & mask) >>> 0, prefix };
+}
+
+const dotted = (n: number): string => [n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join(".");
+
+/** The lower half of a subnet, as the `--ip-range` a contained network is made with (`172.22.0.0/16` gives `172.22.0.0/17`). */
+function lowerHalf(subnet: string): string {
+  const { base, prefix } = parseSubnet(subnet);
+  return `${dotted(base)}/${prefix + 1}`;
+}
+
+/** `{ networkIds }` from an inspect's `NetworkSettings.Networks`: the full ids it carries, by network name; nothing when it carries none. */
+function networkIdsOf(networks: unknown): { networkIds?: Record<string, string> } {
+  if (networks === null || typeof networks !== "object" || Array.isArray(networks)) return {};
+  const ids: Record<string, string> = {};
+  for (const [name, v] of Object.entries(networks as Record<string, unknown>)) {
+    const id = v !== null && typeof v === "object" ? (v as { NetworkID?: unknown }).NetworkID : undefined;
+    if (typeof id === "string" && FULL_ID.test(id)) ids[name] = id;
+  }
+  return Object.keys(ids).length > 0 ? { networkIds: ids } : {};
+}
+
+/** The marker that ends each line mcp-everything writes into a sandbox's `/etc/hosts`. */
+export const LOCAL_ACCESS_MARK = "# mcpe-local-access";
+/**
+ * The script a root `docker exec` runs to put the local-access lines into `/etc/hosts` (`sh -c SCRIPT sh <lines> <file>`).
+ * Idempotent: it does nothing when the marked lines are already the wanted ones. Otherwise it builds the new content
+ * (every line that is not marked, then the wanted lines) and writes it with ONE `printf` redirected into the file:
+ * no `sed -i` and no `mv`, because `/etc/hosts` is a bind mount that cannot be replaced.
+ */
+export const LOCAL_ACCESS_SCRIPT = [
+  `want="$1"; file="$2"`,
+  `have=$(grep '${LOCAL_ACCESS_MARK}$' "$file")`,
+  `[ "$have" = "$want" ] && exit 0`,
+  `keep=$(grep -v '${LOCAL_ACCESS_MARK}$' "$file")`,
+  `if [ -n "$want" ]; then printf '%s\\n%s\\n' "$keep" "$want"; else printf '%s\\n' "$keep"; fi > "$file"`,
+].join("\n");
+/** Names a forward target may not take in a sandbox's `/etc/hosts`: the sandbox's own (its hostname is `sandbox`). */
+const OWN_HOST_NAMES = new Set(["localhost", "sandbox", "ip6-localhost", "ip6-loopback", "ip6-localnet", "ip6-mcastprefix", "ip6-allnodes", "ip6-allrouters"]);
+const HOSTS_NAME = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/;
 /** The roles of a project's network and proxies, and the label that names the sandbox they belong to. */
 const PROJECT_NET_ROLE = "project-net";
 const PROJECT_PROXY_ROLE = "project-proxy";
@@ -613,6 +682,10 @@ const RESERVED_LABELS = new Set(["mcp-everything", OWNER_LABEL, ROLE_LABEL, PROJ
 const NETWORK_FORMAT =
   '{"id":{{json .Id}},"name":{{json .Name}},"internal":{{json .Internal}},"ipv6":{{json .EnableIPv6}},"ipam":{{json .IPAM.Config}},"labels":{{json .Labels}},"created":{{json .Created}}}';
 const POOLS_EXHAUSTED = /all predefined address pools have been fully subnetted/i;
+/** Docker's refusal of a subnet that overlaps one in use: another network took it between the probe and the real create. */
+const POOL_OVERLAPS = /pool overlaps/i;
+/** How many times a network create is retried, with a fresh probe, when its subnet overlaps. */
+const POOL_RETRIES = 3;
 
 /** What a one-shot container is for; the label and the name carry it, and nothing a caller types. */
 export type OneShotRole = (typeof ONE_SHOT_ROLES)[number];
@@ -762,6 +835,8 @@ interface ContainerFacts {
   name?: string;
   running: boolean;
   networks: string[];
+  /** The id of each network by name (NetworkSettings.Networks[name].NetworkID), for the entries that carry one. */
+  networkIds?: Record<string, string>;
   labels: Record<string, string> | null;
   /** HostConfig.Runtime; absent, null or empty when the daemon (or a test double) does not say. */
   runtime?: string;
@@ -785,6 +860,8 @@ export class Docker {
   protected proxyReadiness = { budgetMs: 10_000, pollMs: 250 };
   /** The containment hook, once `setContainment` installed one. With none, every method behaves as it did before leg 7. */
   private hook: ContainmentHook | undefined;
+  /** The post-start step, installed with the hook. */
+  private afterStartHook: AfterStartHook | undefined;
   /** The hook's answers for execs by reference on a running sandbox, by container id (see `hookedExecEnv`). */
   private hookCache = new Map<string, { env: Record<string, string> | undefined; expires: number; name: string; key: string | undefined }>();
   /** Bumped by every invalidation: a hook answer that was in flight across one is not cached. */
@@ -796,6 +873,8 @@ export class Docker {
     private readonly cfg: Config,
     /** The installation id: it is in the name and the owner label of every sandbox this layer creates. */
     readonly installationId: string,
+    /** Where startup warnings go (the runtime check's); nowhere by default. */
+    private readonly log: (line: string) => void = () => {},
   ) {
     if (!isInstallationId(installationId)) {
       throw new Error(`The installation id must be eight lowercase hexadecimal characters, got ${JSON.stringify(installationId)}.`);
@@ -820,9 +899,20 @@ export class Docker {
    * Install (or, with undefined, remove) the containment hook. Every sandbox start and exec of this class passes
    * through it (`acquire`, `ensureRunning`, the restart inside `exec`, and `exec` itself); nothing else does.
    */
-  setContainment(hook: ContainmentHook | undefined): void {
+  setContainment(hook: ContainmentHook | undefined, afterStart?: AfterStartHook): void {
     this.hook = hook;
+    this.afterStartHook = hook ? afterStart : undefined;
     this.invalidate();
+  }
+
+  /** The post-start step for a sandbox that is running now (see `AfterStartHook`); nothing without one. */
+  private async afterStarted(c: ContainerFacts, label: string, started: boolean): Promise<void> {
+    const step = this.afterStartHook;
+    if (!step) return;
+    await step(
+      { id: c.id, name: c.name ?? label, running: true, labels: c.labels, networks: [...c.networks], ...(c.networkIds ? { networkIds: { ...c.networkIds } } : {}), runtime: c.runtime },
+      started,
+    );
   }
 
   /**
@@ -850,7 +940,10 @@ export class Docker {
     if (!hook) return undefined;
     const name = c.name ?? label;
     const generation = this.hookGeneration;
-    const env = await hook({ id: c.id, name, running: c.running, labels: c.labels, networks: [...c.networks], runtime: c.runtime }, mode);
+    const env = await hook(
+      { id: c.id, name, running: c.running, labels: c.labels, networks: [...c.networks], ...(c.networkIds ? { networkIds: { ...c.networkIds } } : {}), runtime: c.runtime },
+      mode,
+    );
     if (cache && c.running && generation === this.hookGeneration) {
       this.hookCache.set(c.id, { env, expires: this.clock() + this.hookTtlMs, name, key: c.labels?.[PROJECT_LABEL]?.toLowerCase() });
     }
@@ -934,6 +1027,7 @@ export class Docker {
       ...(typeof nm === "string" && nm !== "" ? { name: nm.replace(/^\//, "") } : {}),
       running: o.running,
       networks: Object.keys(o.networks ?? {}),
+      ...networkIdsOf(o.networks),
       labels: withLabels ? ((o.labels as Record<string, string> | null) ?? null) : null,
       ...(typeof rt === "string" && rt !== "" ? { runtime: rt } : {}),
     };
@@ -998,6 +1092,18 @@ export class Docker {
     if (typeof listed.default === "string" && listed.default !== "") this.daemonDefaultRuntime = listed.default;
     if (!Object.prototype.hasOwnProperty.call(listed.runtimes, name)) {
       throw new RuntimeUnavailableError(name, `Docker lists no runtime called ${oneLine(name, 100)}`);
+    }
+    if (name === "runsc") {
+      // gVisor's default root-filesystem overlay discards writes outside volumes when a sandbox exits, and a build lives
+      // in the container's layer: an idle-stopped sandbox would lose its tools. A warning, not a refusal: the registration is the operator's.
+      const entry = (listed.runtimes as Record<string, { runtimeArgs?: unknown } | null>)[name];
+      const args = Array.isArray(entry?.runtimeArgs) ? (entry.runtimeArgs as unknown[]) : [];
+      if (!args.some((a) => typeof a === "string" && /^-{1,2}overlay2=none$/.test(a))) {
+        this.log(
+          "warning: the runtime runsc is not registered with --overlay2=none; a sandbox that idles out can lose what was built in it. " +
+            "Register it with: runsc install -- --overlay2=none",
+        );
+      }
     }
     try {
       await this.ensureImage(this.cfg.docker.probeImage);
@@ -1288,6 +1394,69 @@ export class Docker {
     }
   }
 
+  /** The error for a `network create` that failed: pools used up have their own advice. */
+  private networkCreateFailure(created: RunResult): ContainmentUnavailableError {
+    const line = created.stderr.split("\n").map((l) => l.trim()).filter((l) => l !== "").at(-1) ?? "";
+    if (POOLS_EXHAUSTED.test(created.stderr)) {
+      return new ContainmentUnavailableError(
+        "Could not create the contained network: all of Docker's predefined address pools are used up. " +
+          "Remove unused networks or give Docker more room with default-address-pools in its daemon configuration.",
+      );
+    }
+    return new ContainmentUnavailableError(`Could not create the contained network: ${oneLine(line, 200) || "docker network create failed"}`);
+  }
+
+  /**
+   * The subnet the daemon would give a new contained network: a throwaway network made without `--subnet` (labelled as a
+   * one-shot network, so the sweep removes one that is leaked), read and removed at once. Throws like a network create
+   * does, and when the subnet is too small to hold the proxy's address.
+   */
+  private async probeSubnet(): Promise<string> {
+    const name = `${this.cfg.docker.namePrefix}${this.installationId}-${ONESHOT_NET_ROLE}-${randomBytes(4).toString("hex")}`;
+    const made = await this.docker(
+      [
+        "network", "create", "--internal",
+        "-o", "com.docker.network.bridge.gateway_mode_ipv4=isolated",
+        "--ipv6=false",
+        "--label", `${OWNER_LABEL}=${this.installationId}`,
+        "--label", `${ROLE_LABEL}=${ONESHOT_NET_ROLE}`,
+        name,
+      ],
+      { timeoutMs: 60_000 },
+    );
+    if (made.timedOut) {
+      await this.dropNetwork(name);
+      throw new DockerUnavailableError("Could not create the contained network: docker network create timed out");
+    }
+    if (made.code !== 0) throw this.networkCreateFailure(made);
+    const id = made.stdout.trim();
+    if (!FULL_ID.test(id)) {
+      await this.dropNetwork(name);
+      throw new DockerUnavailableError(`Could not create the contained network: Docker printed no usable id: ${oneLine(id, 80) || "(nothing)"}`);
+    }
+    let res: RunResult;
+    try {
+      res = await this.ask(networkInspectArgs(id), 30_000);
+    } catch (e) {
+      await this.dropNetwork(id);
+      throw e;
+    }
+    await this.dropNetwork(id);
+    const check = this.checkContainedNetwork(res, { id, role: ONESHOT_NET_ROLE });
+    if (check.kind !== "ok") {
+      if (check.kind === "unreadable") throw this.unreadable("the probe network", res.code !== 0 || res.timedOut || res.truncated ? res : { ...res, code: 0 });
+      throw new ContainmentUnavailableError(
+        `Docker made a network that is not contained (${check.kind === "foreign" ? "it is not labelled as asked" : check.problem}); containment needs ${ISOLATED_BRIDGE_NEEDS}. The network was removed.`,
+      );
+    }
+    try {
+      proxyAddress(check.subnet);
+    } catch {
+      throw new ContainmentUnavailableError(`Docker's address pools give subnets too small to hold the proxy (${oneLine(check.subnet, 40)}); give Docker larger pools with default-address-pools.`);
+    }
+    return check.subnet;
+  }
+
   /**
    * Make the network, or (for a name the caller fixed) adopt the one that is there when a create failed or timed out
    * and the network is ours and passes the check. With a fixed name nothing is ever removed by name: that could
@@ -1297,19 +1466,30 @@ export class Docker {
     const fixed = opts.name !== undefined;
     const name = opts.name ?? `${this.cfg.docker.namePrefix}${this.installationId}-${opts.role}-${randomBytes(4).toString("hex")}`;
     const expect = { role: opts.role, project: opts.project, sandbox: opts.sandbox };
-    const created = await this.docker(
-      [
-        "network", "create", "--internal",
-        "-o", "com.docker.network.bridge.gateway_mode_ipv4=isolated",
-        "--ipv6=false",
-        "--label", `${OWNER_LABEL}=${this.installationId}`,
-        "--label", `${ROLE_LABEL}=${opts.role}`,
-        ...(opts.project !== undefined ? ["--label", `${PROJECT_LABEL}=${opts.project}`] : []),
-        ...(opts.sandbox !== undefined ? ["--label", `${SANDBOX_LABEL}=${opts.sandbox}`] : []),
-        name,
-      ],
-      { timeoutMs: 60_000 },
-    );
+    // Probe, then pin: the daemon's own pools choose a subnet (a throwaway network says which), and the real network is
+    // made with that subnet and an `--ip-range` in its lower half, so that the proxy's address (the last usable host,
+    // outside the range) is never handed out. Another network may take the subnet in between: then a fresh probe.
+    let created: RunResult;
+    for (let attempt = 0; ; attempt++) {
+      const subnet = await this.probeSubnet();
+      created = await this.docker(
+        [
+          "network", "create", "--internal",
+          "-o", "com.docker.network.bridge.gateway_mode_ipv4=isolated",
+          "--ipv6=false",
+          "--subnet", subnet,
+          "--ip-range", lowerHalf(subnet),
+          "--label", `${OWNER_LABEL}=${this.installationId}`,
+          "--label", `${ROLE_LABEL}=${opts.role}`,
+          ...(opts.project !== undefined ? ["--label", `${PROJECT_LABEL}=${opts.project}`] : []),
+          ...(opts.sandbox !== undefined ? ["--label", `${SANDBOX_LABEL}=${opts.sandbox}`] : []),
+          name,
+        ],
+        { timeoutMs: 60_000 },
+      );
+      if (created.code !== 0 && !created.timedOut && POOL_OVERLAPS.test(created.stderr) && attempt < POOL_RETRIES) continue;
+      break;
+    }
     if (created.timedOut) {
       if (fixed) {
         const adopted = await this.findContainedNetwork(name, expect);
@@ -1326,14 +1506,7 @@ export class Docker {
         const adopted = await this.findContainedNetwork(name, expect);
         if (adopted) return { net: adopted, created: false };
       }
-      const line = created.stderr.split("\n").map((l) => l.trim()).filter((l) => l !== "").at(-1) ?? "";
-      if (POOLS_EXHAUSTED.test(created.stderr)) {
-        throw new ContainmentUnavailableError(
-          "Could not create the contained network: all of Docker's predefined address pools are used up. " +
-            "Remove unused networks or give Docker more room with default-address-pools in its daemon configuration.",
-        );
-      }
-      throw new ContainmentUnavailableError(`Could not create the contained network: ${oneLine(line, 200) || "docker network create failed"}`);
+      throw this.networkCreateFailure(created);
     }
     const id = created.stdout.trim();
     if (!FULL_ID.test(id)) {
@@ -1382,10 +1555,12 @@ export class Docker {
   }
 
   /**
-   * Whether a container, given by the full id `listProjectProxies` returned, is on the given network under the alias
-   * `mcpe-proxy` (one read-only inspect of its networks; it changes nothing). False when it is gone or not so attached.
+   * Whether a container, given by the full id `listProjectProxies` returned, is on the given network at the proxy's
+   * address (`proxyAddress` of the subnet): the CONFIGURED address, `IPAMConfig.IPv4Address`, which is readable while the
+   * container is stopped, not the one it is running with. One read-only inspect; it changes nothing. False when it is
+   * gone or not so attached.
    */
-  async projectProxyAttached(id: string, net: { id: string; name: string }): Promise<boolean> {
+  async projectProxyAttached(id: string, net: { id: string; name: string; subnet: string }): Promise<boolean> {
     if (!FULL_ID.test(id)) throw new Error("A proxy is named by its full id");
     const res = await this.ask(["inspect", "--type", "container", "--format", "{{json .NetworkSettings.Networks}}", id], 30_000);
     if (this.isNotThere(res)) return false;
@@ -1397,9 +1572,67 @@ export class Docker {
       throw this.unreadable("the networks of a project proxy", { ...res, code: 0 });
     }
     if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
-    const entry = (v as Record<string, { NetworkID?: unknown; Aliases?: unknown } | null>)[net.name];
+    const entry = (v as Record<string, { NetworkID?: unknown; IPAMConfig?: { IPv4Address?: unknown } | null } | null>)[net.name];
     if (entry === null || entry === undefined || typeof entry !== "object") return false;
-    return entry.NetworkID === net.id && Array.isArray(entry.Aliases) && entry.Aliases.includes(PROXY_ALIAS);
+    return entry.NetworkID === net.id && entry.IPAMConfig?.IPv4Address === proxyAddress(net.subnet);
+  }
+
+  /**
+   * Take a project's proxy off the project network (replacement's first step: two containers cannot hold one address).
+   * Classified first: this installation's, role `project-proxy`. `network disconnect -f` by network id; a proxy that is
+   * gone, or not on the network, is success. The proxy keeps running on `bridge`; with no proxy on its network the
+   * sandbox has no route, which fails closed.
+   */
+  async detachProjectProxy(id: string, net: { id: string }): Promise<void> {
+    const p = await this.checkedProxy(id);
+    if (!p) return;
+    await this.disconnectForce(net.id, p.id, p.name);
+  }
+
+  /**
+   * Put a project's proxy back at its address after a failed replacement: stop it, `network connect --ip <address>`, start it,
+   * wait until it is ready, and check that it is attached at the address. Stopped first because connecting a running
+   * container to a network is not reliable under every runtime. Classified like `detachProjectProxy`. Throws
+   * `ProxyStartError` when any step fails (the caller then has no proxy: fail closed, repaired on the next use).
+   */
+  async restoreProjectProxy(id: string, net: ContainedNetwork): Promise<void> {
+    const p = await this.checkedProxy(id);
+    if (!p) throw new ProxyStartError("it no longer exists");
+    const address = proxyAddress(net.subnet);
+    const stopped = await this.docker(["stop", "-t", "2", p.id], { timeoutMs: 60_000 });
+    if (stopped.code !== 0 && !this.isNotThere(stopped)) {
+      throw new ProxyStartError(`it could not be stopped: ${stopped.timedOut ? "timed out" : oneLine(stopped.stderr.split("\n").filter((l) => l.trim() !== "").at(-1) ?? "", 200) || "docker stop failed"}`);
+    }
+    const joined = await this.docker(["network", "connect", "--ip", address, net.id, p.id], { timeoutMs: 60_000 });
+    if (joined.code !== 0 || joined.timedOut) {
+      throw new ProxyStartError(`it could not be joined to the project network at ${address}: ${joined.timedOut ? "timed out" : oneLine(joined.stderr.split("\n").filter((l) => l.trim() !== "").at(-1) ?? "", 200) || "docker network connect failed"}`);
+    }
+    await this.startAndAwait(p.id, true);
+    if (!(await this.projectProxyAttached(p.id, net))) throw new ProxyStartError(`it is not attached at ${address}`);
+  }
+
+  /**
+   * Write a sandbox's local-access names into its `/etc/hosts`: one line per name, `<address> <name>   # mcpe-local-access`,
+   * replacing earlier marked lines (none when `names` is empty). A root `docker exec` of `LOCAL_ACCESS_SCRIPT`, idempotent,
+   * and not through the hook. The container is classified first (this installation's, or from before); a name that is
+   * not a plain lower-case host name, or is one of the sandbox's own (`localhost`, its hostname, its short id), is refused.
+   * Throws when the write fails.
+   */
+  async writeLocalAccess(ref: { id: string; name: string }, address: string, names: string[]): Promise<void> {
+    if (!FULL_ID.test(ref.id)) throw new Error("A sandbox is named by its full id");
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(address) || address.split(".").some((o) => Number(o) > 255)) throw new Error(`Not an IPv4 address: ${oneLine(address, 40)}`);
+    for (const n of names) {
+      if (n.length > 253 || !HOSTS_NAME.test(n)) throw new Error(`The local-access name ${JSON.stringify(oneLine(n, 60))} is not a plain host name`);
+      if (OWN_HOST_NAMES.has(n) || n === ref.id.slice(0, 12)) throw new Error(`The local-access name ${n} is one of the sandbox's own and cannot be pointed at the proxy`);
+    }
+    const c = await this.inspectContainer(ref.id, true);
+    if (!c) return;
+    this.refuseUnless([this.containerFacts(ref.name, c)]);
+    const lines = [...new Set(names)].map((n) => `${address} ${n}   ${LOCAL_ACCESS_MARK}`).join("\n");
+    const res = await this.docker(["exec", "-u", "0", c.id, "sh", "-c", LOCAL_ACCESS_SCRIPT, "sh", lines, "/etc/hosts"], { timeoutMs: 30_000, maxBytes: 16 * 1024 });
+    if (res.code !== 0 || res.timedOut) {
+      throw new Error(`Could not write the local-access names into ${clean(ref.name)}: ${res.timedOut ? "timed out" : oneLine(res.stderr, 200) || `exit code ${res.code}`}`);
+    }
   }
 
   /**
@@ -1540,10 +1773,12 @@ export class Docker {
     const id = created.stdout.trim();
     if (!FULL_ID.test(id)) throw new ProxyStartError(`Docker printed no usable id: ${oneLine(id, 80) || "(nothing)"}`);
     held.proxy = id;
-    // The alias must be given before the proxy starts, or the proxy would start with one network and miss the other.
-    const joined = await this.docker(["network", "connect", "--alias", PROXY_ALIAS, contained.id, id], { timeoutMs: 60_000 });
+    // The address must be given before the proxy starts, or the proxy would start with one network and miss the other.
+    // There is never a fallback to a name: a name needs Docker's embedded DNS.
+    const address = proxyAddress(contained.subnet);
+    const joined = await this.docker(["network", "connect", "--ip", address, contained.id, id], { timeoutMs: 60_000 });
     if (joined.code !== 0 || joined.timedOut) {
-      throw new ProxyStartError(`it could not be joined to the contained network: ${joined.timedOut ? "timed out" : oneLine(joined.stderr.split("\n").filter((l) => l.trim() !== "").at(-1) ?? "", 200) || "docker network connect failed"}`);
+      throw new ProxyStartError(`it could not be joined to the contained network at ${address}: ${joined.timedOut ? "timed out" : oneLine(joined.stderr.split("\n").filter((l) => l.trim() !== "").at(-1) ?? "", 200) || "docker network connect failed"}`);
     }
     const started = await this.docker(["start", id], { timeoutMs: 60_000 });
     if (started.code !== 0 || started.timedOut) {
@@ -1599,7 +1834,7 @@ export class Docker {
     const held: { proxy?: string } = {};
     try {
       const proxyId = await this.startProxy(contained, resolvers, egress, held);
-      const url = `http://${PROXY_ALIAS}:${PROXY_PORT}`;
+      const url = `http://${proxyAddress(contained.subnet)}:${PROXY_PORT}`;
       const env = [
         "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
       ].flatMap((k) => ["-e", `${k}=${url}`]);
@@ -1625,9 +1860,9 @@ export class Docker {
   }
 
   /**
-   * A project's proxy: created on `bridge` (the way out), joined to the project network under `mcpe-proxy` and
-   * under one alias per forward target (a sandbox reaches a local service by a name that resolves to the proxy,
-   * DD10), then started and waited for until it reports this program's version. Hardened as the one-shot's proxy,
+   * A project's proxy: created on `bridge` (the way out), joined to the project network at `proxyAddress` of its subnet
+   * (no alias: a sandbox reaches the proxy by that address, and a local service by a name its `/etc/hosts` gives that
+   * address, DD10), then started and waited for until it reports this program's version. Hardened as the one-shot's proxy,
    * plus `--add-host host.docker.internal:host-gateway` so that a forward to the host has an address. No `--rm`, no
    * restart policy. `labels` are the caller's configuration labels (leg 7); they may not name any label this
    * layer sets. The project network must exist and be this project's (never created here). On any failure it
@@ -1649,11 +1884,6 @@ export class Docker {
     for (const [k, v] of Object.entries(labels)) {
       if (RESERVED_LABELS.has(k) || !/^mcp-everything\.[a-z][a-z0-9.-]{0,60}$/.test(k)) throw new Error(`A proxy label may not be named ${JSON.stringify(k.slice(0, 60))}`);
       if (typeof v !== "string" || /[\r\n\u0000]/.test(v)) throw new Error(`The proxy label ${k} must be a string without line breaks`);
-    }
-    const aliases = [...new Set(config.forwards.map((f) => f.host))];
-    for (const a of aliases) {
-      if (a === PROXY_ALIAS) throw new Error(`A forward target may not be named ${PROXY_ALIAS}: that is the proxy's own name on the network`);
-      if (!/^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/.test(a)) throw new Error(`A forward target's name ${JSON.stringify(a.slice(0, 80))} cannot be a network alias`);
     }
     await this.assertRuntime();
     await this.ensureImage(this.cfg.docker.proxyImage);
@@ -1693,13 +1923,11 @@ export class Docker {
       const id = created.stdout.trim();
       if (!FULL_ID.test(id)) throw new ProxyStartError(`Docker printed no usable id: ${oneLine(id, 80) || "(nothing)"}`);
       held = id;
-      // The aliases are given before the proxy starts, or it would start with one network and miss the other.
-      const joined = await this.docker(
-        ["network", "connect", "--alias", PROXY_ALIAS, ...aliases.flatMap((a) => ["--alias", a]), net.id, id],
-        { timeoutMs: 60_000 },
-      );
+      // The address is given before the proxy starts, or it would start with one network and miss the other.
+      const address = proxyAddress(net.subnet);
+      const joined = await this.docker(["network", "connect", "--ip", address, net.id, id], { timeoutMs: 60_000 });
       if (joined.code !== 0 || joined.timedOut) {
-        throw new ProxyStartError(`it could not be joined to the project network: ${joined.timedOut ? "timed out" : oneLine(joined.stderr.split("\n").filter((l) => l.trim() !== "").at(-1) ?? "", 200) || "docker network connect failed"}`);
+        throw new ProxyStartError(`it could not be joined to the project network at ${address}: ${joined.timedOut ? "timed out" : oneLine(joined.stderr.split("\n").filter((l) => l.trim() !== "").at(-1) ?? "", 200) || "docker network connect failed"}`);
       }
       await this.startAndAwait(id, false);
       return { id, name };
@@ -1816,7 +2044,7 @@ export class Docker {
       if (!c || c.name === undefined || c.labels === null) continue;
       if (c.labels[OWNER_LABEL] !== this.installationId || Object.hasOwn(c.labels, ROLE_LABEL)) continue;
       if (!Object.hasOwn(c.labels, PROJECT_LABEL) || c.labels[PROJECT_LABEL] === "") continue;
-      found.push({ id: c.id, name: c.name, running: c.running, labels: c.labels, networks: [...c.networks], runtime: c.runtime });
+      found.push({ id: c.id, name: c.name, running: c.running, labels: c.labels, networks: [...c.networks], ...(c.networkIds ? { networkIds: { ...c.networkIds } } : {}), runtime: c.runtime });
     }
     return found;
   }
@@ -2305,6 +2533,8 @@ export class Docker {
     // The hook comes first: it may have to repair the network or the proxy before the sandbox starts (T14).
     const env = await this.hooked(c, name, "full");
     if (!c.running) await this.startId(c.id, name);
+    // After a start Docker has rewritten `/etc/hosts`; a sandbox that was running is checked for its lines (the step is cheap and idempotent).
+    await this.afterStarted(c, name, !c.running);
     return makeRef(c.id, name, env);
   }
 
@@ -2317,7 +2547,10 @@ export class Docker {
     const c = await this.resolveContainer(name);
     if (!c) return undefined;
     this.refuseRuntimeMismatch(name, c);
-    if (!c.running) await this.startId(c.id, name, true);
+    if (!c.running) {
+      await this.startId(c.id, name, true);
+      await this.afterStarted(c, name, true);
+    }
     return makeRef(c.id, name);
   }
 
@@ -2328,7 +2561,7 @@ export class Docker {
   async inspectSandbox(name: string): Promise<SandboxInspectFacts | undefined> {
     const c = await this.resolveContainer(name);
     if (!c) return undefined;
-    return { id: c.id, name: c.name ?? name, running: c.running, labels: c.labels, networks: [...c.networks], runtime: c.runtime };
+    return { id: c.id, name: c.name ?? name, running: c.running, labels: c.labels, networks: [...c.networks], ...(c.networkIds ? { networkIds: { ...c.networkIds } } : {}), runtime: c.runtime };
   }
 
   /**
@@ -2384,7 +2617,10 @@ export class Docker {
     if (!c) return undefined;
     this.refuseRuntimeMismatch(id, c);
     const env = await this.hooked(c, id, "full");
-    if (!c.running) await this.startId(id, id);
+    if (!c.running) {
+      await this.startId(id, id);
+      await this.afterStarted(c, id, true);
+    }
     return { env };
   }
 
@@ -2432,7 +2668,10 @@ export class Docker {
     const label = typeof target === "string" ? target : target.name;
     this.refuseRuntimeMismatch(label, c);
     await this.hooked(c, label, "full");
-    if (!c.running) await this.startId(c.id, label);
+    if (!c.running) {
+      await this.startId(c.id, label);
+      await this.afterStarted(c, label, true);
+    }
     return true;
   }
 
@@ -2500,6 +2739,7 @@ export class Docker {
         for (const p of objs.proxies) await this.rmProxy(p.id, p.name);
         await this.disconnectForce(own, c.id, name);
         if (objs.net) await this.rmNetwork(objs.net.id, objs.net.name);
+        await this.clearLocalAccess(c, name);
       }
       const res = await this.docker(["network", "connect", "bridge", c.id], { timeoutMs: 60_000 });
       if (res.code !== 0) throw new Error(`Failed to enable network for ${clean(name)}: ${res.stderr.trim()}`);
@@ -2518,6 +2758,21 @@ export class Docker {
     if (objs) {
       for (const p of objs.proxies) await this.rmProxy(p.id, p.name);
       if (objs.net) await this.rmNetwork(objs.net.id, objs.net.name);
+      await this.clearLocalAccess(c, name);
+    }
+  }
+
+  /**
+   * Take the local-access lines out of a running sandbox's `/etc/hosts` when it leaves its project network (they name an
+   * address that is no longer its proxy). Best effort: a failure never fails the network change, and a stopped sandbox
+   * gets a fresh `/etc/hosts` at its next start anyway.
+   */
+  private async clearLocalAccess(c: ContainerFacts, name: string): Promise<void> {
+    if (!c.running) return;
+    try {
+      await this.writeLocalAccess({ id: c.id, name }, "127.0.0.1", []);
+    } catch (e) {
+      this.log(`could not take the local-access names out of ${clean(name)}: ${oneLine((e as Error).message, 200)}`);
     }
   }
 

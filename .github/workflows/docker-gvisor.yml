@@ -1,13 +1,16 @@
 name: Docker gVisor measurements
 
-# Two jobs (flight 02).
+# Three jobs (flight 02).
 #   measure (leg 4): answers, on native Linux, the premises the flight measured
 #     only on Docker Desktop. A measured "no" never fails the job; the results
 #     go to the run's step summary. It uses no repository code.
 #   gvisor (leg 12): registers a pinned, checksum-verified gVisor as `runsc`
+#     (with --overlay2=none, so that a sandbox keeps its build across idle stops)
 #     and runs mcp-everything's Docker suite under it, then the runtime proof
 #     (test/integration/gvisor.test.ts). Advisory, not a required check: the
 #     runner's Docker version floats.
+#   contained-linux (leg 13): the containment cases (legs 5 to 10) under runc,
+#     on native Linux, with no gVisor installed. In parallel with gvisor.
 
 on:
   workflow_dispatch:
@@ -346,7 +349,10 @@ jobs:
           set -euo pipefail
           sudo install -m 0755 "$RUNNER_TEMP/gvisor/runsc" /usr/local/bin/runsc
           runsc --version
-          sudo runsc install
+          # --overlay2=none: gVisor's default root-filesystem overlay discards writes outside volumes when a sandbox
+          # exits, and mcp-everything's build output lives in the container's layer, so an idle-stopped sandbox would
+          # lose its built tools. The README states this requirement.
+          sudo runsc install -- --overlay2=none
           sudo systemctl restart docker
           ready=0
           for _ in $(seq 1 30); do
@@ -366,6 +372,13 @@ jobs:
             *'"runsc"'*) ;;
             *)
               echo "Docker does not list a runtime called runsc"
+              exit 1
+              ;;
+          esac
+          case "$runtimes" in
+            *'--overlay2=none'*) ;;
+            *)
+              echo "runsc is not registered with --overlay2=none"
               exit 1
               ;;
           esac
@@ -483,4 +496,91 @@ jobs:
               }
             }
             fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out.join("\n") + "\n");
+          '
+
+  # Run C (leg 13): the containment cases under runc on native Linux. gVisor is not installed here and no runtime is
+  # named, so every container runs under Docker's default runtime: this is the proof that containment works on a
+  # native Linux daemon (Docker Desktop proved it on a VM's daemon; the gvisor job proves it under runsc).
+  contained-linux:
+    name: contained-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # The describes of legs 5 to 10 (contained networks and the one-shot proxy, the project network primitives, the
+      # containment hook, the contained install, network tools and local access, startup containment), selected by `-t`.
+      CONTAINMENT_DESCRIBES: "docker integration: (contained networks and the one-shot proxy|project network primitives|containment hook|the contained install|network tools and local access|startup containment)"
+      # How many cases of those describes must PASS. The summary fails when fewer did, so a rename that makes `-t` select
+      # nothing, or a case that skips itself, cannot pass silently. UPDATE THIS NUMBER when a case is added to or removed
+      # from those describes in test/integration/docker.test.ts (7 + 5 + 5 + 6 + 5 + 3 at leg 13).
+      CASES_EXPECTED: "31"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker version and runtimes
+        run: |
+          set -euo pipefail
+          docker version
+          docker info --format '{{json .Runtimes}} default={{.DefaultRuntime}}'
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run C, the containment cases under runc
+        id: run_c
+        timeout-minutes: 45
+        env:
+          MCPE_DOCKER_TESTS: "1"
+        run: |
+          set -uo pipefail
+          # No runtime is named: the cases run under Docker's default (runc).
+          unset MCPE_DOCKER_RUNTIME
+          start=$(date +%s)
+          status=0
+          npx vitest run test/integration/docker.test.ts -t "$CONTAINMENT_DESCRIBES" --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/run-c.json" || status=$?
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Summary
+        if: "!cancelled()"
+        env:
+          SECONDS_C: ${{ steps.run_c.outputs.seconds }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const out = ["### Run C (the containment cases under runc, native Linux)", ""];
+            let report;
+            try {
+              report = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/run-c.json", "utf8"));
+            } catch (e) {
+              out.push("no report (the run did not finish or did not start)", "");
+              fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out.join("\n") + "\n");
+              process.exit(1);
+            }
+            const expected = Number(process.env.CASES_EXPECTED);
+            out.push("passed " + report.numPassedTests + " of at least " + expected + ", failed " + report.numFailedTests + ", skipped " + report.numPendingTests + ", " + (process.env.SECONDS_C || "?") + " s", "");
+            const cases = (report.testResults || []).flatMap((f) => f.assertionResults || []);
+            const skipped = cases.filter((c) => c.status === "skipped" || c.status === "pending");
+            const selected = skipped.filter((c) => (c.ancestorTitles || []).join(" ").includes("docker integration: "));
+            if (selected.length > 0) {
+              out.push("Skipped:", "");
+              for (const c of selected) out.push("- " + c.fullName);
+              out.push("");
+            }
+            let bad = false;
+            if (report.numPassedTests < expected) {
+              out.push("FEWER CASES PASSED THAN EXPECTED: " + report.numPassedTests + " < " + expected + " (a failing case, a skipped one, or a selection that no longer matches).", "");
+              bad = true;
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out.join("\n") + "\n");
+            if (bad) process.exit(1);
           '

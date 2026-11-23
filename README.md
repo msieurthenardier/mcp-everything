@@ -681,11 +681,17 @@ is refused at startup.
   `node -e` in `MCPE_PROXY_IMAGE`: read-only, all capabilities dropped, a
   non-root user, nothing published, and under `MCPE_DOCKER_RUNTIME` when one is
   named. It listens only on its address on the project's network, so containers
-  on the bridge cannot use it. The sandbox reaches it by the name `mcpe-proxy`
-  (port 3128).
+  on the bridge cannot use it. The sandbox reaches it **by address, not by
+  name**: the proxy is connected to its network at the last usable host address
+  of the network's subnet (for `172.22.0.0/16`, `172.22.255.254`), port 3128.
+  Each network is made with that subnet pinned and an IP range in its lower half,
+  so Docker never hands the address to anything else. Nothing depends on
+  Docker's embedded DNS (a name for the proxy would, and gVisor's network stack
+  cannot reach it).
 - **What the sandbox's commands get.** Every command mcp-everything starts in a
   contained sandbox gets `HTTP_PROXY`, `HTTPS_PROXY` (and the lower-case
-  forms), `NO_PROXY` empty, and `NODE_USE_ENV_PROXY=1` (Node's `fetch` ignores
+  forms, each `http://<the proxy's address>:3128`), `NO_PROXY` empty, and
+  `NODE_USE_ENV_PROXY=1` (Node's `fetch` ignores
   the variables otherwise). They are given per command, not at creation, so an
   existing sandbox can be contained without a reinstall. In the npm build
   sandbox that was measured (Node 26.13.1, npm 11.20.0), `fetch` used the proxy
@@ -696,8 +702,7 @@ is refused at startup.
   no route.
 - **The proxy decides by address, not by name.** It resolves every name itself,
   through the upstream resolvers it reads from a throwaway container on the
-  bridge (never Docker's embedded DNS, which answers a network alias with the
-  proxy itself), refuses the host's, local and link-local addresses whatever a
+  bridge (never Docker's embedded DNS), refuses the host's, local and link-local addresses whatever a
   name resolves to, and connects to exactly the address it checked. If a name
   resolves to both a public and a refused address, the refused one is dropped
   and the public one used; if it resolves only to refused addresses, the
@@ -721,9 +726,16 @@ is refused at startup.
   replaced, including by the `set_project_hosts` that fixes them.
 - **A change replaces the proxy.** A project's hosts, its stage (build or after
   install), the operator's local access and the resolvers decide its proxy's
-  configuration, which is fixed when it is created. A change builds a new proxy
-  beside the old one, and removes the old one only when the new one answers; a
-  proxy that does not start is reported as that and the old one stays.
+  configuration, which is fixed when it is created. Two containers cannot hold
+  one address, so a change takes the old proxy off the network first, makes the
+  new one at the same address, waits until it answers, and then removes the old
+  one. **A tightening is effective at once**, and connections through the old
+  proxy drop; for a moment, until the new proxy is ready, the sandbox has no
+  route (it fails closed). The sandbox's proxy variables are the same before and
+  after (same address), so nothing is restarted for addressing. If the new proxy
+  does not start, the old one is put back at its address; if that fails too, the
+  project has no proxy until its next use repairs it, and its commands fail
+  closed.
 
 ### What each stage reaches
 
@@ -801,9 +813,17 @@ MCPE_LOCAL_ACCESS="acme/postgres-mcp=host.docker.internal:5432;acme/redis-mcp=db
   address; it reaches a local service only through a name that resolves to its
   proxy.
 - **How it works.** For each target the project's proxy listens on that port and
-  forwards raw TCP, and joins the project's network with the target's name as an
-  alias, so the sandbox connects to `host.docker.internal:5432` and reaches the
-  proxy. Nothing in the sandbox is changed. The exemption from the refused
+  forwards raw TCP, and mcp-everything writes one line per target name into the
+  **sandbox's `/etc/hosts`**: `<the proxy's address> <name>   # mcpe-local-access`.
+  The sandbox connects to `host.docker.internal:5432` and reaches the proxy. No
+  network alias and no DNS server is involved. Docker rewrites `/etc/hosts` every
+  time a sandbox starts, so the lines are written again after each start that
+  mcp-everything makes (and checked when it uses a running sandbox), in one
+  root `docker exec` that replaces only its own marked lines. They are taken out
+  when the forwards become empty or the sandbox leaves its network. A sandbox you
+  start by hand with `docker start` has no such lines until mcp-everything next
+  uses it. Names that are the sandbox's own (`localhost`, its hostname) cannot be
+  targets. The exemption from the refused
   addresses applies only to connections arriving on that port, to the addresses
   that name resolves to: a `CONNECT host.docker.internal:5432` through the HTTP
   side is still refused. The proxy carries the forwards for as long as the
@@ -1081,6 +1101,19 @@ because Docker refuses an unregistered runtime and does not fall back.
   <other>. Reinstall the project to run it under <runtime>.` Nothing is
   started. `set_project_network` with `enabled: false` still works on such a
   sandbox.
+- **Register `runsc` with `--overlay2=none`:** `sudo runsc install --
+  --overlay2=none`, then restart Docker. gVisor's default root-filesystem
+  overlay (`--overlay2=root:self`) discards writes outside volumes when a
+  container exits, and a sandbox's build output (`/opt/mcpe`, `/root/.cargo`,
+  `/usr/local/go`) lives in the container's layer, so an idle-stopped sandbox
+  would lose its built tools. When the named runtime is `runsc` and Docker's
+  registration of it does not carry `--overlay2=none`, mcp-everything logs one
+  warning when it checks the runtime; it does not refuse, because the
+  registration is yours.
+- **Containment does not use Docker's embedded DNS.** gVisor's network stack
+  does not honor the rules that reach it, so contained containers reach their
+  proxy by address and local-access names come from the sandbox's `/etc/hosts`
+  (see [Network containment](#network-containment)).
 - **At startup** the runtime is checked in the background and one line is
   logged ("Docker runs it", or why not). It does not fail the start, because
   Docker may not be up yet. The server's instructions say which runtime is named
@@ -1364,7 +1397,13 @@ Environment variables, all optional:
     retrying, until a process slot frees; idle stopping then resumes with the
     same timeout and latency as above. It logs one line to the container's
     stderr the first time this happens.
-  - Idle stopping has not been verified under gVisor (`runsc`).
+  - Under gVisor (`runsc`), register the runtime with **`--overlay2=none`**
+    (`sudo runsc install -- --overlay2=none`, then restart Docker). gVisor's
+    default root-filesystem overlay discards writes outside volumes when a
+    container exits, and a sandbox's build output lives in the container's
+    layer, so an idle-stopped sandbox would lose the tools it built. With
+    `MCPE_DOCKER_RUNTIME=runsc` mcp-everything logs one warning at startup when
+    Docker's registration of `runsc` lacks it; it does not refuse.
   - Under `MCPE_NETWORK=contained`, the project's proxy is not stopped with
     its sandbox; see [What containment does not stop](#what-containment-does-not-stop).
 - Under `MCPE_NETWORK=contained`, every project network and every networked

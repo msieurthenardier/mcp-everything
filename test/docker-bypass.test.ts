@@ -113,11 +113,22 @@ const NOT_A_START_OR_EXEC: Record<string, string> = {
   // itself (a unit case). Under `open` it is `docker run -d` as before: the listed exception for the open mode.
   createContainer: "docker run -d (open) or docker create (contained, start: false): makes a NEW sandbox on bridge; refuses a start under containment",
   projectRefusals: "docker ps and a read of each project proxy's status: what the proxies refused",
+  // Leg 13 (proxy by address).
+  probeSubnet: "a throwaway network this call made, read and removed",
+  networkCreateFailure: "makes an error",
+  detachProjectProxy: "docker network disconnect of a PROXY, classified by owner and role",
+  restoreProjectProxy: "stop, connect and start of a PROXY (startAndAwait), classified by owner and role",
+  clearLocalAccess: "calls writeLocalAccess (listed below) when a sandbox leaves its network",
+  afterStarted: "calls the post-start step with facts it was given",
 };
 
 /** Unhooked by design, containment-internal: only `Containment` calls these, and none of them execs in a sandbox. */
+
 const UNHOOKED_BY_DESIGN: Record<string, string> = {
   startForContainment: "the start containment makes itself, before and without the hook, while it builds the network and the proxy",
+  // The one exec in a sandbox that is not the hook's: a root write of `/etc/hosts` (a fixed script, validated lines). Through the
+  // hook it would recurse (the hook repairs, and repair writes). Only `Containment` and the class's own `clearLocalAccess` call it.
+  writeLocalAccess: "a root exec of a fixed script that writes the sandbox's /etc/hosts, called by containment's post-start step and replacement",
 };
 
 /** The calls that start a sandbox or run a command in one. */
@@ -245,7 +256,7 @@ describe("no bypass of the containment hook", () => {
   it("every call that starts or execs sits in a hook-guarded method, or in a documented table (by name)", () => {
     const allowed = new Set([...HOOK_GUARDED, ...Object.keys(UNHOOKED_BY_DESIGN)]);
     // Direct verbs belong to the machinery methods below; primitive calls belong to the guarded or unhooked-by-design ones.
-    const MACHINERY = new Set(["startId", "execOnce", "runCreated", "startProxy", "startAndAwait", "proxyStatus", "createContainer", "docker", "ask"]);
+    const MACHINERY = new Set(["startId", "execOnce", "runCreated", "startProxy", "startAndAwait", "proxyStatus", "createContainer", "docker", "ask", "writeLocalAccess"]);
     // An argument list that is not a literal is judged by hand: `ask` forwards its caller's; `execOnce` builds `exec -i ...`;
     // the sweep builds `ps`, `inspect` and `rm` of containers it listed and classified.
     const DYNAMIC = new Set(["ask", "execOnce", "sweepCheckLeftovers"]);
@@ -298,6 +309,24 @@ describe("no bypass of the containment hook", () => {
     }
     const outside = [...new Set(users)].filter((f) => f !== path.join("src", "network", "containment.ts") && f !== path.join("src", "sandbox", "docker.ts"));
     expect(outside).toEqual([]);
+  });
+
+  it("writeLocalAccess is called only by containment.ts and by docker.ts's own clearLocalAccess", () => {
+    const users: string[] = [];
+    for (const sf of all) {
+      walk(sf, (n) => {
+        if (n.kind === SyntaxKind.PropertyAccessExpression && (n as unknown as { name: { text: string } }).name.text === "writeLocalAccess") users.push(path.relative(ROOT, sf.fileName));
+      });
+    }
+    expect([...new Set(users)].sort()).toEqual([path.join("src", "network", "containment.ts"), path.join("src", "sandbox", "docker.ts")]);
+    const cls = dockerClass();
+    const callers: string[] = [];
+    for (const m of members(cls)) {
+      walk(m, (n) => {
+        if (n.kind === SyntaxKind.CallExpression && isThisAccess((n as unknown as { expression: Node }).expression) === "writeLocalAccess") callers.push(nameOf(m)!);
+      });
+    }
+    expect([...new Set(callers)]).toEqual(["clearLocalAccess"]);
   });
 
   it("the startup step (leg 10) and its lock-free internals start and exec through the unhooked start only, and never wait or hook", () => {
