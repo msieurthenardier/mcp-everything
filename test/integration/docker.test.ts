@@ -8,7 +8,7 @@ import { Installer } from "../../src/install/installer.js";
 import { McpProxy } from "../../src/proxy/mcp-proxy.js";
 import { loadInstallationId } from "../../src/installation.js";
 import { Registry } from "../../src/registry.js";
-import { Docker, MANIFESTS, parseProbeOutput, proxyAddress, ProxyStartError, WALK_SCRIPT, walkArguments, type ExecOptions, type ExecResult, type OneShotSpec, type ProxyRefusalRow, type SandboxRef } from "../../src/sandbox/docker.js";
+import { Docker, MANIFESTS, parseProbeOutput, proxyAddress, proxyMac, ProxyStartError, WALK_SCRIPT, walkArguments, type ExecOptions, type ExecResult, type OneShotSpec, type ProxyRefusalRow, type SandboxRef } from "../../src/sandbox/docker.js";
 import { Containment } from "../../src/network/containment.js";
 import { buildHosts, sandboxHosts } from "../../src/network/defaults.js";
 import { refusalLines } from "../../src/network/refusals.js";
@@ -1851,7 +1851,10 @@ describe.skipIf(!enabled)("docker integration: contained networks and the one-sh
       const p = JSON.parse((await run("docker", ["inspect", "--format", fmt, proxyName], { timeoutMs: 30_000 })).stdout) as {
         mode: string; ro: boolean; capDrop: string[]; capAdd: string[] | null; ports: Record<string, unknown> | null; user: string; nets: Record<string, { IPAddress: string }>;
       };
-      expect(p.mode).toBe("bridge");
+      // Leg 14: the proxy is created on the one-shot network (so its address and MAC are fixed at create) and `bridge` is joined after;
+      // HostConfig.NetworkMode is the network it was created on. Both networks are checked through `nets` below.
+      expect(p.mode).toMatch(/-oneshot-net-/);
+      expect(Object.keys(p.nets).sort()).toEqual(["bridge", p.mode].sort());
       expect(p.ro).toBe(true);
       expect(p.capDrop).toEqual(["ALL"]);
       expect(p.capAdd ?? []).toEqual([]);
@@ -2004,6 +2007,9 @@ describe.skipIf(!enabled)("docker integration: project network primitives", () =
       // At the last usable address of the network's subnet, given with `network connect --ip` (IPAMConfig), and under no alias.
       const configured = (await lines(["inspect", "--format", `{{json (index .NetworkSettings.Networks "${netName}").IPAMConfig}}`, proxy.name])).join("");
       expect(JSON.parse(configured)).toMatchObject({ IPv4Address: proxyAddress(network.subnet) });
+      // Leg 14: created with `--network name=,ip=,mac-address=` (then `bridge` connected): the MAC is the network's fixed one.
+      const mac = (await lines(["inspect", "--format", `{{(index .NetworkSettings.Networks "${netName}").MacAddress}}`, proxy.name])).join("").trim();
+      expect(mac).toBe(proxyMac(network.id));
       expect(await docker.projectProxyAttached(proxy.id, network)).toBe(true);
       const aliases = (await lines(["inspect", "--format", `{{json (index .NetworkSettings.Networks "${netName}").Aliases}}`, proxy.name])).join("");
       expect(aliases).not.toContain("mcpe-proxy");
@@ -2039,7 +2045,9 @@ describe.skipIf(!enabled)("docker integration: project network primitives", () =
     expect(await remaining()).toEqual(NONE);
   }, 300_000);
 
-  it("T14 in code: a stopped contained sandbox whose -net was removed starts again, on a new -net, after ensure and attach", async () => {
+  // runsc cannot clean up a container whose start failed (a stale containerd task), so a stopped sandbox whose -net was removed
+  // must be recreated: the failed `docker start` below leaves it unable to start again (leg 14; the README's gVisor limits).
+  it.skipIf(process.env.MCPE_DOCKER_RUNTIME === "runsc")("T14 in code: a stopped contained sandbox whose -net was removed starts again, on a new -net, after ensure and attach", async () => {
     try {
       const { name, ref } = await makeSandbox();
       const netName = `${name}-net`;
@@ -2324,10 +2332,15 @@ describe.skipIf(!enabled)("docker integration: containment hook (leg 7)", () => 
 
       // A forced replacement: another proxy, at the same address, and the same environment (nothing to restart for addressing).
       const [first] = await proxiesOf(p.name);
+      const macOf = async (c: string) => (await lines(["inspect", "--format", `{{(index .NetworkSettings.Networks "${p.name}-net").MacAddress}}`, c])).join("").trim();
+      const macBefore = await macOf(first!);
       expect((await containment.replace(p.project, { force: true })).kind).toBe("replaced");
       const [second] = await proxiesOf(p.name);
       expect(second).not.toBe(first);
       expect(await docker.projectProxyAttached(second!, net)).toBe(true);
+      // Leg 14: the same MAC too (fixed from the network's id), so a sandbox's neighbor cache stays right across the swap.
+      expect(macBefore).toBe(proxyMac(net.id));
+      expect(await macOf(second!)).toBe(proxyMac(net.id));
       expect((await docker.exec(p.name, ["sh", "-c", "echo $HTTPS_PROXY"], { timeoutSec: 60 })).stdout.trim()).toBe(url);
       expect(await statusEventually(p.name, "github.com")).toBe("200");
 

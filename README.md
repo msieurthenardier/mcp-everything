@@ -1114,6 +1114,17 @@ because Docker refuses an unregistered runtime and does not fall back.
   does not honor the rules that reach it, so contained containers reach their
   proxy by address and local-access names come from the sandbox's `/etc/hosts`
   (see [Network containment](#network-containment)).
+- **Containing a running sandbox restarts it.** gVisor's network stack does
+  not see a network that is joined to a sandbox while it runs. Under a runtime
+  other than `runc`, putting a running sandbox on its project network (and
+  taking it off `bridge`) therefore stops it, changes its networks and starts
+  it again; processes in it do not survive. Every proxy is created with a fixed
+  address and MAC on its network, so replacing a proxy does not need a restart.
+  Under `runc` the change is made while the sandbox runs, as before.
+- **A stopped sandbox whose project network was removed is recreated.** `runsc`
+  cannot clean up a container whose start failed ("stale containerd task"),
+  so such a sandbox cannot be started again on a new network; reinstall the
+  project.
 - **At startup** the runtime is checked in the background and one line is
   logged ("Docker runs it", or why not). It does not fail the start, because
   Docker may not be up yet. The server's instructions say which runtime is named

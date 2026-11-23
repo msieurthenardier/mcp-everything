@@ -160,6 +160,9 @@ class FakeLayer implements ContainmentDocker {
     const s = this.sandboxes.get(ref.name);
     if (s && !s.networks.includes(net.name)) s.networks.push(net.name);
   }
+  async restartSandbox(name: string) {
+    this.log(`restartSandbox:${name}`);
+  }
   async listProjectProxies(sandbox: string): Promise<ProjectProxy[]> {
     return this.proxies.filter((p) => p.name.startsWith(`${sandbox}-proxy-`)).map((p) => ({ id: p.id, name: p.name, running: p.running, labels: { ...p.labels } }));
   }

@@ -20,6 +20,8 @@ import {
   proxyVersionOf,
   RECORD_LABEL,
   recordLabelOf,
+  RESTART_AFTER_SWAP,
+  restartAfterSwap,
   SESSION_LABEL,
   sessionLabelOf,
   VERSION_LABEL,
@@ -152,10 +154,16 @@ class FakeLayer implements ContainmentDocker {
     if (this.findError) throw this.findError;
     return this.nets.get(`${sandbox}-net`);
   }
-  async attachProjectNetwork(ref: SandboxRef, net: { id: string; name: string }) {
+  /** Leg 14: what each attach was told about the sandbox (`running` and its runtime), parallel to the attach calls. */
+  attachInfo: Array<{ running: boolean; runtime?: string | null } | undefined> = [];
+  async attachProjectNetwork(ref: SandboxRef, net: { id: string; name: string }, running?: { running: boolean; runtime?: string | null }) {
     this.log(`attachProjectNetwork:${ref.name}`);
+    this.attachInfo.push(running);
     const s = this.sandboxes.get(ref.name);
     if (s && !s.networks.includes(net.name)) s.networks.push(net.name);
+  }
+  async restartSandbox(name: string) {
+    this.log(`restartSandbox:${name}`);
   }
   async listProjectProxies(sandbox: string): Promise<ProjectProxy[]> {
     this.log("listProjectProxies");
@@ -168,11 +176,14 @@ class FakeLayer implements ContainmentDocker {
   }
   /** Leg 13. Replacement's first step: the proxy leaves the network (and so its address). */
   detachError?: Error;
+  /** Leg 14: runs after each proxy is detached (a test steals the lock here: after the detach, before the create). */
+  afterDetach?: () => void;
   async detachProjectProxy(id: string) {
     this.log("detachProjectProxy");
     if (this.detachError) throw this.detachError;
     const p = this.proxies.find((x) => x.id === id);
     if (p) p.alias = false;
+    this.afterDetach?.();
   }
   /** Leg 13. Rollback: the old proxy comes back at the address; `restoreError` makes it fail, and an address held by another proxy is refused. */
   restoreError?: Error;
@@ -262,8 +273,10 @@ class FakeLayer implements ContainmentDocker {
   async inspectSandbox(name: string): Promise<SandboxInspectFacts | undefined> {
     this.log("inspectSandbox");
     const s = this.sandboxes.get(name);
-    return s ? { id: idOf(name), name, running: s.running, labels: s.labels, networks: [...s.networks], runtime: undefined } : undefined;
+    return s ? { id: idOf(name), name, running: s.running, labels: s.labels, networks: [...s.networks], runtime: this.runtime } : undefined;
   }
+  /** Leg 14: the runtime every sandbox here reports (undefined: none named, runc). */
+  runtime: string | undefined;
   invalidate(f?: { id?: string; sandbox?: string; key?: string }) {
     this.log(`invalidate:${f?.sandbox ?? ""}`);
   }
@@ -1136,11 +1149,20 @@ describe("the hook", () => {
       expect(layer.count("removeProjectProxy")).toBe(0);
     });
 
+    it("a running sandbox under runsc whose network is made again is attached with its facts (the Docker layer stops and starts it)", async () => {
+      const c = await contained();
+      layer.nets.clear();
+      await c.ensureContained({ ...facts(), running: true, runtime: "runsc" }, "full");
+      expect(layer.attachInfo.at(-1)).toEqual({ running: true, runtime: "runsc" });
+    });
+
     it("recreates a missing network and attaches the sandbox to it, then a proxy for the new network", async () => {
       const c = await contained();
       layer.nets.clear();
       await c.ensureContained(facts({ running: false }), "full");
       expect(layer.calls).toContain(`attachProjectNetwork:${SANDBOX}`);
+      // Leg 14: the repair says whether the sandbox is running and under which runtime, so the Docker layer can stop it first under gVisor.
+      expect(layer.attachInfo.at(-1)).toEqual({ running: false, runtime: undefined });
       expect(layer.nets.has(NET)).toBe(true);
       // The old proxy sat on the old network: a recreated network changes the label, so it was replaced.
       expect(layer.proxies.length).toBe(1);
@@ -1412,6 +1434,65 @@ describe("replacement by address (leg 13)", () => {
     await expect(make().replace(KEY)).rejects.toBeInstanceOf(ContainmentLockLostError);
     expect(layer.count("removeProjectProxyNamed")).toBe(1);
     expect(layer.count("restoreProjectProxy")).toBe(0);
+  });
+
+  // Leg 13's review follow-up: `assertLive` between the detach and the create was not pinned (removing it was not caught).
+  it("a lock lost after the detach and before the create stops there: nothing is created, nothing is put back", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make().replace(KEY);
+    stale();
+    layer.calls = [];
+    layer.afterDetach = () => fs.writeFileSync(lockPath(), "thief:token");
+    await expect(make().replace(KEY)).rejects.toBeInstanceOf(ContainmentLockLostError);
+    expect(layer.count("detachProjectProxy")).toBe(1);
+    expect(layer.count("createProjectProxy")).toBe(0);
+    expect(layer.count("restoreProjectProxy")).toBe(0);
+  });
+
+  // Leg 14 (T18): a reconnected proxy gets a new MAC, so a rollback that put the old proxy back restarts a running non-runc sandbox.
+  it.each([
+    ["runsc", true, 1],
+    ["runsc", false, 0],
+    ["runc", true, 0],
+    [undefined, true, 0],
+  ])("a rolled-back replacement under runtime %s (sandbox running: %s) restarts the sandbox %i time(s)", async (runtime, running, restarts) => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make().replace(KEY);
+    stale();
+    layer.runtime = runtime;
+    layer.sandboxes.get(SANDBOX)!.running = running;
+    layer.calls = [];
+    layer.createError = new Error("no");
+    await expect(make().replace(KEY)).rejects.toThrow(/no/);
+    expect(layer.count("restoreProjectProxy")).toBe(1);
+    expect(layer.count("restartSandbox")).toBe(restarts);
+  });
+
+  it("a failed rollback (nothing put back) restarts nothing", async () => {
+    registryWith(rec());
+    sandbox([NET]);
+    await make().replace(KEY);
+    stale();
+    layer.runtime = "runsc";
+    layer.calls = [];
+    layer.createError = new Error("no");
+    layer.restoreError = new Error("Address already in use");
+    await expect(make().replace(KEY)).rejects.toThrow(/no/);
+    expect(layer.count("restartSandbox")).toBe(0);
+  });
+
+  // Leg 14: the named fallback is off, and a replacement under it never restarts the sandbox.
+  it("the restart-after-swap switch is off: a replacement of a running sandbox's proxy restarts nothing", async () => {
+    expect(RESTART_AFTER_SWAP).toBe(false);
+    registryWith(rec());
+    sandbox([NET]);
+    await make().replace(KEY);
+    stale();
+    layer.calls = [];
+    expect((await make().replace(KEY)).kind).toBe("replaced");
+    expect(layer.count("restartSandbox")).toBe(0);
   });
 
   it("only one of two old proxies is put back: they share the address", async () => {
@@ -1687,5 +1768,25 @@ describe("proxyDiffers (leg 9)", () => {
     };
     expect(await c.proxyDiffers(KEY)).toBeUndefined();
     expect(layer.calls.filter((x) => /^(create|remove|start|setNetwork|attach)/.test(x))).toEqual([]);
+  });
+});
+
+describe("restartAfterSwap, the named fallback (leg 14)", () => {
+  const gvisor = { running: true, contained: true, runc: false };
+
+  it("is off by default (the shipped switch), and says no whatever the sandbox is", () => {
+    expect(RESTART_AFTER_SWAP).toBe(false);
+    expect(restartAfterSwap(gvisor)).toBe(false);
+  });
+
+  it("switched on, it says yes only for a running, contained sandbox under a non-runc runtime", () => {
+    expect(restartAfterSwap(gvisor, true)).toBe(true);
+    expect(restartAfterSwap({ ...gvisor, running: false }, true)).toBe(false);
+    expect(restartAfterSwap({ ...gvisor, contained: false }, true)).toBe(false);
+    expect(restartAfterSwap({ ...gvisor, runc: true }, true)).toBe(false);
+  });
+
+  it("switched off explicitly, it says no", () => {
+    expect(restartAfterSwap(gvisor, false)).toBe(false);
   });
 });

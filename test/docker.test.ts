@@ -26,8 +26,10 @@ import {
   parseProbeOutput,
   parseProxyReport,
   parseResolvConf,
+  isRuncRuntime,
   projectNetworkName,
   proxyAddress,
+  proxyMac,
   ProxyStartError,
   PROBE_SCRIPT,
   RuntimeMismatchError,
@@ -204,10 +206,27 @@ class ScriptedDocker extends Docker {
           }
         });
         const id = idFor(name);
-        this.created.push({ name, id, labels, args });
         const rt = args.indexOf("--runtime");
-        this.containers.set(name, { id, running: false, labels, networks: ["bridge"], ...(rt >= 0 ? { runtime: args[rt + 1]! } : {}) });
+        // Leg 14: a proxy is created on its network as `--network name=<net>,ip=<addr>,mac-address=<mac>`; `bridge` is connected after.
+        const nw = args[args.indexOf("--network") + 1];
+        const spec = nw !== undefined && nw.startsWith("name=") ? Object.fromEntries(nw.split(",").map((kv) => [kv.slice(0, kv.indexOf("=")), kv.slice(kv.indexOf("=") + 1)])) : undefined;
+        // Two containers cannot hold one address on a network (Docker refuses the create, as it refuses a connect).
+        if (spec?.ip !== undefined && [...this.containers.values()].some((c) => c.networks.includes(spec.name!) && c.ips?.[spec.name!] === spec.ip)) {
+          return { code: 1, stderr: "Error response from daemon: Address already in use\n" };
+        }
+        this.created.push({ name, id, labels, args });
+        this.containers.set(name, {
+          id, running: false, labels, networks: spec ? [spec.name!] : ["bridge"],
+          ...(spec?.ip !== undefined ? { ips: { [spec.name!]: spec.ip } } : {}),
+          ...(rt >= 0 ? { runtime: args[rt + 1]! } : {}),
+        });
         return { stdout: `${id}\n` };
+      }
+      case "stop": {
+        const found = this.find(args[args.length - 1]!);
+        if (!found) return { code: 1, stderr: "Error response from daemon: No such container\n" };
+        found[1].running = false;
+        return {};
       }
       case "start": {
         const one = args[1] === "-a";
@@ -1399,6 +1418,9 @@ describe("the guard cannot be skipped unnoticed", () => {
     // root exec; `clearLocalAccess` is its best-effort call from `setNetworkNow`, on the container that guarded method resolved.
     // `afterStarted` only calls the post-start step it was handed, with facts it was given.
     "probeSubnet", "networkCreateFailure", "detachProjectProxy", "restoreProjectProxy", "writeLocalAccess", "clearLocalAccess", "afterStarted",
+    // Leg 14. `needsRestartToChangeNetwork` judges facts it is given. `whileStopped` acts on a sandbox its callers already resolved
+    // (`setNetworkNow`, `attachProjectNetwork`'s sandbox reference) and `restartSandbox` resolves and classifies first (its own block).
+    "needsRestartToChangeNetwork", "whileStopped", "restartSandbox",
   ];
   /**
    * Methods that report instead of refusing: they never throw and issue only read-only commands, which the
@@ -2947,10 +2969,11 @@ describe("a one-shot behind its proxy", () => {
     expect(sub(pc, "--user")).toEqual(["node"]);
     expect(pc).toContain("--read-only");
     expect(sub(pc, "--tmpfs")).toEqual(["/tmp:size=8m"]);
-    expect(sub(pc, "--network")).toEqual(["bridge"]);
+    const net = netOf(d);
+    // Leg 14: created on the contained network at its address and fixed MAC; `bridge` is connected after the create.
+    expect(sub(pc, "--network")).toEqual([`name=${net.name},ip=172.30.1.254,mac-address=${proxyMac(net.id)}`]);
     for (const bad of ["-p", "--publish", "-P", "--privileged", "host"]) expect(pc).not.toContain(bad);
     expect(sub(pc, "--entrypoint")).toEqual(["node"]);
-    const net = netOf(d);
     expect(net.cidr).toBe("172.30.1.0/24");
     const launch = proxyLaunchArgs(proxyConfig({ allow: ALLOW, listenCidr: net.cidr, resolvers: ["192.0.2.53"], limits: { bindWaitMs: 3000 } }));
     // The image, then the program's three arguments, exactly: an argv array and never a shell.
@@ -2969,14 +2992,15 @@ describe("a one-shot behind its proxy", () => {
     expect(conf.allow.map((e) => e.local)).toEqual([true]);
   });
 
-  it("joins the contained network at the proxy address (no alias) before it starts, and starts it by id", async () => {
+  it("is created on the contained network (address and MAC fixed), joins bridge before it starts (no --ip, no alias), and starts by id", async () => {
     const d = mkEgress();
     await d.once(EGRESS);
     const proxyId = d.created.find((c) => c.labels[ROLE_L] === "oneshot-proxy")!.id;
-    const net = netOf(d);
     const connect = d.argvs.findIndex((a) => a[0] === "network" && a[1] === "connect");
+    const create = d.argvs.findIndex(isProxyCreate);
     const start = d.argvs.findIndex((a) => a[0] === "start" && a[1] === proxyId);
-    expect(d.argvs[connect]).toEqual(["network", "connect", "--ip", "172.30.1.254", net.id, proxyId]);
+    expect(d.argvs[connect]).toEqual(["network", "connect", "bridge", proxyId]);
+    expect(create).toBeLessThan(connect);
     expect(d.argvs[start]).toEqual(["start", proxyId]);
     expect(connect).toBeLessThan(start);
   });
@@ -3759,7 +3783,8 @@ describe("createProjectProxy", () => {
     expect(sub(create, "--label")).toEqual([
       "mcp-everything=1", `${OWNER_L}=${ID}`, `${ROLE_L}=project-proxy`, `${PROJECT_L}=${PROJ}`, `${SANDBOX_L}=${PS}`, "mcp-everything.config=abc123",
     ]);
-    expect(sub(create, "--network")).toEqual(["bridge"]);
+    // Leg 14: on the project network at its address with the network's fixed MAC; `bridge` is connected after the create.
+    expect(sub(create, "--network")).toEqual([`name=${PNET},ip=172.30.50.254,mac-address=${proxyMac(net.id)}`]);
     expect(sub(create, "--add-host")).toEqual(["host.docker.internal:host-gateway"]);
     expect(sub(create, "--user")).toEqual(["node"]);
     expect(sub(create, "--cap-drop")).toEqual(["ALL"]);
@@ -3770,12 +3795,14 @@ describe("createProjectProxy", () => {
     expect(create).not.toContain("-p");
     expect(create.slice(-3)).toEqual(proxyLaunchArgs(PCONFIG));
     const connect = d.argvs.find((a) => a[0] === "network" && a[1] === "connect")!;
-    // At the last usable host address of 172.30.50.0/24, and no alias: forward names reach the proxy through the sandbox's /etc/hosts.
-    expect(connect).toEqual(["network", "connect", "--ip", "172.30.50.254", net.id, p.id]);
+    // The create put it at the last usable host address of 172.30.50.0/24, and no alias: forward names reach the proxy through the
+    // sandbox's /etc/hosts. The only connect is `bridge`, with no address (leg 14), before the start.
+    expect(connect).toEqual(["network", "connect", "bridge", p.id]);
     expect(d.containers.get(p.name)!.ips).toEqual({ [PNET]: "172.30.50.254" });
+    expect(d.verbs.indexOf("create")).toBeLessThan(d.verbs.indexOf("network connect"));
     expect(d.verbs.indexOf("network connect")).toBeLessThan(d.verbs.indexOf("start"));
     expect(d.containers.get(p.name)!.running).toBe(true);
-    expect(d.containers.get(p.name)!.networks).toEqual(["bridge", PNET]);
+    expect(d.containers.get(p.name)!.networks).toEqual([PNET, "bridge"]);
     expect(d.count("rm")).toBe(0);
   });
 
@@ -3786,16 +3813,18 @@ describe("createProjectProxy", () => {
     await d.createProjectProxy(PS, PROJ, cfg, {});
     const connect = d.argvs.find((a) => a[0] === "network" && a[1] === "connect")!;
     expect(connect).not.toContain("--alias");
-    expect(connect.slice(0, 4)).toEqual(["network", "connect", "--ip", "172.30.50.254"]);
+    expect(connect).toEqual(["network", "connect", "bridge", idFor(d.created[0]!.name)]);
+    expect(sub(d.argvs.find((a) => a[0] === "create")!, "--network")[0]).toContain("ip=172.30.50.254");
   });
 
-  it("an address that is taken fails the join with the address named, removes the proxy, and never falls back to a name", async () => {
+  it("an address that is taken fails the create with Docker's reason, makes nothing, and never falls back to a name", async () => {
     const { d } = await make();
     putProxy(d, proxyName(2), proxyLabels(), { networks: ["bridge", PNET] });
     d.containers.get(proxyName(2))!.ips = { [PNET]: "172.30.50.254" };
     const e = await settle(d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS));
     expect(e).toBeInstanceOf(ProxyStartError);
-    expect((e as Error).message).toContain("172.30.50.254");
+    expect((e as Error).message).toContain("Address already in use");
+    expect(d.count("network connect")).toBe(0);
     expect(d.count("start")).toBe(0);
     for (const a of d.argvs) expect(a).not.toContain("--alias");
     expect([...d.containers.keys()]).toEqual([proxyName(2)]); // the new one is gone
@@ -4267,6 +4296,142 @@ describe('setNetwork: "contained"', () => {
     await d.attachProjectNetwork(makeRef(id, PS), net);
     expect(d.containers.get(PS)!.networks).toEqual([PNET]);
     expect(d.argvs.filter((a) => a[1] === "disconnect")[0]).toEqual(["network", "disconnect", "-f", PNET, id]);
+  });
+
+  // Leg 14: under a non-runc runtime a running sandbox's network changes only while it is stopped.
+  describe("a running sandbox under a non-runc runtime (leg 14)", () => {
+    const mutating = (d: ScriptedDocker) => d.argvs.filter((a) => a[0] === "stop" || a[0] === "start" || (a[0] === "network" && a[1] !== "inspect"));
+
+    it.each(["runsc", "kata"])("%s: stop, attach, disconnect bridge, start, then the post-start step (in that order)", async (runtime) => {
+      const d = mkEgress();
+      const net = putNet(d);
+      const id = d.put(PS, "mine", { networks: ["bridge"], runtime });
+      const seen: Array<{ networks: string[]; started: boolean; running: boolean }> = [];
+      d.setContainment(async () => undefined, async (facts, started) => {
+        seen.push({ networks: facts.networks, started, running: facts.running });
+      });
+      await d.setNetwork(PS, "contained");
+      expect(mutating(d)).toEqual([
+        ["stop", "-t", "5", id],
+        ["network", "disconnect", "-f", PNET, id],
+        ["network", "connect", net.id, id],
+        ["network", "disconnect", "bridge", id],
+        ["start", id],
+      ]);
+      expect(d.containers.get(PS)!.networks).toEqual([PNET]);
+      expect(d.containers.get(PS)!.running).toBe(true);
+      // The post-start step ran once, after the start, on the new networks.
+      expect(seen).toEqual([{ networks: [PNET], started: true, running: true }]);
+    });
+
+    it("a runc sandbox, or one with no runtime named, is changed live: no stop, no start", async () => {
+      for (const runtime of ["runc", "io.containerd.runc.v2", undefined]) {
+        const d = mkEgress();
+        const net = putNet(d);
+        const id = d.put(PS, "mine", { networks: ["bridge"], ...(runtime !== undefined ? { runtime } : {}) });
+        await d.setNetwork(PS, "contained");
+        expect(mutating(d)).toEqual([
+          ["network", "disconnect", "-f", PNET, id],
+          ["network", "connect", net.id, id],
+          ["network", "disconnect", "bridge", id],
+        ]);
+      }
+    });
+
+    it("a stopped sandbox under runsc is changed as before (no stop, and no start: the caller starts it)", async () => {
+      const d = mkEgress();
+      putNet(d);
+      d.put(PS, "mine", { networks: ["bridge"], runtime: "runsc", running: false });
+      await d.setNetwork(PS, "contained");
+      expect(d.count("stop") + d.count("start")).toBe(0);
+      expect(d.containers.get(PS)!.networks).toEqual([PNET]);
+    });
+
+    it("a failed attach leaves the sandbox stopped, on bridge, never started on the wrong networks", async () => {
+      const d = mkEgress();
+      putNet(d);
+      d.put(PS, "mine", { networks: ["bridge"], runtime: "runsc" });
+      d.script.push((a) => (a[1] === "connect" ? { code: 1, stderr: "boom" } : undefined));
+      await expect(d.setNetwork(PS, "contained")).rejects.toThrow(/Failed to attach/);
+      expect(d.count("start")).toBe(0);
+      expect(d.containers.get(PS)!.running).toBe(false);
+    });
+
+    it("a failed stop changes nothing", async () => {
+      const d = mkEgress();
+      putNet(d);
+      d.put(PS, "mine", { networks: ["bridge"], runtime: "runsc" });
+      d.script.push((a) => (a[0] === "stop" ? { code: 1, stderr: "cannot stop" } : undefined));
+      await expect(d.setNetwork(PS, "contained")).rejects.toThrow(/Failed to stop sandbox/);
+      expect(d.count("network connect") + d.count("network disconnect")).toBe(0);
+    });
+
+    it("the repair's re-attach (attachProjectNetwork with the sandbox's facts) does the same: stop, attach, start; runc is live", async () => {
+      const d = mkEgress();
+      const id = d.put(PS, "mine", { networks: [PNET], runtime: "runsc" });
+      const net = await d.ensureProjectNetwork(PS, PROJ);
+      d.argvs.length = 0;
+      await d.attachProjectNetwork(makeRef(id, PS), net, { running: true, runtime: "runsc" });
+      expect(mutating(d)).toEqual([
+        ["stop", "-t", "5", id],
+        ["network", "disconnect", "-f", PNET, id],
+        ["network", "connect", net.id, id],
+        ["start", id],
+      ]);
+      d.argvs.length = 0;
+      await d.attachProjectNetwork(makeRef(id, PS), net, { running: true, runtime: "runc" });
+      await d.attachProjectNetwork(makeRef(id, PS), net, { running: false, runtime: "runsc" });
+      await d.attachProjectNetwork(makeRef(id, PS), net);
+      expect(d.count("stop") + d.count("start")).toBe(0);
+    });
+
+    it("restartSandbox stops and starts a running sandbox; a stopped or missing one is left alone; another's is refused", async () => {
+      const d = mkEgress();
+      const id = d.put(PS, "mine", { networks: [], runtime: "runsc" });
+      await d.restartSandbox(PS);
+      expect(d.argvs.filter((a) => a[0] === "stop" || a[0] === "start")).toEqual([["stop", "-t", "5", id], ["start", id]]);
+      const idle = mkEgress();
+      idle.put(PS, "mine", { networks: [], running: false });
+      await idle.restartSandbox(PS);
+      await idle.restartSandbox("mcpe-0123abcd-gone");
+      expect(idle.count("stop") + idle.count("start")).toBe(0);
+      const other = mkEgress();
+      other.put(PS, "another", { networks: [] });
+      expect(await settle(other.restartSandbox(PS))).toBeInstanceOf(SandboxRefusedError);
+      expect(other.count("stop") + other.count("start")).toBe(0);
+    });
+  });
+});
+
+describe("proxyMac and isRuncRuntime (leg 14)", () => {
+  const A = idFor("net:a");
+  const B = idFor("net:b");
+
+  it("is a locally administered unicast MAC (02: prefix), six lower-case hex octets", () => {
+    for (const id of [A, B, "x", ""]) expect(proxyMac(id)).toMatch(/^02(:[0-9a-f]{2}){5}$/);
+  });
+
+  it("is the same for the same network id, and differs between ids", () => {
+    expect(proxyMac(A)).toBe(proxyMac(A));
+    expect(proxyMac(A)).not.toBe(proxyMac(B));
+  });
+
+  it("isRuncRuntime: runc and io.containerd.runc.v2, an absent one as the daemon's default", () => {
+    expect(isRuncRuntime("runc")).toBe(true);
+    expect(isRuncRuntime("io.containerd.runc.v2")).toBe(true);
+    expect(isRuncRuntime("runsc")).toBe(false);
+    expect(isRuncRuntime("kata")).toBe(false);
+    for (const absent of [undefined, null, ""]) expect(isRuncRuntime(absent)).toBe(true);
+    for (const absent of [undefined, null, ""]) expect(isRuncRuntime(absent, "runsc")).toBe(false);
+    expect(isRuncRuntime("runc", "runsc")).toBe(true);
+  });
+
+  it("both proxies are created with the MAC of their network's id", async () => {
+    const d = mkEgress();
+    const net = putNet(d);
+    await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+    const create = d.argvs.find((a) => a[0] === "create")!;
+    expect(sub(create, "--network")).toEqual([`name=${PNET},ip=172.30.50.254,mac-address=${proxyMac(net.id)}`]);
   });
 });
 
@@ -5395,11 +5560,13 @@ describe("no embedded DNS anywhere (leg 13)", () => {
     const src = read("src/sandbox/docker.ts");
     expect(src).not.toMatch(/--alias/);
     expect(src).not.toMatch(/PROXY_ALIAS/);
-    // Every connect of a PROXY is `--ip <address>`; the only other connect is the sandbox's own attach to its network (no address, no alias).
+    // Leg 14: a proxy's address is given at its create (`--network name=...,ip=...`); a connect of a proxy is `bridge` (no address) or,
+    // for a restored one, `--ip <address>`; the only other connect is the sandbox's own attach to its network (no address, no alias).
     const connects = [...src.matchAll(/\[\s*"network",\s*"connect"[^\]]*\]/g)].map((m) => m[0]);
     expect(connects.length).toBeGreaterThanOrEqual(4);
     for (const c of connects) if (!c.includes("sandbox.id") && !c.includes('"bridge"')) expect(c).toMatch(/"--ip"/);
-    expect(connects.filter((c) => c.includes('"--ip"'))).toHaveLength(3); // the one-shot's proxy, a project proxy, a restored proxy
+    expect(connects.filter((c) => c.includes('"--ip"'))).toHaveLength(1); // the restored proxy
+    expect(src.match(/ip=\$\{proxyAddress\(net\.subnet\)\},mac-address=\$\{proxyMac\(net\.id\)\}/g)).toHaveLength(1); // the one create spec both proxies share
   });
 
   it("no source file names the proxy by host name", () => {
@@ -5414,7 +5581,7 @@ describe("no embedded DNS anywhere (leg 13)", () => {
     }
   });
 
-  it("a one-shot's proxy variables, a project proxy's connect and a restored proxy's connect all carry --ip and no --alias", async () => {
+  it("a one-shot's proxy and a project proxy are created with their address and carry no --alias; a restored proxy's connect carries --ip", async () => {
     const d = mkEgress();
     await d.once(EGRESS);
     const e = mkEgress();
@@ -5423,8 +5590,10 @@ describe("no embedded DNS anywhere (leg 13)", () => {
     await e.restoreProjectProxy(p.id, { id: idFor(`net:${PNET}`), name: PNET, subnet: "172.30.50.0/24" });
     for (const x of [d, e]) {
       for (const a of x.argvs) expect(a).not.toContain("--alias");
-      for (const a of x.argvs.filter((y) => y[0] === "network" && y[1] === "connect")) expect(a).toContain("--ip");
+      for (const a of x.argvs.filter((y) => y[0] === "create" && y.includes("--read-only"))) expect(sub(a, "--network")[0]).toMatch(/^name=.+,ip=\d+\.\d+\.\d+\.254,mac-address=02(:[0-9a-f]{2}){5}$/);
     }
+    for (const a of d.argvs.filter((y) => y[0] === "network" && y[1] === "connect")) expect(a).toEqual(["network", "connect", "bridge", expect.any(String)]);
+    expect(e.argvs.filter((y) => y[0] === "network" && y[1] === "connect").filter((a) => a.includes("--ip"))).toHaveLength(1);
   });
 });
 

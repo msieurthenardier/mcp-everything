@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import net from "node:net";
 import type { Config } from "../config.js";
 import { isInstallationId } from "../installation.js";
@@ -623,6 +623,30 @@ const ISOLATED_BRIDGE_NEEDS = "a Docker version whose bridge driver supports gat
 export function proxyAddress(subnet: string): string {
   const { base, prefix } = parseSubnet(subnet);
   return dotted(base + 2 ** (32 - prefix) - 2);
+}
+
+/**
+ * The MAC address every proxy on a network is created with: a locally administered unicast address (`02:` prefix) derived
+ * from the network's id, the same for the same id. A proxy that replaces another on the same network thereby has the same
+ * IP and the same MAC, so a sandbox's neighbor cache (which gVisor does not refresh) stays right across a replacement. Pure.
+ */
+export function proxyMac(networkId: string): string {
+  const h = createHash("sha256").update(`proxy-mac:${networkId}`).digest();
+  return ["02", ...Array.from(h.subarray(0, 5), (b) => b.toString(16).padStart(2, "0"))].join(":");
+}
+
+/** The `--network` value that creates a proxy on its network at the proxy's address and MAC (the bridge is connected after the create). */
+function proxyNetworkSpec(net: { id: string; name: string; subnet: string }): string {
+  return `name=${net.name},ip=${proxyAddress(net.subnet)},mac-address=${proxyMac(net.id)}`;
+}
+
+/**
+ * Whether a runtime is runc (`runc`, `io.containerd.runc.v2`), the one that sees a network joined or left while a container
+ * runs. An absent runtime counts as the daemon's default. Anything else (gVisor's `runsc`) does not see it.
+ */
+export function isRuncRuntime(runtime: string | null | undefined, daemonDefault?: string): boolean {
+  const r = runtime !== undefined && runtime !== null && runtime !== "" ? runtime : daemonDefault !== undefined && daemonDefault !== "" ? daemonDefault : "runc";
+  return r === "runc" || r === "io.containerd.runc.v2";
 }
 
 function parseSubnet(subnet: string): { base: number; prefix: number } {
@@ -1641,10 +1665,52 @@ export class Docker {
    * names the network by its NAME, because the stale entry of a removed network is keyed by name (and a name that
    * is there again resolves to the network just made); the connect names it by id.
    */
-  async attachProjectNetwork(sandbox: SandboxRef, net: { id: string; name: string }): Promise<void> {
-    await this.docker(["network", "disconnect", "-f", net.name, sandbox.id], { timeoutMs: 60_000 }).catch(() => undefined);
-    const res = await this.docker(["network", "connect", net.id, sandbox.id], { timeoutMs: 60_000 });
-    if (res.code !== 0) throw new Error(`Failed to attach ${clean(sandbox.name)} to its project network: ${res.stderr.trim()}`);
+  async attachProjectNetwork(
+    sandbox: SandboxRef,
+    net: { id: string; name: string },
+    running?: { running: boolean; runtime?: string | null },
+  ): Promise<void> {
+    const attach = async (): Promise<void> => {
+      await this.docker(["network", "disconnect", "-f", net.name, sandbox.id], { timeoutMs: 60_000 }).catch(() => undefined);
+      const res = await this.docker(["network", "connect", net.id, sandbox.id], { timeoutMs: 60_000 });
+      if (res.code !== 0) throw new Error(`Failed to attach ${clean(sandbox.name)} to its project network: ${res.stderr.trim()}`);
+    };
+    if (running && this.needsRestartToChangeNetwork(running)) await this.whileStopped(sandbox.id, sandbox.name, attach);
+    else await attach();
+  }
+
+  /**
+   * Whether a sandbox that is running must be stopped to have its network changed: it is running, and its runtime is not
+   * runc (gVisor's network stack does not see a network joined or left while the sandbox runs).
+   */
+  private needsRestartToChangeNetwork(c: { running: boolean; runtime?: string | null }): boolean {
+    return c.running && !isRuncRuntime(c.runtime, this.daemonDefaultRuntime);
+  }
+
+  /**
+   * Change a running sandbox's networks the way a non-runc runtime needs: `docker stop`, the change, `docker start`, then the
+   * post-start step (the local-access names: Docker rewrote `/etc/hosts`). A change that fails leaves the sandbox stopped
+   * (never started on the wrong networks) and throws. Unhooked: this is containment's own step.
+   */
+  private async whileStopped(id: string, name: string, change: () => Promise<void>): Promise<void> {
+    const stopped = await this.docker(["stop", "-t", "5", id], { timeoutMs: 60_000 });
+    if (stopped.code !== 0 && !this.isNotThere(stopped)) {
+      throw new Error(`Failed to stop sandbox ${clean(name)} to change its network: ${stopped.timedOut ? "timed out" : stopped.stderr.trim()}`);
+    }
+    await change();
+    await this.startId(id, name, true);
+    const after = await this.inspectContainer(id, true);
+    if (after) await this.afterStarted(after, name, true);
+  }
+
+  /**
+   * Stop and start a running sandbox, then run the post-start step. The restart that follows a proxy swap under a non-runc
+   * runtime when containment's named switch (`restartAfterSwap`) is on. Undefined-safe: a sandbox that is gone or not running is left alone.
+   */
+  async restartSandbox(name: string): Promise<void> {
+    const c = await this.resolveContainer(name);
+    if (!c || !c.running) return;
+    await this.whileStopped(c.id, name, async () => undefined);
   }
 
   /**
@@ -1755,7 +1821,9 @@ export class Docker {
         "--user", "node",
         "--read-only",
         "--tmpfs", "/tmp:size=8m",
-        "--network", "bridge",
+        // Created on the contained network at its address and fixed MAC; `bridge` (the way out) is connected after the create,
+        // because `docker create` cannot take both. There is never a fallback to a name: a name needs Docker's embedded DNS.
+        "--network", proxyNetworkSpec(contained),
         "--entrypoint", "node",
         this.cfg.docker.proxyImage,
         ...proxyLaunchArgs(
@@ -1773,12 +1841,10 @@ export class Docker {
     const id = created.stdout.trim();
     if (!FULL_ID.test(id)) throw new ProxyStartError(`Docker printed no usable id: ${oneLine(id, 80) || "(nothing)"}`);
     held.proxy = id;
-    // The address must be given before the proxy starts, or the proxy would start with one network and miss the other.
-    // There is never a fallback to a name: a name needs Docker's embedded DNS.
-    const address = proxyAddress(contained.subnet);
-    const joined = await this.docker(["network", "connect", "--ip", address, contained.id, id], { timeoutMs: 60_000 });
+    // The way out must be joined before the proxy starts, or the proxy would start with one network and miss the other.
+    const joined = await this.docker(["network", "connect", "bridge", id], { timeoutMs: 60_000 });
     if (joined.code !== 0 || joined.timedOut) {
-      throw new ProxyStartError(`it could not be joined to the contained network at ${address}: ${joined.timedOut ? "timed out" : oneLine(joined.stderr.split("\n").filter((l) => l.trim() !== "").at(-1) ?? "", 200) || "docker network connect failed"}`);
+      throw new ProxyStartError(`it could not be joined to bridge: ${joined.timedOut ? "timed out" : oneLine(joined.stderr.split("\n").filter((l) => l.trim() !== "").at(-1) ?? "", 200) || "docker network connect failed"}`);
     }
     const started = await this.docker(["start", id], { timeoutMs: 60_000 });
     if (started.code !== 0 || started.timedOut) {
@@ -1906,7 +1972,7 @@ export class Docker {
           "--user", "node",
           "--read-only",
           "--tmpfs", "/tmp:size=8m",
-          "--network", "bridge",
+          "--network", proxyNetworkSpec(net),
           "--add-host", "host.docker.internal:host-gateway",
           "--entrypoint", "node",
           this.cfg.docker.proxyImage,
@@ -1923,11 +1989,10 @@ export class Docker {
       const id = created.stdout.trim();
       if (!FULL_ID.test(id)) throw new ProxyStartError(`Docker printed no usable id: ${oneLine(id, 80) || "(nothing)"}`);
       held = id;
-      // The address is given before the proxy starts, or it would start with one network and miss the other.
-      const address = proxyAddress(net.subnet);
-      const joined = await this.docker(["network", "connect", "--ip", address, net.id, id], { timeoutMs: 60_000 });
+      // The way out is joined before the proxy starts, or it would start with one network and miss the other.
+      const joined = await this.docker(["network", "connect", "bridge", id], { timeoutMs: 60_000 });
       if (joined.code !== 0 || joined.timedOut) {
-        throw new ProxyStartError(`it could not be joined to the project network at ${address}: ${joined.timedOut ? "timed out" : oneLine(joined.stderr.split("\n").filter((l) => l.trim() !== "").at(-1) ?? "", 200) || "docker network connect failed"}`);
+        throw new ProxyStartError(`it could not be joined to bridge: ${joined.timedOut ? "timed out" : oneLine(joined.stderr.split("\n").filter((l) => l.trim() !== "").at(-1) ?? "", 200) || "docker network connect failed"}`);
       }
       await this.startAndAwait(id, false);
       return { id, name };
@@ -2724,11 +2789,16 @@ export class Docker {
       const project = c.labels?.[PROJECT_LABEL];
       const net = await this.findContainedNetwork(own, { role: PROJECT_NET_ROLE, sandbox: name, ...(project !== undefined ? { project } : {}) });
       if (!net) throw new Error(`The project network ${clean(own)} does not exist; it must be made before ${clean(name)} is contained`);
-      await this.attachProjectNetwork(makeRef(c.id, name), net);
-      if (onBridge) {
-        const res = await this.docker(["network", "disconnect", "bridge", c.id], { timeoutMs: 60_000 });
-        if (res.code !== 0) throw new Error(`Failed to disable network for ${clean(name)}: ${res.stderr.trim()}`);
-      }
+      const move = async (): Promise<void> => {
+        await this.attachProjectNetwork(makeRef(c.id, name), net);
+        if (onBridge) {
+          const res = await this.docker(["network", "disconnect", "bridge", c.id], { timeoutMs: 60_000 });
+          if (res.code !== 0) throw new Error(`Failed to disable network for ${clean(name)}: ${res.stderr.trim()}`);
+        }
+      };
+      // gVisor does not see a network joined to a running sandbox: stop, attach, leave bridge, start (runc changes it live).
+      if (this.needsRestartToChangeNetwork(c)) await this.whileStopped(c.id, name, move);
+      else await move();
       return;
     }
     if (mode === "open") {

@@ -595,6 +595,56 @@ The Docker case for the volume fix has a fifth, owed in Phase B: run it once wit
 - NEW, leg 9 describe, "leg 13: the local-access names are in the sandbox's /etc/hosts ...": one sandbox on the proxy image, its volume, `-net` and proxy, a registry record in the describe's own temporary data directory; stops and restarts the sandbox with `docker stop` on the checked name; replaces the proxy under a configuration with no forwards. Removal: the same `sweepOwn()` (owner label) and `afterAll` removal of the describe's data directory (checked to be under the temporary directory and named `mcpe-it-c9-<id>`).
 - CHANGED (same guards, no new object): the idle-timeout cases and the project-network primitives case read `IFACES`; the project-network case also asserts the proxy's `IPAMConfig` address and `projectProxyAttached`, and that no alias is present; the CONNECT scripts (three copies) take the proxy's host from `HTTPS_PROXY`; five `mcpe-proxy` pins now compare with `proxyUrlOf(<net>)` (inspect of the network's subnet); the bash `/dev/tcp` probe in the Go install reads the host from `HTTPS_PROXY`; the replacement case passes `-e HTTPS_PROXY=<url>` to its raw `docker exec` and no longer expects an overlap; the post-replacement checks (here and in `set_project_hosts`) retry up to 6 times, 1 s apart; the Go CLI offline case, the "before ownership" case (`--runtime`) and T14 (diagnostics) as classified above.
 
+### gvisor-network-changes
+**Status**: landed (not committed). Stage A below; Stage B and the T18 follow-up recorded here.
+**Stage B** (Flight Director's go-ahead): full local `npm run test:docker` (no runtime named): first run **65 passed, 1 failed, 5 skipped**, 646 s. The one failure was a leg-14 consequence, not a product bug: the one-shot proxy case "while it runs the proxy is hardened and joined to bridge and the one-shot network only" asserted `HostConfig.NetworkMode === "bridge"`, but the proxy is now created on the one-shot network, so the mode is that network's name. **Changed that assertion** (now: the mode names the `-oneshot-net-` network, and `NetworkSettings.Networks` holds exactly `bridge` plus that network; the other assertions of the case are unchanged, none loosened otherwise). Re-ran that case alone: passed. After-lists identical to the before-lists (containers 22 `eda4d0afb38a`, volumes 253 `0e4087fdb748`, networks 8 `751ad5f79484`); volume diff against `scratchpad/leg14-volumes-before.txt` empty (no new volume); no `mcpe-it`/`mcpe-hosts` dir in `/tmp`. Log: `scratchpad/leg14/docker-run.log`. Final counts: `npm test` 2751 passed, 71 skipped (before 2728/71); typecheck and build clean. Docker-gated cases are not rerun in full after the one-assertion edit (the single case was).
+**What was built**:
+- `src/sandbox/docker.ts`:
+  - `proxyMac(networkId)` (pure, exported): `02:` plus the first five bytes of `sha256("proxy-mac:" + id)`; locally administered, unicast, the same for the same id. `proxyNetworkSpec(net)` (private): `name=<net>,ip=<proxyAddress>,mac-address=<proxyMac>`.
+  - Both proxies (one-shot's `startProxy`, project's `createProjectProxy`) are created with `--network <spec>` (no longer `--network bridge`), then `network connect bridge <id>` (no `--ip`), then `start`. A taken address now fails at the create with Docker's own words, as `ProxyStartError`.
+  - `restoreProjectProxy` is unchanged (stop, `network connect --ip`, start, ready, attached); `projectProxyAttached` still checks the configured address.
+  - `isRuncRuntime(runtime, daemonDefault?)` (pure, exported): `runc` and `io.containerd.runc.v2` are runc; an absent runtime is the daemon's default (runc until known).
+  - `whileStopped(id, name, change)` (private): `docker stop -t 5`, the change, `startId` (with the runtime mapping), then a fresh inspect and the post-start step. A failed change leaves the sandbox stopped (never started on the wrong networks). `needsRestartToChangeNetwork(c)`: running and not runc.
+  - `setNetworkNow("contained")` does attach, then `disconnect bridge`, inside `whileStopped` when the sandbox is running under a non-runc runtime; unchanged otherwise. `attachProjectNetwork(ref, net, running?)` takes the optional sandbox facts (`{ running, runtime }`) and does the same stop, attach, start for the repair's re-attach; with no third argument it is as before.
+  - `restartSandbox(name)` (public): resolve and classify, then `whileStopped` with no change; a stopped or missing sandbox is left alone. It exists only for the fallback.
+- `src/network/containment.ts`:
+  - `RESTART_AFTER_SWAP` (exported const, **false**) and `restartAfterSwap({ running, contained, runc }, enabled = RESTART_AFTER_SWAP)` (pure): the one named place to switch the fallback on. `replaceInner` calls a private `restartForSwap(s)` after a successful swap (before the local-access write): with the switch off it returns at once; on, it inspects the sandbox and calls `docker.restartSandbox` when it is running, contained and non-runc. Never throws (logged).
+  - `ContainmentDocker` gained `restartSandbox` and the optional third argument of `attachProjectNetwork`; the repair passes `{ running: f.running, runtime: f.runtime }`.
+- `test/integration/gvisor.test.ts`: Run B's events format is `{{.Actor.ID}}`. **Checked locally** against the Docker 29.8.2 Desktop daemon with read-only `docker events --since .. --until .. --format`: `{{.Actor.ID}}` prints container ids; `{{.ID}}` fails with "can't evaluate field ID in type *events.Message" (the CI failure). `docker events --help` lists `--format string` with Go templates.
+- `test/integration/docker.test.ts`: T14 is `it.skipIf(process.env.MCPE_DOCKER_RUNTIME === "runsc")` with the reason (runsc cannot clean up a container whose start failed, a stale containerd task, so a stopped sandbox whose `-net` was removed must be recreated).
+- `README.md` (gVisor limits, in "The isolation runtime"): containing a running sandbox restarts it under gVisor (processes do not survive; proxies carry a fixed address and MAC so a replacement needs no restart); a stopped sandbox whose project network was removed is recreated (T14's cause). The "not yet tested in CI" sentence and its LEG 12 comment are untouched.
+**Existing tests changed, and why**:
+- `test/docker.test.ts` (fake): `create` reads `--network name=..,ip=..` (the proxy starts on that network with its address, `bridge` joins later), refuses a taken address at the create like Docker, and `stop` now stops the container.
+  - "creates the proxy hardened" (one-shot) and "makes a hardened proxy" (project): `--network` is the spec with the MAC, not `bridge`; the project one also expects the only connect to be `bridge` and the networks order `[project net, bridge]`.
+  - "joins the contained network at the proxy address (no alias) before it starts" renamed to "is created on the contained network ..., joins bridge before it starts": the connect is `network connect bridge <id>`.
+  - "makes a proxy whatever the forward target is called": the connect is the bridge one and the create carries the address.
+  - "an address that is taken fails the join with the address named ..." renamed ("fails the create with Docker's reason, makes nothing"): the failure is now at the create, so the message is Docker's "Address already in use" (the address is no longer in it) and no connect is issued.
+  - "no `network connect` in docker.ts carries --alias ...": proxy connects are now `bridge` (no address) or the restore's `--ip`; the count of `--ip` connects is 1, not 3, and one create spec is shared by both proxies.
+  - "a one-shot's proxy variables, a project proxy's connect and a restored proxy's connect all carry --ip" renamed: the create carries the address and MAC, every proxy connect of a create is `bridge`, the restore's connect carries `--ip`.
+  - `NOT_GUARDED`: names `needsRestartToChangeNetwork`, `whileStopped`, `restartSandbox`. A seed string was changed to avoid the `mcpe-proxy` source scan.
+- `test/docker-bypass.test.ts`: the three new methods are in the tables (`whileStopped` and `restartSandbox` are unhooked by design, like `startForContainment`: containment's own network changes); the `startId` callers list gained `whileStopped`.
+- `test/containment.test.ts` (`FakeLayer`): records the attach's third argument (`attachInfo`), implements `restartSandbox`, and has an `afterDetach` hook. "recreates a missing network and attaches the sandbox" also asserts the facts passed. `test/startup-containment.test.ts` (`FakeLayer`): implements `restartSandbox`.
+**New unit cases**: `proxyMac` (format, same id same MAC, different ids differ), `isRuncRuntime`; both proxies' create argv; the stop, attach, disconnect bridge, start order and the post-start step under `runsc` and `kata`, runc and no-runtime sandboxes unchanged, a stopped runsc sandbox unchanged, a failed attach and a failed stop, the repair's `attachProjectNetwork` with and without facts, `restartSandbox` (running, stopped, missing, another's refused); containment: the repair passes its facts, `restartAfterSwap` in both states, the shipped switch is off and a replacement restarts nothing, and **leg 13's follow-up**: a lock lost after the detach and before the create creates nothing and restores nothing.
+**Trials** (`git diff --stat -- src test` 6 files, 397 insertions, 44 deletions before; each weakening confirmed to fail, then restored by editing; the diff stat afterwards matches except the one-line difference the trials' own restore left out of the before count, checked by `grep` on the three restored lines):
+1. the MAC dropped from the create spec: 5 failed (both argv cases, the MAC case, the two source scans).
+2. `needsRestartToChangeNetwork` made false (the stop, attach, start branch disabled): 5 failed.
+3. `RESTART_AFTER_SWAP` set true: 4 failed (the "off" cases and two order cases that count the sandbox's calls).
+4. `assertLive` removed between detach and create: 1 failed, the new case (this was the leg 13 review's uncaught mutation). One trial edit dropped a trailing space on `const made =`; it was found by reading the lines and restored, and the three tests files re-ran green.
+**Checks**: `npm run typecheck` clean; `npm test`: **2728 passed, 71 skipped before; 2746 passed, 71 skipped after** (+18 passed); `npm run build` clean.
+**Deviations and notes**:
+1. **Open question, the rollback's MAC.** The leg says the restore path reconnects with the same IP and "its MAC is fixed at create". `network connect` has no MAC option (T17), and the proxy was disconnected by the replacement. T17 did not test a disconnect then a reconnect; Docker may give the reconnected endpoint a MAC derived from its IP (`02:42:..`) rather than the one fixed at create. If so, a failed replacement's rollback would restore the old IP with a different MAC under gVisor. It affects only the rollback of a failed replacement; the new Docker-gated case reads the MAC after a normal replacement (not after a rollback). Not guessed at: reported for a check after the gate.
+2. `attachProjectNetwork` gained an optional third parameter rather than a new method, so the repair keeps one call. `ContainmentDocker.restartSandbox` is required (the fallback needs it); the fakes gained it.
+3. The stop uses `-t 5`; the leg names no timeout.
+4. A repair's re-attach runs the post-start step too (the leg: "then afterStart"), before the proxy replacement that follows it.
+**T18 follow-up (Flight Director's answer to deviation 1)**: T18 (Docker Desktop 29.8.2, throwaway objects) showed that a proxy created with a fixed MAC, disconnected and reconnected with `--ip`, keeps its IP but gets a NEW random MAC; the connect `--driver-opt` MAC does not help. So `rollbackReplace` now calls `restartAfterRestore(s)` after a successful restore: if the sandbox is running and `isRuncRuntime` is false, `restartSandbox` (not behind `RESTART_AFTER_SWAP`; never throws, logged). Unit cases: runsc and running restarts once; runsc stopped, runc and no runtime restart nothing; a failed restore restarts nothing (5 new cases; `npm test` count recorded below). Trial 5: the `restartAfterRestore` call removed: the runsc-running case failed (1), restored. Deviations 2 to 4 accepted. The leg's Context now records T18.
+**Docker lists before Stage B** (read-only): containers 22 `eda4d0afb38a`; volumes 253 `0e4087fdb748`; networks 8 `751ad5f79484`. The volume list is saved in `scratchpad/leg14-volumes-before.txt` (253 lines, checked equal to the daemon's list; the Write tool).
+**Docker-gated cases changed or added (written, NOT run)**:
+- CHANGED, `test/integration/docker.test.ts` leg 6 case "moves a sandbox between off, contained and open ...": also asserts the proxy's MAC on the project network is `proxyMac(network.id)` (a read-only inspect; no new object).
+- CHANGED, leg 13 case "a replacement keeps the proxy's address ...": also reads the old and the new proxy's MAC on the network and expects both to be `proxyMac(network.id)` (the old one read before the replacement; no new object).
+- CHANGED, T14 "in code": `skipIf(MCPE_DOCKER_RUNTIME === "runsc")`; unchanged otherwise.
+- CHANGED, `test/integration/gvisor.test.ts` runtime-proof case: the events format.
+- No new Docker object is made by any case. Cases that call `setNetwork(.., "contained")` on a running sandbox now stop and start it under `MCPE_DOCKER_RUNTIME=runsc` (the product change), which only the CI `gvisor` job exercises; locally (no runtime named) they behave as before.
+
 ## Decisions
 
 ### MCPE_LOCAL_ACCESS targets are names; the agent's hosts are names
@@ -1109,6 +1159,44 @@ The Docker case for the volume fix has a fifth, owed in Phase B: run it once wit
     - the probe network is briefly visible. The sweep's age floor keeps it from being taken mid-probe; an unreadable attempt retries.
     - after a lock takeover the old proxy is deliberately not restored.
   - Leg 13 set to `completed`; the fix commit follows.
+- **Fix commit `3872c1a`** pushed (15 files, +2,293 / −234).
+- **Second full `gvisor` run** (45192885567):
+  - **`contained-linux` (runc, native Linux): 31 of 31 passed. Containment is proven on native Linux.**
+  - **Run A: 57 passed, 9 failed** (was 21), in 719 s.
+  - **Run B: 2 passed, 1 failed.**
+  - Fixed by leg 13: embedded DNS (all contained installs, clones and one-shots now work under gVisor) and the overlay finding (the "keeps its files" test passes with `--overlay2=none`).
+  - **Remaining**:
+    - 7× `EHOSTUNREACH`, sandbox to proxy, all where the network changes while the sandbox runs. The diagnosis: a hot-plugged NIC is unseen by gVisor, and the neighbor cache is stale after a proxy swap.
+    - T14's cause: runsc cannot clean up a failed start ("stale containerd task object").
+    - Run B: a test bug (`--format {{.ID}}` on events).
+- **T17** (Flight Director trial, Docker Desktop, throwaway objects, removed): creating the proxy with `--network name=<net>,ip=<addr>,mac-address=<mac>`, then `connect bridge`, gives the same IP **and the same MAC** across two successive proxies. `docker create` cannot take `bridge` and a user network together, and `network connect` has no MAC option.
+- **Leg 14 `gvisor-network-changes`** (the HAT becomes 15):
+  - a fixed proxy MAC per network;
+  - stop–attach–start for containing a running sandbox under a non-runc runtime;
+  - a named restart-after-swap fallback, off until CI decides;
+  - T14 skipped under runsc with its cause;
+  - the events-format fix;
+  - leg 13's follow-up test.
+
+  It is tiered high, but there is no separate design review: the work is narrow, it rests on measured premises, and CI plus a diff review are the checks.
+- **Leg 14 Docker gate (Flight Director).**
+  - Stage A: 2746 passed, 71 skipped; typecheck and build clean; four trials failed tests. The changed Docker cases only add MAC assertions, a runsc skip and the events-format fix (no new objects).
+  - **T18** (Flight Director trial, Docker Desktop, throwaway objects, removed): after `network disconnect` and `network connect --ip X`, a proxy keeps its IP but gets a **new random MAC**; `--driver-opt com.docker.network.endpoint.macaddress=…` does not help. So a failed replacement's rollback loses the fixed MAC.
+  - **Fix**: the rollback restarts a running non-runc sandbox after the restore. This is a rare path.
+  - The go-ahead for Stage B was given with that fix.
+- Leg 14 `[LAND:leg]` received.
+  - The local full Docker suite gave 65 passed, 1 failed and 5 skipped. The failure was the one-shot proxy's `NetworkMode` pin, a consequence of creating it on its own network. The assertion now requires that network plus exactly `bridge`, still never host. The case re-ran green.
+  - Docker lists unchanged, with no new volume.
+  - Unit suite: 2751 passed, 71 skipped.
+- **Leg 14 review: `[HANDOFF:confirmed]`, no blocking issues.**
+  - 9 mutations; 8 were caught. **Not caught**: a failed `docker stop` in `whileStopped` (no test pins "stop fails, so nothing changes"). The code throws correctly.
+  - **Follow-ups (non-blocking)**: a unit test for a failed stop, and splitting a double statement in `test/docker-bypass.test.ts:282`.
+  - Leg 14 set to `completed`; committed and pushed for the third `gvisor` round.
+- **A stalled shell, found by the operator.**
+  - A Developer's background wait loop, `while pgrep -f 'vitest run test/integration' …; do sleep 15; done`, had run for 7 h 46 min (since about leg 9's Docker run).
+  - It could never end, because `pgrep -f` matched the loop's own command line, which contains the pattern. It kept that agent's task "waiting on its own background work".
+  - Stopped by the Flight Director (`kill 3041064`). No other loops of that form remain.
+  - **For the debrief**: a wait loop on `pgrep -f` must exclude itself (`pgrep -f '[v]itest …'`), or wait on a PID. Background waits by crew should have a bound.
 - **Phase 2d: the flight-end Reviewer is spawned** over `git diff main` plus the untracked files. Two items are carried to it: the build-phase local-access forwards (leg 11's finding), and the test helpers' `rm -f` without `-v`. The Reviewer is told not to run the Docker suite; the Flight Director runs the final full Docker suite after the fixes.
 - **Standing gap recorded**: sandboxes from before ownership (no project label) are not listed and stay uncontained under `contained`. Leg 11's README states it: "reinstall to contain".
 - **DD5 "measured" is narrowed**: Go and npm are measured in leg 8. The Debian `need`/`apt-get`, Python, Rust, Ruby and CMake/autotools rows, and `pnpm`/`yarn`, stay unmeasured. Leg 11's README must not claim otherwise.

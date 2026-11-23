@@ -561,6 +561,7 @@ Legs are cut by kind of risk (flight 1 debrief):
 - [x] `status-and-docs` - Instructions, status lines, tool wording, README
 - [x] `gvisor-ci` - CI workflow on plain Linux with gVisor and containment
 - [x] `proxy-by-address` - Sandboxes reach their proxy by a fixed address, not Docker's embedded DNS (which gVisor cannot use); local-access names through the sandbox's hosts file; gVisor-specific skips; a native-Linux runc containment run in CI *(added after the first full gVisor run, 2026-11-23; operator)*
+- [x] `gvisor-network-changes` - Under gVisor, network changes to a running sandbox: a fixed proxy MAC per project network (T17), and attaching a running sandbox by stop–attach–start; T14 skipped under runsc with its cause; Run B's events format *(added after the second full gVisor run, 2026-11-23)*
 - [ ] `hat-and-alignment` *(optional)* - Guided HAT (human acceptance test) session with iterative fixes
 
 ---

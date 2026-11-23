@@ -5,6 +5,7 @@ import type { Config } from "../config.js";
 import type { Registry } from "../registry.js";
 import type { Ecosystem, ProjectRecord } from "../types.js";
 import {
+  isRuncRuntime,
   makeRef,
   networkModeOf,
   newProjectProxyName,
@@ -128,12 +129,33 @@ export const LIMITS = {
   resolverFailures: 3,
 } as const;
 
+/**
+ * THE SWITCH (leg 14). Under a non-runc runtime (gVisor), whether a running, contained sandbox is restarted after its
+ * proxy was swapped, in case the sandbox's neighbor cache still holds the old proxy's MAC. OFF: the proxy's fixed MAC
+ * (`proxyMac`) is relied on first. The Flight Director turns it on only if CI still shows `EHOSTUNREACH` after a replacement.
+ */
+export const RESTART_AFTER_SWAP = false;
+
+/**
+ * Whether a sandbox is restarted after a proxy replacement: only when the switch is on, the sandbox is running, on its
+ * project network only, and its runtime is not runc. Pure; `enabled` defaults to the named switch.
+ */
+export function restartAfterSwap(
+  sandbox: { running: boolean; contained: boolean; runc: boolean },
+  enabled: boolean = RESTART_AFTER_SWAP,
+): boolean {
+  return enabled && sandbox.running && sandbox.contained && !sandbox.runc;
+}
+
 /** What `Containment` needs of the Docker layer; `Docker` is one, and a test's double is another. */
 export interface ContainmentDocker {
   ensureImage(image: string): Promise<void>;
   ensureProjectNetwork(sandbox: string, project: string): Promise<ContainedNetwork & { created: boolean }>;
   findProjectNetwork(sandbox: string, project: string): Promise<ContainedNetwork | undefined>;
-  attachProjectNetwork(sandbox: SandboxRef, net: { id: string; name: string }): Promise<void>;
+  /** With `running` given and a non-runc runtime, a running sandbox is stopped, attached and started again. */
+  attachProjectNetwork(sandbox: SandboxRef, net: { id: string; name: string }, running?: { running: boolean; runtime?: string | null }): Promise<void>;
+  /** Stop and start a running sandbox (and its post-start step); a sandbox that is gone or stopped is left alone. */
+  restartSandbox(name: string): Promise<void>;
   listProjectProxies(sandbox: string): Promise<ProjectProxy[]>;
   projectProxyAttached(id: string, net: { id: string; name: string; subnet: string }): Promise<boolean>;
   /** Take a proxy off the project network (replacement's first step); gone or not attached is success. */
@@ -720,6 +742,7 @@ export class Containment {
         await this.docker.removeProjectProxy(p.id);
         removed++;
       }
+      await this.restartForSwap(s);
       // The names are the same when only hosts changed (the address is fixed); they are written again when there are any, and
       // taken out when the session's forwards changed and none are left.
       if (names.length > 0 || olds.some((p) => p.labels[SESSION_LABEL] !== plan.labels[SESSION_LABEL])) await this.syncLocalAccess(s, net, names);
@@ -730,6 +753,35 @@ export class Containment {
     } finally {
       if (!keep) await this.rollbackReplace(s, net, name, detached, lockLost);
       this.docker.invalidate({ sandbox: s.sandbox, key: s.key });
+    }
+  }
+
+  /**
+   * The named fallback (see `RESTART_AFTER_SWAP`, off): after a proxy swap, a running contained sandbox under a non-runc
+   * runtime is restarted. Never throws: a failure is logged, and the sandbox is then left as the swap left it.
+   */
+  private async restartForSwap(s: Subject): Promise<void> {
+    if (!RESTART_AFTER_SWAP) return;
+    try {
+      const f = await this.docker.inspectSandbox(s.sandbox);
+      if (!f) return;
+      if (restartAfterSwap({ running: f.running, contained: networkModeOf(f.name, f.networks) === "contained", runc: isRuncRuntime(f.runtime) })) await this.docker.restartSandbox(s.sandbox);
+    } catch (e) {
+      this.log(`containment: could not restart ${s.sandbox} after its proxy was replaced: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * T18: a proxy reconnected with `network connect --ip` keeps its address but gets a NEW MAC (a MAC can only be fixed at
+   * create). So after a rollback restored the old proxy, a running sandbox under a non-runc runtime is restarted, to rebuild its
+   * neighbor cache. Not behind `RESTART_AFTER_SWAP`: this path always needs it. Never throws (logged).
+   */
+  private async restartAfterRestore(s: Subject): Promise<void> {
+    try {
+      const f = await this.docker.inspectSandbox(s.sandbox);
+      if (f && f.running && !isRuncRuntime(f.runtime)) await this.docker.restartSandbox(s.sandbox);
+    } catch (e) {
+      this.log(`containment: could not restart ${s.sandbox} after its old proxy was put back: ${(e as Error).message}`);
     }
   }
 
@@ -750,6 +802,7 @@ export class Containment {
     for (const p of detached) {
       try {
         await this.docker.restoreProjectProxy(p.id, net);
+        await this.restartAfterRestore(s);
         return;
       } catch (e) {
         this.log(`containment: could not put the old proxy ${p.name} back after a failed replacement: ${(e as Error).message}`);
@@ -1101,7 +1154,8 @@ export class Containment {
     const net = await this.docker.ensureProjectNetwork(s.sandbox, s.project);
     this.subnets.set(net.id, net.subnet);
     // A network made again leaves the sandbox on the old one's name: attach it to the new one (T14).
-    if (net.created) await this.docker.attachProjectNetwork(makeRef(f.id, f.name), net);
+    // Under a non-runc runtime a running sandbox is stopped, attached and started again (the Docker layer decides).
+    if (net.created) await this.docker.attachProjectNetwork(makeRef(f.id, f.name), net, { running: f.running, runtime: f.runtime });
     if (opts.compareSession) return { result: await this.replaceLocked(lock, s, { compareSession: true }), net };
     const a = await this.assess(record, net, await this.docker.listProjectProxies(s.sandbox), s.key);
     if (a.kind === "replace") return { result: await this.replaceLocked(lock, s, {}), net };

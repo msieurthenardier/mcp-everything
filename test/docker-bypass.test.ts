@@ -119,6 +119,8 @@ const NOT_A_START_OR_EXEC: Record<string, string> = {
   detachProjectProxy: "docker network disconnect of a PROXY, classified by owner and role",
   restoreProjectProxy: "stop, connect and start of a PROXY (startAndAwait), classified by owner and role",
   clearLocalAccess: "calls writeLocalAccess (listed below) when a sandbox leaves its network",
+  // Leg 14 (gVisor network changes).
+  needsRestartToChangeNetwork: "a judgement of facts it was given",
   afterStarted: "calls the post-start step with facts it was given",
 };
 
@@ -126,6 +128,11 @@ const NOT_A_START_OR_EXEC: Record<string, string> = {
 
 const UNHOOKED_BY_DESIGN: Record<string, string> = {
   startForContainment: "the start containment makes itself, before and without the hook, while it builds the network and the proxy",
+  // Leg 14. Under a non-runc runtime a running sandbox's network can only change while it is stopped: `whileStopped` is stop, the
+  // change, then the unhooked start and the post-start step. Reached only from `setNetworkNow` and `attachProjectNetwork` (the
+  // network changes containment makes) and `restartSandbox` (containment's named fallback, off); never an exec.
+  whileStopped: "stop, a network change and an unhooked start of a sandbox, for containment's own network changes under a non-runc runtime",
+  restartSandbox: "containment's restart of a running sandbox after a proxy swap (a named switch, off): resolves and classifies, then whileStopped",
   // The one exec in a sandbox that is not the hook's: a root write of `/etc/hosts` (a fixed script, validated lines). Through the
   // hook it would recurse (the hook repairs, and repair writes). Only `Containment` and the class's own `clearLocalAccess` call it.
   writeLocalAccess: "a root exec of a fixed script that writes the sandbox's /etc/hosts, called by containment's post-start step and replacement",
@@ -272,8 +279,7 @@ describe("no bypass of the containment hook", () => {
 
   it("calls of the primitives come only from the guarded methods and startForContainment, with the exact callers recorded", () => {
     const callers = (what: string) => [...new Set(sites().filter((s) => s.what === what).map((s) => s.caller))].sort();
-    expect(callers("this.startId")).toEqual(["acquire", "ensureRunning", "startForContainment", "startIfStopped"]);
-    expect(callers("this.execOnce")).toEqual(["exec"]);
+    expect(callers("this.startId")).toEqual(["acquire", "ensureRunning", "startForContainment", "startIfStopped", "whileStopped"]);    expect(callers("this.execOnce")).toEqual(["exec"]);
     expect(callers("this.startIfStopped")).toEqual(["exec"]);
     expect(callers("this.ensureRunning")).toEqual([]);
   });

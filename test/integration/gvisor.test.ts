@@ -168,7 +168,7 @@ describe.skipIf(!enabled)("docker integration under gVisor (leg 12)", () => {
       const until = Math.floor(Date.now() / 1000) + 1;
       const events = await run(
         "docker",
-        ["events", "--since", String(since), "--until", String(until), "--filter", "type=container", "--filter", "event=create", "--filter", `label=mcp-everything.owner=${id}`, "--format", "{{.ID}}"],
+        ["events", "--since", String(since), "--until", String(until), "--filter", "type=container", "--filter", "event=create", "--filter", `label=mcp-everything.owner=${id}`, "--format", "{{.Actor.ID}}"],
         { timeoutMs: 120_000 },
       );
       expect(events.code, events.stderr).toBe(0);
