@@ -1,6 +1,6 @@
 # Flight: Checking Dependencies and Tool Descriptions
 
-**Status**: landed
+**Status**: completed
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-23.** The mission's tentative flight 3 ("Checking what a project brings with it") held three independent clusters of design decisions. At the operator's agreement it was split: this flight takes the two checks that run inside mcp-everything and change no sandbox layout. The layout change (build output onto a volume, a scanner stage after the build) becomes flight 4, together with the `docker.ts` split and the `before` ownership fix that flight 2's debrief puts ahead of it.
@@ -58,7 +58,7 @@ Add two built-in checks under flight 1's findings and policy. **`dependencies`**
 
 **DD3 — Dependency findings.** One finding per affected package, not per advisory:
 - **`error`** when any of its OSV ids starts with `MAL-` (operator, 2026-11-23). Rule id `malicious-package`.
-- **`warning`** otherwise (known vulnerable). Rule id `vulnerable-package`. The highest CVSS base score among the fetched advisories, when OSV gives one, is shown as `securitySeverity` (not used by the policy, as flight 1's DD3).
+- **`warning`** otherwise (known vulnerable). Rule id `vulnerable-package`. The highest CVSS base score among the fetched advisories, when OSV gives one, is shown as `securitySeverity` (not used by the policy, as flight 1's DD3). *(As built: OSV gives a CVSS vector, not a score, so GitHub's `database_specific.severity` label is shown instead; leg 2 and the flight log, accepted at the debrief.)*
 - Message: the package and version, the ids (at most 5, then "and N more"), and the first fetched summary. Location: the purl's ecosystem and name (`npm:lodash`), not a file (the graph does not say which manifest).
 - Every string from GitHub or OSV is third-party text and goes through flight 1's cleaning and bounds (message 200, location 120, rule id 80; at most 20 findings kept, highest level first, `omitted` counted).
 - Notes: how many packages were looked up; what was not looked up and why. They follow flight 1's existing rule (they count only under `MCPE_SCAN_BLOCK_AT=note`, as `build-hooks`' notes do; DD9). "What was sent where" is not a note (DD2).
