@@ -8,27 +8,27 @@ export type SarifResult =
 /** At most this many findings are kept (and cleaned) from one scanner's output. */
 export const MAX_FINDINGS = 20;
 
-const RULE_ID_MAX = 80;
-const MESSAGE_MAX = 200;
-const LOCATION_MAX = 120;
-const SEVERITY_MAX = 16;
+export const RULE_ID_MAX = 80;
+export const MESSAGE_MAX = 200;
+export const LOCATION_MAX = 120;
+export const SEVERITY_MAX = 16;
 const SKIPPED_KINDS = new Set(["pass", "notApplicable", "informational"]);
 
 export function emptyCounts(): Record<Level, number> {
   return { error: 0, warning: 0, note: 0 };
 }
 
-function isObject(v: unknown): v is Record<string, unknown> {
+export function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 /** Own-property read, so `__proto__` and friends are never inherited values. */
-function own(o: Record<string, unknown>, k: string): unknown {
+export function own(o: Record<string, unknown>, k: string): unknown {
   return Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined;
 }
 
 /** Slice before cleaning so hostile megabyte strings cost nothing, then clean to one line and cap. */
-function clean(text: string, max: number): string {
+export function clean(text: string, max: number): string {
   return oneLine(text.slice(0, max * 4), max);
 }
 

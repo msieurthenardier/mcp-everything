@@ -1,6 +1,6 @@
 # Flight: Checking Dependencies and Tool Descriptions
 
-**Status**: ready
+**Status**: in-flight
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-23.** The mission's tentative flight 3 ("Checking what a project brings with it") held three independent clusters of design decisions. At the operator's agreement it was split: this flight takes the two checks that run inside mcp-everything and change no sandbox layout. The layout change (build output onto a volume, a scanner stage after the build) becomes flight 4, together with the `docker.ts` split and the `before` ownership fix that flight 2's debrief puts ahead of it.
@@ -219,9 +219,9 @@ Flags:
 
 > **Note:** These are tentative suggestions, not commitments. Legs are planned and created one at a time as the flight progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] `extract-discovery` - Move discovery out of `installer.ts` behind the same calls, with no behavior change. Only the installer changes; nothing in `src/toolgen/` (low risk).
-- [ ] `dependency-check` - GitHub dependency graph and OSV lookups as the `dependencies` built-in check, before the clone, at checked installs and in `check_project`. Includes `CheckOutcome.contacted`, the lookup that is inert unless injected (`Installer` and `AppOptions`; the real client in `index.ts`), the rewritten `unreachableBlock`, the report, the instructions and the README (high risk: third-party input parser, outside services).
-- [ ] `tool-description-check` - `buildToolsWithText` with transient sources, the `tool-descriptions` check in `vetCatalog` at the end of discovery, withholding under block, `toolCheck` on the record, what the agent is told, the instructions and the README (high risk: changes what is published and callable).
+- [x] `extract-discovery` - Move discovery out of `installer.ts` behind the same calls, with no behavior change. Only the installer changes; nothing in `src/toolgen/` (low risk).
+- [x] `dependency-check` - GitHub dependency graph and OSV lookups as the `dependencies` built-in check, before the clone, at checked installs and in `check_project`. Includes `CheckOutcome.contacted`, the lookup that is inert unless injected (`Installer` and `AppOptions`; the real client in `index.ts`), the rewritten `unreachableBlock`, the report, the instructions and the README (high risk: third-party input parser, outside services).
+- [x] `tool-description-check` - `buildToolsWithText` with transient sources, the `tool-descriptions` check in `vetCatalog` at the end of discovery, withholding under block, `toolCheck` on the record, what the agent is told, the instructions and the README (high risk: changes what is published and callable).
 - [ ] `hat-and-alignment` - Guided HAT session with iterative fixes (operator, 2026-11-23).
 
 ---

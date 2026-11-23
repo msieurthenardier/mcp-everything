@@ -19,6 +19,7 @@ import { proxyConfig } from "../../src/network/proxy/config.js";
 import { randomBytes } from "node:crypto";
 import net from "node:net";
 import { App } from "../../src/server.js";
+import { githubOsvLookup } from "../../src/scan/dependencies.js";
 import { runScanners } from "../../src/scan/run.js";
 import type { ScannerSpec } from "../../src/scan/types.js";
 import { run } from "../../src/util/exec.js";
@@ -1571,7 +1572,8 @@ describe.skipIf(!enabled)("docker integration: the check tool", () => {
     expect(cfg.dataDir).toBe(dir);
     expect(cfg.docker.namePrefix.startsWith(prefix)).toBe(true);
     expect(cfg.scan.scanners).toEqual([]);
-    checker = new App({ cfg });
+    // The real lookup: check_project asks GitHub and OSV even with scanning off.
+    checker = new App({ cfg, dependencies: githubOsvLookup({ fetch: globalThis.fetch, githubToken: process.env.GITHUB_TOKEN }) });
     id = checker.docker.installationId;
     expect(id).toMatch(HEX8);
     expect(fs.readFileSync(path.join(dir, "installation-id"), "utf8").trim()).toBe(id);
@@ -1603,6 +1605,8 @@ describe.skipIf(!enabled)("docker integration: the check tool", () => {
     const t = text(res);
     expect(t).toMatch(/Checked github:tomnomnom\/gron at commit [0-9a-f]{40}\./);
     expect(t).toMatch(/- build-hooks: ran;/);
+    // GitHub's quota is not this suite's to depend on: a rate-limited lookup is accepted, a crash is not.
+    expect(t).toMatch(/- dependencies: (?:ran; 0 error|failed; .*rate limit)/);
     expect(t).toMatch(/`go install` runs nothing from the repository/);
     expect(t).toContain("Installs are not scanned at present");
     checker.registry.refresh();

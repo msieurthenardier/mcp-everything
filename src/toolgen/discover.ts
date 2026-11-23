@@ -137,7 +137,19 @@ function aliasNote(command: CommandSpec | undefined): string {
   return command?.aliases?.length ? ` Also installed as ${command.aliases.map(baseName).join(", ")}.` : "";
 }
 
-function cliTool(slug: string, repoId: string, node: HelpNode, used: Set<string>, command?: CommandSpec): ToolDef {
+/**
+ * A piece of project-derived text a tool carries, under a label made only of mcp-everything's own words and positions.
+ * Transient: it feeds the tool-description check at discovery and is never stored on a `ToolDef`.
+ */
+export interface TextField {
+  field: string;
+  text: string;
+}
+
+/** Where the builders leave the text of each tool they build. */
+export type TextSink = Map<ToolDef, TextField[]>;
+
+function cliTool(slug: string, repoId: string, node: HelpNode, used: Set<string>, command?: CommandSpec, sink?: TextSink): ToolDef {
   const display = [baseName(node.path[0]!), ...node.path.slice(1)].join(" ");
   const options = node.help.options.slice(0, MAX_OPTIONS_PER_TOOL);
   const summary = node.help.summary || node.blurb;
@@ -152,7 +164,7 @@ function cliTool(slug: string, repoId: string, node: HelpNode, used: Set<string>
   if (node.help.options.length > options.length) {
     pieces.push(`${node.help.options.length - options.length} more options are available via args.`);
   }
-  return {
+  const tool: ToolDef = {
     name: makeToolName(slug, [baseName(node.path[0]!), ...node.path.slice(1)], used),
     description: oneLine(pieces.join(" "), 900),
     inputSchema: schemaFor(options),
@@ -161,10 +173,27 @@ function cliTool(slug: string, repoId: string, node: HelpNode, used: Set<string>
     options,
     cwd: WORK_DIR,
   };
+  if (sink) {
+    const fields: TextField[] = [{ field: "argv", text: node.path.join(" ") }];
+    if (summary) fields.push({ field: "help.summary", text: summary });
+    if (node.help.usage) fields.push({ field: "help.usage", text: node.help.usage });
+    if (node.help.subcommands.length > 0) {
+      fields.push({ field: "help.subcommands", text: node.help.subcommands.map((s) => s.name).join(", ") });
+    }
+    options.forEach((o, i) => {
+      fields.push({ field: `options/${i}/flag`, text: o.flag });
+      if (o.short) fields.push({ field: `options/${i}/short`, text: o.short });
+      if (o.description) fields.push({ field: `options/${i}/description`, text: o.description });
+      if (o.choices?.length) fields.push({ field: `options/${i}/choices`, text: o.choices.join(" ") });
+    });
+    if (command?.aliases?.length) fields.push({ field: "aliases", text: command.aliases.join(" ") });
+    sink.set(tool, fields);
+  }
+  return tool;
 }
 
-function passthroughTool(slug: string, repoId: string, command: CommandSpec, used: Set<string>): ToolDef {
-  return {
+function passthroughTool(slug: string, repoId: string, command: CommandSpec, used: Set<string>, sink?: TextSink): ToolDef {
+  const tool: ToolDef = {
     name: makeToolName(slug, [baseName(command.name)], used),
     description: `${tag(repoId)} Runs \`${baseName(command.name)}\` (${command.origin}).${aliasNote(command)} No --help output was recognized, so pass everything via args.`,
     inputSchema: schemaFor([]),
@@ -173,13 +202,28 @@ function passthroughTool(slug: string, repoId: string, command: CommandSpec, use
     options: [],
     cwd: WORK_DIR,
   };
+  if (sink) {
+    const fields: TextField[] = [{ field: "command", text: command.name }];
+    if (command.aliases?.length) fields.push({ field: "aliases", text: command.aliases.join(" ") });
+    sink.set(tool, fields);
+  }
+  return tool;
 }
 
-function extraTools(slug: string, repoId: string, meta: ProjectMeta, used: Set<string>): ToolDef[] {
+/** One field per name, so names that are harmless apart cannot add up to a match across a join. */
+function listFields(label: string, names: string[]): TextField[] {
+  return names.map((text, i) => ({ field: `${label}/${i}`, text }));
+}
+
+function extraTools(slug: string, repoId: string, meta: ProjectMeta, used: Set<string>, sink?: TextSink): ToolDef[] {
   const tools: ToolDef[] = [];
+  const add = (tool: ToolDef, fields: TextField[]) => {
+    tools.push(tool);
+    sink?.set(tool, fields);
+  };
   if (meta.hasPythonEnv) {
     const mods = meta.pythonModules.slice(0, 12).join(", ");
-    tools.push({
+    add({
       name: makeToolName(slug, ["python"], used),
       description: `${tag(repoId)} Run Python code in the project's virtualenv, where the project is installed.${mods ? ` Importable modules: ${mods}.` : ""} args become sys.argv[1:].`,
       inputSchema: schemaFor([], { code: { type: "string", description: "Python source to execute." } }, ["code"]),
@@ -188,11 +232,11 @@ function extraTools(slug: string, repoId: string, meta: ProjectMeta, used: Set<s
       options: [],
       cwd: WORK_DIR,
       valueProp: "code",
-    });
+    }, listFields("meta.pythonModules", meta.pythonModules.slice(0, 12)));
   }
   if (meta.hasNode) {
     const pkgs = meta.nodePackages.slice(0, 6).join(", ");
-    tools.push({
+    add({
       name: makeToolName(slug, ["node"], used),
       description: `${tag(repoId)} Run JavaScript with Node.js from the repository root with dependencies installed${pkgs ? ` (packages: ${pkgs})` : ""}. Load the project with require("./") or await import(); print results with console.log.`,
       inputSchema: schemaFor([], { code: { type: "string", description: "JavaScript source to execute (CommonJS)." } }, ["code"]),
@@ -201,10 +245,10 @@ function extraTools(slug: string, repoId: string, meta: ProjectMeta, used: Set<s
       options: [],
       cwd: REPO_DIR,
       valueProp: "code",
-    });
+    }, listFields("meta.nodePackages", meta.nodePackages.slice(0, 6)));
   }
   if (meta.npmScripts.length > 0 && meta.hasNode) {
-    tools.push({
+    add({
       name: makeToolName(slug, ["npm_run"], used),
       description: `${tag(repoId)} Run one of the project's package.json scripts in the repository root. Put script arguments in args after "--".`,
       inputSchema: schemaFor([], { script: { type: "string", enum: meta.npmScripts, description: "Script name." } }, ["script"]),
@@ -213,10 +257,10 @@ function extraTools(slug: string, repoId: string, meta: ProjectMeta, used: Set<s
       options: [],
       cwd: REPO_DIR,
       valueProp: "script",
-    });
+    }, listFields("meta.npmScripts", meta.npmScripts));
   }
   if (meta.makeTargets.length > 0) {
-    tools.push({
+    add({
       name: makeToolName(slug, ["make"], used),
       description: `${tag(repoId)} Run a Makefile target in the repository root.`,
       inputSchema: schemaFor([], { target: { type: "string", enum: meta.makeTargets, description: "Makefile target." } }, ["target"]),
@@ -225,12 +269,48 @@ function extraTools(slug: string, repoId: string, meta: ProjectMeta, used: Set<s
       options: [],
       cwd: REPO_DIR,
       valueProp: "target",
-    });
+    }, listFields("meta.makeTargets", meta.makeTargets));
   }
   return tools;
 }
 
 const MAX_SCHEMA_BYTES = 20_000;
+
+/** The schema keywords whose names are mcp-everything's to write in a label; every other key is project text. */
+const SCHEMA_KEYWORDS = new Set([
+  "type", "description", "title", "enum", "const", "default", "examples", "items", "properties", "required",
+  "anyOf", "oneOf", "allOf", "additionalProperties", "format", "pattern", "$ref", "$defs", "definitions",
+]);
+/** Under these every key is a name the project chose, even one spelled like a keyword. */
+const NAMED_MAPS = new Set(["properties", "$defs", "definitions"]);
+const MAX_SCHEMA_DEPTH = 32;
+
+/**
+ * Every string of an upstream schema, keys and values, under positional labels: a keyword is written as itself, any
+ * other key as `#<ordinal>`, an array element as `[<i>]`, and a key's own text as `<path> (key)`. A label never holds a
+ * project-chosen word.
+ */
+function schemaFields(root: unknown): TextField[] {
+  const out: TextField[] = [];
+  const walk = (value: unknown, path: string, depth: number, namedMap: boolean): void => {
+    if (depth > MAX_SCHEMA_DEPTH) return;
+    if (typeof value === "string") {
+      out.push({ field: path, text: value });
+    } else if (Array.isArray(value)) {
+      value.forEach((v, i) => walk(v, `${path}/[${i}]`, depth + 1, false));
+    } else if (value !== null && typeof value === "object") {
+      let ordinal = 0;
+      for (const key of Object.keys(value)) {
+        const keyword = !namedMap && SCHEMA_KEYWORDS.has(key);
+        const segment = keyword ? key : `#${ordinal++}`;
+        if (!keyword) out.push({ field: `${path}/${segment} (key)`, text: key });
+        walk((value as Record<string, unknown>)[key], `${path}/${segment}`, depth + 1, NAMED_MAPS.has(key) && keyword);
+      }
+    }
+  };
+  walk(root, "inputSchema", 0, false);
+  return out;
+}
 
 /**
  * Tools of an MCP server running inside the sandbox, republished under the
@@ -243,6 +323,7 @@ export function mcpTools(
   server: string,
   upstream: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>,
   used: Set<string>,
+  sink?: TextSink,
 ): ToolDef[] {
   const tools: ToolDef[] = [];
   for (const t of upstream) {
@@ -254,7 +335,7 @@ export function mcpTools(
       schema = { type: "object", additionalProperties: true };
       note = " (Its argument schema was unusable or too large and has been replaced by a permissive one.)";
     }
-    tools.push({
+    const tool: ToolDef = {
       name: makeToolName(slug, [t.name], used),
       description: oneLine(`${tag(repoId)} MCP tool \`${oneLine(t.name, 80)}\` of server "${server}". ${t.description}${note}`, 1000),
       inputSchema: schema,
@@ -263,7 +344,15 @@ export function mcpTools(
       options: [],
       cwd: REPO_DIR,
       mcp: { server, tool: t.name },
-    });
+    };
+    tools.push(tool);
+    if (sink) {
+      const fields: TextField[] = [{ field: "upstream.name", text: t.name }];
+      const description: unknown = t.description;
+      if (description !== undefined && description !== null) fields.push({ field: "upstream.description", text: String(description) });
+      fields.push({ field: "server", text: server }, ...schemaFields(schema));
+      sink.set(tool, fields);
+    }
   }
   return tools;
 }
@@ -286,27 +375,42 @@ export interface BuildInput {
  * itself; what gets advertised to clients is decided by `selectPublished`.
  */
 export function buildTools(input: BuildInput): ToolDef[] {
+  return buildToolsWithText(input).tools;
+}
+
+/**
+ * `buildTools`, and beside it the project-derived text each kept tool carries (see `TextField`). `sources` is
+ * transient: it is never stored, so a tool cut by `maxTools` has none and `ToolDef` gains no field.
+ */
+export function buildToolsWithText(input: BuildInput): { tools: ToolDef[]; sources: Map<ToolDef, TextField[]> } {
   const used = new Set<string>();
   const tools: ToolDef[] = [];
+  const sources = new Map<ToolDef, TextField[]>();
+  const built: TextSink = new Map();
   const room = () => tools.length < input.maxTools;
+  const keep = (tool: ToolDef) => {
+    tools.push(tool);
+    const fields = built.get(tool);
+    if (fields) sources.set(tool, fields);
+  };
 
   for (const server of input.mcp ?? []) {
-    for (const tool of mcpTools(input.slug, input.repoId, server.server, server.tools, used)) {
+    for (const tool of mcpTools(input.slug, input.repoId, server.server, server.tools, used, built)) {
       if (!room()) break;
-      tools.push(tool);
+      keep(tool);
     }
   }
   for (const root of input.roots) {
     if (!room()) break;
-    tools.push(
+    keep(
       root.node
-        ? cliTool(input.slug, input.repoId, root.node, used, root.command)
-        : passthroughTool(input.slug, input.repoId, root.command, used),
+        ? cliTool(input.slug, input.repoId, root.node, used, root.command, built)
+        : passthroughTool(input.slug, input.repoId, root.command, used, built),
     );
   }
-  for (const tool of extraTools(input.slug, input.repoId, input.meta, used)) {
+  for (const tool of extraTools(input.slug, input.repoId, input.meta, used, built)) {
     if (!room()) break;
-    tools.push(tool);
+    keep(tool);
   }
 
   let level = input.roots.map((r) => r.node?.children ?? []);
@@ -315,12 +419,12 @@ export function buildTools(input: BuildInput): ToolDef[] {
     for (let i = 0; i < widest && room(); i++) {
       for (const nodes of level) {
         const node = nodes[i];
-        if (node && room()) tools.push(cliTool(input.slug, input.repoId, node, used));
+        if (node && room()) keep(cliTool(input.slug, input.repoId, node, used, undefined, built));
       }
     }
     level = level.map((nodes) => nodes.flatMap((n) => n.children));
   }
-  return tools;
+  return { tools, sources };
 }
 
 /** `*` wildcard pattern to an anchored, case-insensitive expression. */

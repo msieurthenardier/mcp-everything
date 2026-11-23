@@ -53,10 +53,11 @@ export function decide(mode: ScanDecision["mode"], blockAt: Level, checks: Check
 }
 
 /**
- * Blocking at `error` with no operator scanners can never block: the built-in check reports at most
- * `warning`. Returns a sentence for the startup log and the server instructions, else undefined.
+ * Blocking at `error` with no operator scanners blocks only on a known-malicious dependency of a GitHub
+ * repository: the other built-in check reports at most `warning`. Informational, for the startup log and the
+ * server instructions; undefined for every other case.
  */
 export function unreachableBlock(blockAt: Level, scanners: ScannerSpec[], mode: ScanDecision["mode"] = "block"): string | undefined {
   if (mode !== "block" || blockAt !== "error" || scanners.length > 0) return undefined;
-  return "MCPE_SCAN=block with MCPE_SCAN_BLOCK_AT=error cannot block anything: no scanners are configured (MCPE_SCANNERS), and the built-in check never reports above warning. Set MCPE_SCAN_BLOCK_AT=warning or add a scanner.";
+  return "MCPE_SCAN=block at error with no scanners configured blocks only on a known-malicious dependency of a GitHub repository; build-hooks, the other check that runs at install, reports at most warning, and tool-descriptions never blocks an install: it withholds tools. Set MCPE_SCAN_BLOCK_AT=warning or add a scanner to block on more.";
 }

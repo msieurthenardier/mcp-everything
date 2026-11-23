@@ -71,7 +71,7 @@ claude mcp add mcp-everything -- node "$PWD/dist/index.js"
 | `install_project` | Clone, build and generate tools for a repository. When scanning is on (see [Checking projects before they run](#checking-projects-before-they-run)), the repository is checked first, and the install can be blocked or can go ahead with the findings reported. Its `hosts` parameter (up to 64 entries) adds hosts the project may reach under network containment; see [Network containment](#network-containment). |
 | `check_project` | Clone and check a repository without installing it: the built-in check and the operator's scanners, whatever the scanning setting. Reports what an install would do now. Nothing from the repository is built or run. |
 | `list_projects` / `project_info` | What is installed, its status, warnings, and its published tools. `list_projects` states this installation's id; `project_info` also says whose its sandbox container is, according to Docker, and the sandbox's network as Docker shows it (`off`, `contained`, `open` or `unknown`); for a contained one it adds the hosts it may reach and the proxy's latest refusals. |
-| `find_project_tools` | Search every generated tool, published or not, by keyword. |
+| `find_project_tools` | Search every generated tool, published or not, by keyword, except tools withheld by the tool-description check (see [The tool-description check](#the-tool-description-check)). |
 | `select_project_tools` | Choose which of a project's tools are published in the tool list. |
 | `call_project_tool` | Call a generated tool by name, for clients that do not refresh their tool list. |
 | `sandbox_exec` | Run a shell command in a project's sandbox. |
@@ -350,9 +350,12 @@ or remove a scanner, or change the policy.
 1. A throwaway container clones the repository into a new *staging* volume
    (never into an installed project's volume) and reads the build files named
    below, within the limits stated below.
-2. The built-in check and the operator's scanners run over that clone. Nothing
-   from the repository is built or run by the check. Scanners are the
-   operator's own images and do read the repository's files.
+2. The built-in checks and the operator's scanners run over that clone. Nothing
+   from the repository is built or run by the checks. Scanners are the
+   operator's own images and do read the repository's files. The
+   `dependencies` check runs at the same time as the clone, and asks GitHub
+   and OSV about the repository's dependencies (see
+   [The dependency check](#the-dependency-check)).
 3. The policy decides. Under `block`, findings at or above the threshold end
    the install: nothing is built and the result says why. Under `warn`,
    findings are reported and the build goes ahead.
@@ -409,16 +412,26 @@ reconnect. An invalid value is refused at startup.
 | `MCPE_SCAN_TIMEOUT` | `900` | Whole seconds, 60 to 3600: the overall time budget for all of one check's scanners, image pulls included. |
 | `MCPE_SCANNERS` | none | Path to a JSON file of your own scanners (below). A regular file of at most 1,000,000 bytes. It may be set while scanning is `off`: `check_project` uses it. |
 
-What blocks. The built-in check reports its red flags (below) at level
+What blocks. The `build-hooks` check reports its red flags (below) at level
 `warning` and everything else it lists at level `note`; it reports nothing
-at `error`. So with no scanner of your own, `MCPE_SCAN=block` with the default
-`MCPE_SCAN_BLOCK_AT=error` can never block anything; the startup log and the
-server's instructions say so. At `warning` a project with a red
-flag is blocked. At `note` every project is blocked, because the built-in
-check always has notes (even for a project with no lifecycle script) and notes count at
-that level. Only checks that ran or came out incomplete count; a check that
+at `error`. The `dependencies` check (see [The dependency check](#the-dependency-check))
+reports a known-malicious dependency at `error` and a known-vulnerable one at
+`warning`. So with no scanner of your own, `MCPE_SCAN=block` with the default
+`MCPE_SCAN_BLOCK_AT=error` blocks only on a known-malicious dependency of a
+GitHub repository; the startup log and the server's instructions say so. The
+`tool-descriptions` check (see [The tool-description check](#the-tool-description-check))
+never blocks an install, whatever the level: under `block` it withholds tools.
+
+**Blocking at `warning`** also blocks any GitHub repository with a
+known-vulnerable dependency, which is common, as well as a project with a red
+flag. **Blocking at `note`** blocks every project, because `build-hooks` always
+has notes (even for a project with no lifecycle script) and notes count at
+that level; it also blocks a repository whose dependency graph lists versions
+that were not looked up (ranges) or has more advisories than were read.
+Only checks that ran or came out incomplete count; a check that
 failed or did not run is reported and never counts, so a scanner that fails
-or times out never blocks an install.
+or times out never blocks an install, and neither does a dependency check
+that GitHub or OSV could not answer.
 
 ### Adding a scanner
 
@@ -605,14 +618,118 @@ Pruned directories: the walk does not enter `.git`, `node_modules`, `target`,
 inside one of them is not seen. Submodules are cloned and checked only when
 `submodules: true` is given.
 
+### The dependency check
+
+The check named `dependencies` asks two outside services about a repository on
+**github.com**: GitHub for its dependency graph, and OSV (`api.osv.dev`) for
+which exact versions in it are known to be malicious or vulnerable. It is
+reported first in the report, before `build-hooks`. It runs in mcp-everything's
+own process, at the same time as the clone, so it does not go through the
+sandbox's containment.
+
+- **When it runs.** At a checked install (scanning `on`, `warn` or `block`), and
+  in `check_project` **whatever `MCPE_SCAN` says**, including `off`: an install
+  with scanning off sends nothing, but `check_project` is an explicit request
+  to check, and it sends. Another forge gets `not-run` (it has no public
+  dependency graph), and nothing is sent.
+- **What it asks.** GitHub: the repository's owner and name, to read its
+  dependency graph (`/dependency-graph/sbom`). OSV: the name and exact version of
+  each package in the graph, in batches. Nothing from the clone is sent. The
+  report says which services were contacted, and how many packages were sent.
+- **Levels.** A package with a known-malicious advisory (an OSV `MAL-` id) is an
+  `error` (rule `malicious-package`); one with other known advisories is a
+  `warning` (rule `vulnerable-package`). One finding per package, with
+  its advisory ids and, when OSV gives them, a summary and GitHub's severity
+  label. Counts cover every affected package; at most 20 findings are shown.
+- **Ranges are not looked up.** Without a lockfile on the default branch, GitHub's
+  graph lists version ranges (`^1.2.0`), and a range is not a version. Packages
+  without an exact version are counted in a note, the check is `incomplete`, and
+  they are not sent to OSV. Workflow actions (`.github/workflows`) are not
+  checked. At most 5000 packages are looked up.
+- **A pinned `ref`.** The graph describes the default branch only. With a `ref`
+  that is not the default branch, the check is `not-run` and says so; checking
+  it costs one more GitHub call (to read the default branch's name), and nothing
+  goes to OSV. Check without a `ref` to see the default branch's dependencies.
+- **A clone that fails** after the lookup sent something still says what was
+  sent, in the reason it reports.
+- **Limits.** GitHub's unauthenticated limit is 60 requests an hour (a different
+  limit from the one `search_projects` meets); `GITHUB_TOKEN` (or `GH_TOKEN`)
+  raises it, and `search_projects` uses the same token. The token is sent
+  to `api.github.com` only, never to OSV. A rate limit is a `failed` check, which
+  never blocks. Each request has a 15-second limit and the check 60 seconds;
+  nothing is followed through a redirect.
+
+### The tool-description check
+
+The check named `tool-descriptions` reads the text that the tools generated for
+a project carry to the agent, and flags text that looks like an attempt to
+steer the agent. It runs in mcp-everything's own process and does no I/O.
+
+- **When it runs.** At the end of every discovery, while `MCPE_SCAN` is not
+  `off`: after an install, `discover_tools`, `refresh_mcp`,
+  `connect_mcp_server` and `disconnect_mcp_server`. `select_project_tools`
+  does not run it and keeps what the last discovery recorded.
+  `check_project` does not run it either: it installs nothing, so there are no
+  generated tools to read.
+- **What it reads.** Only text that came from the project, not
+  mcp-everything's own wording. For a proxied MCP server's tool: the upstream
+  tool's name and description, the server's name, and every string of its input
+  schema (including property names). For a command-line tool: its help summary,
+  usage, subcommand names, options (flags, descriptions, choices) and aliases.
+  For the helper tools: the module, package, script and Makefile target names
+  that went into them. It covers every tool in the catalog, published or not.
+- **What it flags.**
+  - `error`: hidden characters (Unicode tag characters and bidirectional
+    overrides); text that tells the reader to ignore its instructions or to hide
+    something from the user; text that names one of mcp-everything's own tools
+    that change trust or reach (`install_project`, `set_project_hosts`,
+    `sandbox_exec` and the like). A proxied server's own tool name is exempt
+    from the last rule (a project that is itself an MCP server may own such a
+    name); its description is not.
+  - `warning`: invisible characters (isolates and zero-width characters; they
+    occur in genuine right-to-left text, so only a warning, and a joiner inside
+    an emoji is not flagged); directives aimed at the agent (`<important>`,
+    "before using this tool", "you must first read"); and a credential or secret
+    file (`~/.ssh`, `id_rsa`, `.env`, `mcp.json`, `api key`) in the same
+    sentence as a sending verb (send, upload, attach, forward, transmit,
+    exfiltrate, or post to a URL). A bare mention, as in `--env-file`, is
+    ordinary help text and is not flagged.
+- **What the agent is told.** Findings never quote the text they matched, and
+  the property or tool names that carried it are not repeated: each finding
+  names the generated tool, the rule, and a position in the tool's text.
+  `project_info` shows a `tool descriptions:` line (the date, the mode the
+  check ran under, the counts and the withheld tools); with `verbose` it lists
+  the findings kept. A project installed before this check says `not
+  checked` until its next discovery.
+- **Under `warn`**, every tool is published and the findings are reported.
+  **Under `block`**, a tool with a finding at or above `MCPE_SCAN_BLOCK_AT` is
+  **withheld**: it is removed from the catalog, so it is not published, not found
+  by `find_project_tools`, and a call to it answers that it was withheld. Its
+  project's other tools stay usable, and the install is not blocked.
+  `select_project_tools` cannot bring a withheld tool back. The next discovery
+  recomputes everything: a project that fixes its text gets its tool back at
+  the next `refresh_mcp`. The check failing never withholds anything.
+- **Sessions with other settings.** Every session shares one registry, and each
+  checks under its own setting. A discovery in a session with scanning `off` or
+  `warn` republishes what a `block` session withheld (and an `off` one removes
+  the record of the check).
+- **A reading aid, not a guarantee.** Patterns can be evaded, and they can
+  misfire on a security tool that documents prompt injection or on a project
+  that is itself about mcp-everything's tools.
+
 ### What none of this protects against
 
 - **A hostile agent.** The checks look at a project, not at the agent that
   uses it. Once a project is installed, `sandbox_exec` runs anything in its
   sandbox, including changing what a checked tool does.
-- **Evasion.** Scanners and the built-in check find known patterns and known
-  advisories; an author who knows them can write around them.
+- **Evasion.** Scanners and the built-in checks, tool-descriptions included, find
+  known patterns and known advisories; an author who knows them can write around them.
 - **Dependencies' build code**, which this version does not list (above).
+- **What the dependency graph misses.** The graph is GitHub's reading of the
+  default branch's manifests, development dependencies included; it misses what a
+  build resolves by itself (a package manager that fetches without a lockfile,
+  vendored code, anything a build script downloads), and a version OSV has no
+  advisory for is not flagged.
 - **The network is contained only if you turn it on.** With `MCPE_NETWORK=open`
   (the default) nothing restricts where a build, a sandbox with its network on,
   the clone, or a scanner with `network: true` can connect: the internet,
@@ -870,7 +987,14 @@ the Java DB download. A different Trivy version or different flags (a different
 
 ### What reaches outside services
 
-With scanning on, these reach outside services (and without containment, any
+With scanning on, an install sends the repository's name to `api.github.com` and
+the names and versions of its dependencies to `api.osv.dev` (the
+[dependency check](#the-dependency-check)). This comes from mcp-everything's own
+process, so it is not narrowed by containment. `check_project` does the same
+whatever `MCPE_SCAN` says. Nothing from the clone is sent, and the GitHub token
+goes only to GitHub.
+
+With scanning on, these also reach outside services (and without containment, any
 host): the clone container (the repository's forge); a scanner with `network:
 true`; and the Docker daemon, which pulls the clone, sandbox, scanner and proxy
 images from whatever registries the image names. Under containment the clone
@@ -1337,7 +1461,7 @@ Environment variables, all optional:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `GITHUB_TOKEN` / `GH_TOKEN` | none | GitHub API token (search rate limit: 10/min anonymous). |
+| `GITHUB_TOKEN` / `GH_TOKEN` | none | GitHub API token (search rate limit: 10/min anonymous; the dependency check's limit: 60/hour anonymous). Sent to `api.github.com` only. |
 | `GITLAB_TOKEN` | none | GitLab API token. |
 | `MCPE_EXTRA_HOSTS` | none | More forges to allow, e.g. `gitlab.gnome.org=gitlab,git.example.com=gitlab`. |
 | `MCPE_DATA_DIR` | `$XDG_DATA_HOME/mcp-everything`, else `~/.local/share/mcp-everything` | Where the project registry and the `installation-id` file are stored. The default follows `XDG_DATA_HOME` when it is set. Copying the directory copies the id, and two installations with one id cannot be told apart; see [Several installations on one Docker daemon](#several-installations-on-one-docker-daemon). A registry written by a newer version of mcp-everything is refused and left untouched; upgrade, or move `registry.json` aside to start with an empty registry (the sandboxes of the projects in it stay in Docker). |

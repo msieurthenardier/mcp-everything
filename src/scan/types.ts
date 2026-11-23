@@ -43,6 +43,10 @@ export interface CheckOutcome {
   /** Statements that are not findings and never count for the policy. */
   notes: string[];
   error?: string;
+  /** The outside services a request was actually sent to, in order. Rendered as a fixed statement, never a note. */
+  contacted?: ("github" | "osv")[];
+  /** How many packages were sent to OSV. A structured count, not a note, so it never counts for the policy. */
+  lookedUp?: number;
 }
 
 /** A build-relevant file read from the clone. `truncated` when cut at the walk's per-file cap. */

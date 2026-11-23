@@ -79,11 +79,13 @@ describe("decide", () => {
   });
 });
 
-describe("unreachableBlock", () => {
+describe("unreachableBlock (informational: block at error with no scanners)", () => {
   const spec: ScannerSpec = { name: "t", image: "i", command: ["c"], network: false, hosts: [], timeoutSec: 300, env: [] };
-  it("speaks only for block at error with no scanners", () => {
+  it("speaks only for block at error with no scanners, and never says it cannot block", () => {
     const s = unreachableBlock("error", []);
-    expect(s).toMatch(/cannot block/);
+    expect(s).toMatch(/blocks only on a known-malicious dependency of a GitHub repository/);
+    expect(s).not.toMatch(/cannot block/);
+    expect(s).toContain("tool-descriptions never blocks an install: it withholds tools.");
     expect(unreachableBlock("error", [spec])).toBeUndefined();
     expect(unreachableBlock("warning", [])).toBeUndefined();
     expect(unreachableBlock("note", [])).toBeUndefined();

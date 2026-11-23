@@ -18,7 +18,8 @@ import { Docker, DockerUnavailableError, OWNER_SHOWN, REPO_DIR, WORK_DIR, type E
 import { buildInvocation, resolveCwd, ToolInputError } from "./toolgen/invoke.js";
 import type { Ecosystem, McpServerSpec, ProjectRecord, ToolDef } from "./types.js";
 import { totalCounts, unreachableBlock } from "./scan/policy.js";
-import type { ScanReport } from "./scan/types.js";
+import { inertDependencyLookup, type DependencyLookup } from "./scan/dependencies.js";
+import type { CheckOutcome, ScanReport } from "./scan/types.js";
 import { oneLine, stripAnsi } from "./util/text.js";
 
 const ECOSYSTEMS: Ecosystem[] = ["rust", "go", "python", "node", "ruby", "cmake", "autotools", "make", "generic"];
@@ -49,8 +50,16 @@ function securityParagraph(cfg: Config): string {
     if (unreachable) lines.push(unreachable);
   }
   lines.push(
-    `Checks that run on a repository: build-hooks (built-in)${scanners.length > 0 ? `, and the operator's scanners: ${scanners.map((s) => s.name).join(", ")}` : "; the operator has configured no scanners of their own"}.`,
+    `Checks that run on a repository: dependencies (built-in, GitHub repositories: sends the repository name to GitHub and exact package versions to OSV), build-hooks (built-in)${mode === "off" ? "" : ", tool-descriptions (built-in, generated tools when they are discovered)"}${scanners.length > 0 ? `, and the operator's scanners: ${scanners.map((s) => s.name).join(", ")}` : "; the operator has configured no scanners of their own"}.`,
   );
+  if (mode !== "off") {
+    lines.push(
+      "Generated tool descriptions are checked when tools are discovered (tool-descriptions); under block a flagged tool is withheld and project_info says why.",
+    );
+  }
+  if (mode === "off") {
+    lines.push("check_project still runs the dependency check, which sends to GitHub and OSV; installs send nothing.");
+  }
   if (cfg.network.mode === "contained") {
     lines.push(
       "Sandbox networks are contained: clones reach only the repository's forge; builds reach their package registries, GitHub and the project's hosts; a sandbox with its network on reaches its registries and the project's hosts.",
@@ -468,6 +477,16 @@ function keptSentence(kept: ProjectRecord | undefined): string {
   return `${kept.slug} was left as it was${commit}${status}.`;
 }
 
+/** What a check sent to outside services, from the services it actually contacted; absent for none (or for records that predate it). */
+function sentStatement(c: CheckOutcome): string | undefined {
+  const contacted = c.contacted ?? [];
+  if (!contacted.includes("github")) return undefined;
+  const github = "sent: the repository's name to GitHub (api.github.com)";
+  if (!contacted.includes("osv")) return github;
+  const n = c.lookedUp ?? 0;
+  return `${github}, and ${n} package ${n === 1 ? "name" : "names"} and ${n === 1 ? "version" : "versions"} to OSV (api.osv.dev)`;
+}
+
 /**
  * One report as text, shared by `install_project`'s block wording and `check_project`: each check's name, status,
  * counts, error, kept findings (`[level] ruleId: message (location)`), the number not shown, and its notes.
@@ -476,6 +495,9 @@ function renderReport(report: ScanReport): string {
   const out: string[] = [];
   for (const c of report.checks) {
     out.push(`- ${c.name}: ${c.status}; ${c.counts.error} error, ${c.counts.warning} warning, ${c.counts.note} note${c.error ? `; ${c.error}` : ""}`);
+    const sent = sentStatement(c);
+    if (sent) out.push(`    ${sent}`);
+    if (c.lookedUp === 0 && c.status === "ran") out.push("    the graph lists no dependencies");
     for (const f of c.findings) out.push(`    [${f.level}] ${f.ruleId}: ${f.message}${f.location ? ` (${f.location})` : ""}`);
     if (c.omitted > 0) out.push(`    (${c.omitted} more not shown)`);
     for (const n of c.notes) out.push(`    note: ${n}`);
@@ -501,6 +523,8 @@ export interface AppOptions {
   proxy?: McpProxy;
   /** Where `{slug}__{NAME}` variables for proxied MCP servers are read from, at every launch (default: the process environment). */
   env?: Record<string, string | undefined>;
+  /** The dependency check's lookup (the real one is wired in `index.ts`); inert by default, so nothing is sent. */
+  dependencies?: DependencyLookup;
 }
 
 export class App {
@@ -531,7 +555,7 @@ export class App {
     // reads the facts it is given. Built before the installer, which contains each new sandbox through it (leg 8).
     this.containment = new Containment(this.cfg, this.registry, this.docker, { dataDir: this.cfg.dataDir, log: this.log });
     this.containment.install();
-    this.installer = new Installer(this.cfg, this.docker, this.registry, this.proxy, undefined, opts.env, this.containment);
+    this.installer = new Installer(this.cfg, this.docker, this.registry, this.proxy, undefined, opts.env, this.containment, opts.dependencies);
   }
 
   /** How many server instances are live: one per connection (a probe that fell back is not counted once it closed). */
@@ -789,6 +813,13 @@ export class App {
     const project = owner;
     const tool = project?.tools.find((t) => t.name === name);
     if (!project || !tool) {
+      // Among all candidates, not only the owner: `a` and `a__b` can both prefix a name.
+      const holder = candidates.find((p) => p.toolCheck?.withheldNames?.includes(name));
+      if (holder) {
+        const entry = holder.toolCheck!.withheld.find((w) => w.tool === name);
+        const why = entry ? ` (${oneLine(entry.ruleId, 80)}, ${oneLine(entry.level, 10)})` : "";
+        throw new ToolInputError(`${name} was withheld by the tool-description check${why}. See project_info for the finding.`);
+      }
       const hint = project
         ? `Tools of ${slug}: ${project.tools.slice(0, 15).map((t) => t.name).join(", ") || "none"}${project.tools.length > 15 ? `, … (${project.tools.length} in all; search with find_project_tools)` : ""}.`
         : "Use list_projects to see installed projects.";
@@ -980,6 +1011,30 @@ export class App {
     return `  security: scanned at install (commit ${oneLine(scan.commit, 40).slice(0, 12)}, ${then}): ${c.error} error, ${c.warning} warning, ${c.note} note; scanning is currently ${now}`;
   }
 
+  /** The `tool descriptions:` line, and under `verbose` the findings kept. The mode shown is the one recorded at the check. */
+  private toolCheckLines(p: ProjectRecord, verbose: boolean): string[] {
+    const tc = p.toolCheck;
+    if (!tc) return ["  tool descriptions: not checked"];
+    const o = tc.outcome;
+    if (o.status === "failed") return ["  tool descriptions: check failed (the tool-description check could not complete)"];
+    const mode = tc.mode === "block" ? `block at ${oneLine(tc.blockAt, 10)}` : "warn";
+    let line = `  tool descriptions: checked ${oneLine(tc.at.slice(0, 10), 12)} under ${mode}: ${o.counts.error} error, ${o.counts.warning} warning`;
+    const names = tc.withheldNames ?? [];
+    if (names.length > 0) {
+      const shown = names.slice(0, 10).map((n) => {
+        const w = tc.withheld.find((e) => e.tool === n);
+        return w ? `${oneLine(n, 120)} (${oneLine(w.ruleId, 80)})` : oneLine(n, 120);
+      });
+      line += `; withheld: ${shown.join(", ")}${names.length > 10 ? `, and ${names.length - 10} more` : ""}`;
+    }
+    const lines = [line];
+    if (verbose) {
+      for (const f of o.findings) lines.push(`    [${f.level}] ${f.ruleId}: ${f.message}${f.location ? ` (${f.location})` : ""}`);
+      if (o.omitted > 0) lines.push(`    (${o.omitted} more not shown)`);
+    }
+    return lines;
+  }
+
   /**
    * `view` is Docker's own answer about the sandbox's network (`project_info` asks); without one the line is the record's
    * own flag, labelled as such, because nothing here asked Docker.
@@ -991,6 +1046,7 @@ export class App {
       `  source: https://${p.repo.host}/${p.repo.path}${p.commit ? ` @ ${p.commit.slice(0, 12)}` : ""}`,
       `  build: ${p.primary}${p.image ? ` in ${p.image}` : ""}; license: ${p.license ?? "not detected"}; ${network}`,
       this.securityLine(p),
+      ...this.toolCheckLines(p, verbose),
       ...(p.imageReason ? [`  runtime: ${p.imageReason}`] : []),
     ];
     if (verbose) lines.push(`  sandbox: ${p.container}`);
@@ -1442,7 +1498,13 @@ export class App {
         }
         // Stable sort: equal scores keep catalog order.
         hits.sort((a, b) => b.score - a.score);
-        if (hits.length === 0) return text(`No generated tool matches "${query}" (${total} searched). Try fewer or different keywords.`);
+        const withheldLines = projects.flatMap((p) => {
+          const n = p.toolCheck?.withheldNames?.length ?? 0;
+          return n > 0 ? [`${n} tool(s) of ${p.slug} were withheld by the tool-description check; see project_info.`] : [];
+        });
+        if (hits.length === 0) {
+          return text([`No generated tool matches "${query}" (${total} searched). Try fewer or different keywords.`, ...withheldLines].join("\n"));
+        }
         const lines = [`${hits.length} of ${total} generated tools match${hits.length > limit ? `; showing the best ${limit}` : ""}. Run one with call_project_tool(tool, arguments).`];
         for (const hit of hits.slice(0, limit)) {
           lines.push(`${hit.tool.name}${hit.published ? "" : "  [not published]"}`);
@@ -1450,6 +1512,7 @@ export class App {
           lines.push(`    arguments (* required): ${argumentSummary(hit.tool)}`);
           if (wantSchema) lines.push(`    schema: ${JSON.stringify(hit.tool.inputSchema).slice(0, 6000)}`);
         }
+        lines.push(...withheldLines);
         return text(lines.join("\n"));
       }
 
@@ -1546,7 +1609,9 @@ export class App {
         if (this.jobs.has(project.repo.id.toLowerCase())) throw new ToolInputError(`${project.slug} is still installing.`);
         const updated = await this.installer.rediscover(project, extra as string[]);
         this.announceToolListChanged();
-        return text(this.describe(updated, true));
+        const withheld = updated.toolCheck?.withheldNames?.length ?? 0;
+        const lead = withheld > 0 ? `Withheld by the tool-description check: ${withheld} tool(s); see below.\n` : "";
+        return text(`${lead}${this.describe(updated, true)}`);
       }
 
       case "connect_mcp_server": {
@@ -1576,8 +1641,12 @@ export class App {
         const updated = await this.installer.connectMcp(project, spec);
         this.announceToolListChanged();
         const count = updated.tools.filter((t) => t.mcp?.server === name).length;
+        const tc = updated.toolCheck;
+        const held = tc ? tc.withheld.filter((w) => w.server === name).length : 0;
+        const withheldNote =
+          held > 0 ? `, ${tc!.withheldOmitted > 0 ? "at least " : ""}${held} withheld by the tool-description check` : "";
         const offline = updated.network ? "" : " The sandbox is offline; enable set_project_network if this server needs the network.";
-        return text(`Connected MCP server "${name}" of ${updated.slug}: ${count} tool(s) published.${offline}\n\n${this.describe(updated, true)}`);
+        return text(`Connected MCP server "${name}" of ${updated.slug}: ${count} tool(s) published${withheldNote}.${offline}\n\n${this.describe(updated, true)}`);
       }
 
       case "refresh_mcp": {
@@ -1594,11 +1663,21 @@ export class App {
         this.announceToolListChanged();
         const updated = out.record;
         const servers = updated.mcpServers ?? [];
-        const bare = servers.filter((s) => !updated.tools.some((t) => t.mcp?.server === s.name)).length;
+        // A server whose tools were all withheld started; it is not one with no tool built.
+        const allWithheld = new Set(updated.toolCheck?.allWithheldServers ?? []);
+        const withheldCount = updated.toolCheck?.withheldNames?.length ?? 0;
+        const bare = servers.filter((s) => !allWithheld.has(s.name) && !updated.tools.some((t) => t.mcp?.server === s.name)).length;
         const proxied = updated.tools.filter((t) => t.kind === "mcp").length;
         const gone = out.before.filter((n) => !out.after.includes(n));
         const lines = [
           `Refreshed ${updated.slug}: ${servers.length} MCP server(s) recorded, ${bare} with no tool in the catalog, ${proxied} proxied tool(s) in the catalog.`,
+          ...(withheldCount > 0
+            ? [
+                `Withheld by the tool-description check: ${withheldCount} tool(s) (not counted above)${
+                  allWithheld.size > 0 ? `; all tools of: ${[...allWithheld].map((n) => `"${n}"`).join(", ")}` : ""
+                }`,
+              ]
+            : []),
           names.length > 0
             ? `Variables applied (names only): ${names.join(", ")}.`
             : `No ${updated.slug}__<NAME> variable is set for this project.`,
@@ -1609,7 +1688,10 @@ export class App {
           lines.push(`Candidates that did not answer: ${out.unanswered.map((u) => `\`${u}\``).join(", ")} (${out.reason}).`);
         }
         if (!updated.network) lines.push("The sandbox is offline; enable set_project_network if a server needs the network.");
-        const failed = out.failed.length > 0 || gone.length > 0 || proxied === 0;
+        // Every tool withheld is a project that works as designed, not one that failed to start; but with no server
+        // recorded there is nothing withheld to explain "no proxied tool at all".
+        const everyServerWithheld = servers.length > 0 && servers.every((s) => allWithheld.has(s.name));
+        const failed = out.failed.length > 0 || gone.length > 0 || (proxied === 0 && !everyServerWithheld);
         return text(`${lines.join("\n")}\n\n${this.describe(updated, true)}`, failed);
       }
 
