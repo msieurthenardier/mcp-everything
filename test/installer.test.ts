@@ -1762,7 +1762,7 @@ describe("installChecked", () => {
     const later = new Date(Date.now() + 5000);
     fs.utimesSync(file, later, later); // a change of mtime however fast the write was
   };
-  const WARN = /^A reinstall at commit c{12} was blocked by the scan policy on \d{4}-\d\d-\d\d; the project is unchanged\.$/;
+  const WARN = /^A reinstall at commit c{12} was blocked by the scan policy on \d{4}-\d\d-\d\d \(UTC\); the project is unchanged\.$/;
   /** Nothing of an installed sandbox is touched. */
   const untouched = () => {
     for (const c of ["closeProject", "destroy", "setNetwork", "createContainer", "removeContainer", "createSandboxVolume", "copyVolume"]) {

@@ -5,7 +5,7 @@ const NAME = /^[a-z0-9][a-z0-9-]{0,31}$/;
 // The image-reference pattern install_project uses.
 const IMAGE = /^[a-z0-9][a-z0-9._/:@-]{0,200}$/i;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
-const KEYS = new Set(["name", "image", "command", "network", "timeout_seconds", "env", "stage"]);
+const KEYS = new Set(["name", "image", "command", "entrypoint", "network", "timeout_seconds", "env", "stage"]);
 const MAX_ENTRIES = 16;
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -64,6 +64,11 @@ export function parseScannersFile(text: string, source: string): ScannerSpec[] {
       }
     }
 
+    const entrypoint = get("entrypoint");
+    if (entrypoint !== undefined && (typeof entrypoint !== "string" || entrypoint.length > 256 || entrypoint.includes("\0"))) {
+      throw new ConfigError(`${where}: "entrypoint" must be a string of at most 256 characters with no NUL ("" clears the image's entrypoint)`);
+    }
+
     const network = get("network");
     if (network !== undefined && typeof network !== "boolean") throw new ConfigError(`${where}: "network" must be true or false`);
 
@@ -86,6 +91,7 @@ export function parseScannersFile(text: string, source: string): ScannerSpec[] {
       name,
       image,
       command: command as string[],
+      ...(entrypoint !== undefined ? { entrypoint: entrypoint as string } : {}),
       network: network ?? false,
       timeoutSec: timeout ?? 300,
       env: (env as string[] | undefined) ?? [],

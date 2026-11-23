@@ -389,7 +389,7 @@ export class Installer {
         await dropOnce();
         let kept: ProjectRecord | undefined;
         if (existing) {
-          const warning = `${BLOCKED_WARNING} ${report.commit.slice(0, 12)} was blocked by the scan policy on ${report.at.slice(0, 10)}; the project is unchanged.`;
+          const warning = `${BLOCKED_WARNING} ${report.commit.slice(0, 12)} was blocked by the scan policy on ${report.at.slice(0, 10)} (UTC); the project is unchanged.`;
           this.registry.update(existing.slug, (cur) => {
             if (!cur) return undefined;
             kept = { ...cur, warnings: [...cur.warnings.filter((w) => !w.startsWith(BLOCKED_WARNING)), warning] };

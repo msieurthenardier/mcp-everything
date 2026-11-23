@@ -1,6 +1,6 @@
 # Flight: Checking a Project's Own Code Before It Runs
 
-**Status**: in-flight
+**Status**: landed
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Design review 1** (Architect, 2026-11-21): approve with changes. Four high issues (a blocked reinstall reported as success; the staging sequence colliding with the install's first step; container timeouts that leave containers running; the built-in walk overflowing the clone's output cap) and the medium ones are folded in below; the claims were spot-checked by the Flight Director against `src/util/exec.ts`, `src/sandbox/docker.ts`, `src/server.ts` and `test/docker.test.ts`. Legs 2 and 4 were split.
@@ -185,7 +185,7 @@ Give mcp-everything a way to check a repository after it is cloned and before an
 - [x] `checked-install-server` - The server's entry point, wording by outcome, "being checked", the startup sweep, and the integration cases *(split from `check-before-build` at its design review, 2026-11-22)*
 - [x] `check-tool` - `check_project` on its own job key, `Installer.check`, the shared report renderer
 - [x] `security-status-and-docs` - Generated instructions, the `security:` line, the startup statement, and the README with its corrections *(split from `agent-view-and-docs` at its design review, 2026-11-22)*
-- [ ] `hat-and-alignment` *(optional)* - Guided HAT (human acceptance test) session with iterative fixes
+- [x] `hat-and-alignment` *(optional)* - Guided HAT (human acceptance test) session with iterative fixes
 
 ---
 

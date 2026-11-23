@@ -21,6 +21,9 @@ describe("the README and the code agree", () => {
   it.each(SCAN_VARIABLES)("names %s", (name) => {
     expect(readme).toContain(`\`${name}\``);
   });
+  it("documents a scanner's entrypoint", () => {
+    expect(section("Checking projects before they run")).toContain("`entrypoint`");
+  });
   it("names the check tool", () => {
     expect(readme).toContain("`check_project`");
     expect(section("Built-in tools")).toContain("`check_project`");

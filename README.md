@@ -364,7 +364,7 @@ is not ready) is checked
 before anything of it is touched: its sandbox, volume, record and tools stay
 as they were until the check passes. A blocked reinstall changes one thing in
 the existing record, a warning saying that a reinstall at that commit was
-blocked on that date. If the check cannot be made (for example the clone
+blocked on that (UTC) date. If the check cannot be made (for example the clone
 fails), the existing project is left as it was. `install_project` on a
 repository that is already installed and ready, without `reinstall`, returns
 the existing project and checks nothing.
@@ -441,8 +441,10 @@ or times out never blocks an install.
 - `name` (required): lower-case letters, digits and hyphens, up to 32,
   starting with a letter or digit, unique; `build-hooks` is reserved for the
   built-in check. `image` and `command` (1 to 64 strings) are required.
-  `network` defaults to `false`; `timeout_seconds` to 300 (10 to 1800); `env`
-  to none. At most 16 scanners. Any other key is refused at startup (`stage`
+  `entrypoint` (optional) replaces the image's entrypoint: a string of at
+  most 256 characters, and `""` clears it so `command` is the whole command
+  line. `network` defaults to `false`; `timeout_seconds` to 300 (10 to 1800);
+  `env` to none. At most 16 scanners. Any other key is refused at startup (`stage`
   is accepted with the value `"source"` and has no effect today).
 - **Pin the image by digest**, as the example does, and bump the digest
   yourself when you choose a newer version: a tag can be moved. mcp-everything
@@ -457,13 +459,27 @@ or times out never blocks an install.
   Output over 8 MB is a failure. SARIF results that are suppressed, or whose
   `kind` is `pass`, `notApplicable` or `informational`, are not counted; a
   result with no level of its own (and no default level on its rule) counts as `warning`.
-- A scanner that can write SARIF only to a file needs a wrapper, and the
-  wrapper has to be the image's entrypoint: the command is not run through a
-  shell. With an image whose entrypoint is a shell (or one you build with
-  `ENTRYPOINT ["sh", "-c"]`), a command such as
-  `["tool -o /tmp/r.sarif /scan/repo >&2; cat /tmp/r.sarif"]` writes the file
-  to its own writable layer and prints it. This wrapper form is not exercised
-  by this project's tests.
+- A scanner that can write SARIF only to a file, or that needs a pre-step,
+  needs a wrapper, and the command is not run through a shell. Set
+  `entrypoint` to a shell the image has and put the script in `command`:
+
+  ```json
+  {
+    "name": "filescan",
+    "image": "example/filescan@sha256:<digest>",
+    "entrypoint": "sh",
+    "command": ["-c", "filescan -o /tmp/r.sarif /scan/repo >&2; cat /tmp/r.sarif"]
+  }
+  ```
+
+  The container runs `sh -c '...'`; the report goes to the container's own
+  writable layer (the checkout is read-only) and `cat` prints it. `""` clears
+  the image's entrypoint, so `command` can start with the program itself
+  (`["sh", "-c", "..."]`). The image must contain the program you name. The
+  override mechanics (an `entrypoint` replacing the image's, and `""` clearing
+  it) are exercised by this project's tests with a shell script that prints
+  SARIF; the example's `filescan` is made up. Building your own image with the
+  wrapper as its `ENTRYPOINT` also works.
 - The checkout is mounted **read-only** at `/scan` (the repository is
   `/scan/repo`, which is also the working directory); the scanner cannot
   change what is built. Its network is **off** unless `network` is `true`.

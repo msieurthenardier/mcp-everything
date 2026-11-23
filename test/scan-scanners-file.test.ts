@@ -20,6 +20,20 @@ describe("parseScannersFile", () => {
     const [s] = parse({ scanners: [entry({ network: true, timeout_seconds: 10, env: ["TOKEN", "_x1"], stage: "source" })] });
     expect(s).toMatchObject({ network: true, timeoutSec: 10, env: ["TOKEN", "_x1"] });
   });
+  it("validates entrypoint, keeps \"\" and leaves the key out when unset", () => {
+    const [none] = parse({ scanners: [entry()] });
+    expect("entrypoint" in none!).toBe(false);
+    expect(parse({ scanners: [entry({ entrypoint: "sh" })] })[0]!.entrypoint).toBe("sh");
+    const [empty] = parse({ scanners: [entry({ entrypoint: "" })] });
+    expect("entrypoint" in empty!).toBe(true);
+    expect(empty!.entrypoint).toBe("");
+    expect(parse({ scanners: [entry({ entrypoint: "x".repeat(256) })] })).toHaveLength(1);
+    bad({ scanners: [entry({ entrypoint: "x".repeat(257) })] }, /scanners\[0\] \(trivy\).*"entrypoint"/);
+    bad({ scanners: [entry({ entrypoint: 1 })] }, /"entrypoint"/);
+    bad({ scanners: [entry({ entrypoint: null })] }, /"entrypoint"/);
+    bad({ scanners: [entry({ entrypoint: ["sh"] })] }, /"entrypoint"/);
+    bad({ scanners: [entry({ entrypoint: "a\u0000b" })] }, /"entrypoint"/);
+  });
   it("refuses text that is not JSON without quoting it", () => {
     try {
       parse("{\u001b[31m oops");

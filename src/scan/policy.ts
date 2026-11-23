@@ -46,7 +46,7 @@ export function decide(mode: ScanDecision["mode"], blockAt: Level, checks: Check
       mode,
       blockAt,
       verdict: "block",
-      reason: withTail(`blocked: ${n} ${n === 1 ? "finding" : "findings"} at ${blockAt} or above, from ${names}`),
+      reason: withTail(`${n} ${n === 1 ? "finding" : "findings"} at ${blockAt} or above, from ${names}`),
     };
   }
   return { mode, blockAt, verdict: "build", reason: withTail(`no findings at ${blockAt} or above`) };

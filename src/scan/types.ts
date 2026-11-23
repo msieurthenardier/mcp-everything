@@ -15,6 +15,8 @@ export interface ScannerSpec {
   name: string;
   image: string;
   command: string[];
+  /** Overrides the image's entrypoint; "" clears it; absent leaves it. */
+  entrypoint?: string;
   network: boolean;
   timeoutSec: number;
   env: string[];

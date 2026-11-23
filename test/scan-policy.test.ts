@@ -56,7 +56,7 @@ describe("decide", () => {
           const d = decide("block", blockAt, [check("trivy", status, { [level]: 1 })]);
           expect(d.verdict).toBe(expectBlock ? "block" : "build");
           expect(d.blockAt).toBe(blockAt);
-          if (expectBlock) expect(d.reason).toBe(`blocked: 1 finding at ${blockAt} or above, from trivy`);
+          if (expectBlock) expect(d.reason).toBe(`1 finding at ${blockAt} or above, from trivy`);
           if (status === "failed") expect(d.reason).toContain("trivy failed and was not counted");
           if (status === "not-run") expect(d.reason).toContain("trivy did not run and was not counted");
         });
@@ -67,7 +67,7 @@ describe("decide", () => {
 
   it("names every blocking check and sums its findings", () => {
     const d = decide("block", "error", [check("trivy", "ran", { error: 1 }), check("semgrep", "incomplete", { error: 1 }), check("clean", "ran")]);
-    expect(d.reason).toBe("blocked: 2 findings at error or above, from trivy, semgrep");
+    expect(d.reason).toBe("2 findings at error or above, from trivy, semgrep");
   });
 
   it("notes count only when blockAt is note", () => {

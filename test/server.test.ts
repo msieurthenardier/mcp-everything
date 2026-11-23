@@ -1689,7 +1689,7 @@ describe("the checked install in the server", () => {
   const report = (over: Partial<NonNullable<Extract<Outcome, { kind: "blocked" }>["report"]>> = {}) => ({
     commit: "0123456789abcdef0123456789abcdef01234567",
     at: "2026-11-22T10:00:00.000Z",
-    decision: { mode: "block" as const, blockAt: "error" as const, verdict: "block" as const, reason: "blocked: 2 findings at error or above, from fake" },
+    decision: { mode: "block" as const, blockAt: "error" as const, verdict: "block" as const, reason: "2 findings at error or above, from fake" },
     checks: [
       {
         name: "fake",
@@ -1823,7 +1823,7 @@ describe("the checked install in the server", () => {
       const res = await run({ kind: "blocked", report: report() });
       expect(res.isError).toBe(true);
       const t = body(res);
-      expect(t.startsWith("Blocked by the scan policy: blocked: 2 findings at error or above, from fake. Nothing was installed.\n")).toBe(true);
+      expect(t.startsWith("Blocked by the scan policy: 2 findings at error or above, from fake. Nothing was installed.\n")).toBe(true);
       expect(t).toContain("- fake: ran; 2 error, 1 warning, 0 note");
       expect(t).toContain("[error] R1: bad thing (a.sh:3)");
       expect(t).toContain("1 more not shown");
@@ -1832,7 +1832,7 @@ describe("the checked install in the server", () => {
     });
     it("blocked, with a ready project kept at a commit", async () => {
       const res = await run({ kind: "blocked", report: report(), kept: { ...record("demo"), commit: "abcdef0123456789abcdef" } });
-      expect(body(res)).toContain("Blocked by the scan policy: blocked: 2 findings at error or above, from fake. demo was left as it was, at commit abcdef012345.\n");
+      expect(body(res)).toContain("Blocked by the scan policy: 2 findings at error or above, from fake. demo was left as it was, at commit abcdef012345.\n");
     });
     it("blocked, with a kept project that has no commit and is not ready", async () => {
       const res = await run({ kind: "blocked", report: report(), kept: { ...record("demo"), status: "failed" } });
@@ -2151,8 +2151,8 @@ describe("check_project", () => {
         "An install would not be blocked by scanning.",
       );
       await app2.shutdown();
-      const t = body(await check({ kind: "checked", report: rep("block", "block", "blocked: 1 finding at error or above, from x") }));
-      expect(t).toContain("An install would be blocked: blocked: 1 finding at error or above, from x.");
+      const t = body(await check({ kind: "checked", report: rep("block", "block", "1 finding at error or above, from x") }));
+      expect(t).toContain("An install would be blocked: 1 finding at error or above, from x.");
     });
     it("a failed check is an error result with its reason", async () => {
       const res = await check({ kind: "check-failed", reason: "Could not clone" });
@@ -2160,7 +2160,7 @@ describe("check_project", () => {
       expect(body(res)).toBe("The check could not be completed: Could not clone.");
     });
     it("shows each check in the same text as install_project's blocked wording", async () => {
-      const r = rep("block", "block", "blocked: 1 finding at error or above, from x");
+      const r = rep("block", "block", "1 finding at error or above, from x");
       const asCheck = body(await check({ kind: "checked", report: r }));
       await app2.shutdown();
       const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_SCAN: "block" });

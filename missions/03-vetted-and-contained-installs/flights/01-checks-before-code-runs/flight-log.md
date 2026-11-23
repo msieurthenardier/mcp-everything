@@ -158,6 +158,23 @@ In flight. Branch `flight/01-checks-before-code-runs`, from `main` at `94b96d0`.
 
 ---
 
+### HAT fix: depth check pruning
+
+- Cause: the depth check ran `walkfind -mindepth 9`; with `-mindepth`, find evaluates no expression (so no `-prune`) for entries shallower than 9, so a `node_modules` at depth 4 was descended into and its deep build files made the build-hooks check report `incomplete` (depth) on remy/nodemon.
+- Change (WALK_SCRIPT, src/sandbox/docker.ts): `wfind` takes an optional fifth argument, an extra `-path` test placed after the prune; the depth check now runs `walkfind -maxdepth 1000 "$t" "$pat" './*/*/*/*/*/*/*/*/*'` (nine or more components, one past the walk's `-maxdepth 8`), so the prune is effective at every depth. Newline and per-pattern runs unchanged.
+- Tests (test/docker.test.ts): new case, a `package.json` ten levels deep under a `node_modules` at depth 3 gives no `INCOMPLETE depth`, and ten levels deep with nothing pruned still gives it. Confirmed the new case fails with the old `-mindepth 9` form (edited back, run, restored). By hand in the pinned probe image (`docker run --rm --network none --entrypoint sh <probeImage> -c '<fixture>; <walk>'`, fixture in-container): pruned fixture gave no INCOMPLETE line, unpruned gave `INCOMPLETE depth`.
+- Counts: vitest 1508 passed, 36 skipped (28 files passed, 1 skipped); typecheck and build clean. Docker suite not run.
+
+### HAT feature: scanner entrypoint
+
+- src/scan/types.ts, src/scan/scanners-file.ts: `ScannerSpec.entrypoint?`; the parser accepts `entrypoint` (string, at most 256 characters, no NUL; `""` kept as `""`; anything else is a ConfigError naming entry and field); the key is absent from the parsed spec when unset.
+- src/sandbox/docker.ts: `runScanner` passes `entrypoint: spec.entrypoint` straight through (never `||`), so `""` reaches `--entrypoint ""`; absent adds no flag.
+- README "Adding a scanner": the field is listed, a `sh` wrapper example replaces the "custom image only" advice, `""` explained, and the "not exercised by this project's tests" sentence now states what the tests do cover. test/readme.test.ts asserts `entrypoint` is mentioned.
+- Tests: parser case (absent via `in`, value, `""`, 256 ok, 257, number, null, array, NUL); runScanner case (`--entrypoint sh` and `--entrypoint ""` before the image, one flag, command after the image); integration "(c2)" on the pinned clone image (entrypoint git): `sh` override and `""` clear both give `ran` with counts 1/0/1.
+- Counts: vitest 1511 passed, 37 skipped (28 files passed, 1 skipped); typecheck clean; build done.
+- Trial: `runScanner` using `spec.entrypoint || undefined` made the new runScanner unit case fail (1 failed, 299 passed in test/docker.test.ts); undone by edit.
+- Docker: `npm run test:docker` once, exit 0, 35 passed, 2 skipped (also re-ran the assertions the earlier block-wording/UTC fix changed); output in the session scratchpad as hat-entrypoint-docker.out. Afterwards `docker ps -a --filter label=mcp-everything.role` and `docker volume ls --filter label=mcp-everything.role` are both empty; the eleven operator containers (seven mcpe-bde0aedf-*, mcpe-cowsay, mcpe-gron, mcpe-ha_googlehome, mcpe-rea) are all still present. One unrelated container, `afp-lv-pgt4qd-stray-0tj5ol`, listed before the run was gone after it; it is not ours (no mcp-everything prefix) and was not touched by this project's tests.
+
 ## Deviations
 
 ---
@@ -374,3 +391,12 @@ In flight. Branch `flight/01-checks-before-code-runs`, from `main` at `94b96d0`.
 **Flight review** (Reviewer, Sonnet, no knowledge of the Developers' reasoning): `[HANDOFF:confirmed]`, no blocking issue. It re-ran the unit suite (1507/36), typecheck, build and the Docker suite once (34 passed, 2 skipped; no role-labelled leftovers; the operator's containers unchanged); did not run the pressure cases (`WATCHDOG_SCRIPT`'s text is unchanged; only `probeImage`, not a sandbox image, changed default). Trials: removing the walk script's quoting, and adding a real `eval` of a file name, are both caught by the injection test — the blind spot is narrower than recorded above, since the walk `cd`s into the fixture before touching names. Verified: `MCPE_SCAN_BLOCK_AT=note` blocks every project (the built-in check always carries notes, Go and generic included); every statement of the new README section against the code; redaction, the env file, container capabilities and mounts, volume and sweep ownership, text bounds. Two non-blocking items fixed by a Developer (see Decisions, "Flight review fixes"): the injection test also asserts no `pwned` in the working directory, before and after; two README slips. Re-checked by the Flight Director (the assertions at `test/docker.test.ts` lines 1672 and 1679; the README sentence); no second review, the changes being a test assertion and two typo fixes.
 - **Squawk 0051 logged and deferred** (`squawks/0051-settle-failure-offline-order-untested.md`): the untested order of `takeOffline` and `registry.put` in `settleFailure` (leg 1, trial 1b). Revisit at this flight's debrief or the next turnaround.
 - All ten autonomous legs set to `completed`. The flight commit is handed to a Developer; the HAT leg follows with the operator.
+
+### HAT fix: block wording and UTC date
+
+- src/scan/policy.ts: the block reason no longer starts with "blocked: " (now "N finding(s) at <level> or above, from <names>"), so "Blocked by the scan policy: ..." and "An install would be blocked: ..." no longer say it twice. `renderReport`'s "Decision (<mode>): <reason>" line still reads fine unchanged; README has no example carrying the old text.
+- src/install/installer.ts: the blocked-reinstall warning now says "on YYYY-MM-DD (UTC)". The prefix used for replacing an earlier warning is unchanged, so replacement still works.
+- Assertions renamed (not weakened) in test/scan-policy.test.ts, test/server.test.ts, test/installer.test.ts and test/integration/docker.test.ts (the Docker one is not run here; re-run at the HAT's end).
+- Counts: vitest 1508 passed, 36 skipped (28 files passed, 1 skipped); typecheck clean; build done.
+
+**HAT leg completed** (with the operator, 2026-11-22). Steps 1–7 passed. Inline fixes: the walk's depth check pruning (a false "incomplete" found on `remy/nodemon`), the block wording ("blocked" twice), the blocked-reinstall date labelled UTC. Through the feature gate (scope, design review, gated Docker case): a scanner's optional `entrypoint`. A container `afp-lv-pgt4qd-stray-0tj5ol` vanished from the daemon during the last Docker run; its `afp-` prefix is the agent-factory project's (its images are `afp-session`, `afp-stub`, `afp-connector`), Docker's event history had rotated, and nothing in mcp-everything or its suite can remove a container without its owner label or the suite prefix — recorded, not ours. HAT review (Reviewer): `[HANDOFF:confirmed]`, no issue. Operator's decisions are in the leg's Outcome. Flight status `landed`; flight 1 checked off in the mission.

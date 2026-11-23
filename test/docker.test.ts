@@ -1622,6 +1622,17 @@ describe("the walk script, in a local shell", () => {
     });
   });
 
+  it2("does not report INCOMPLETE depth for a deep match that lies under a pruned directory", () => {
+    withDir((dir) => {
+      put(dir, "a/b/node_modules/c/d/e/f/g/h/i/j/package.json", "{}"); // ten levels deep, under a pruned node_modules at depth 3
+      expect(exec(dir).split("\n")).not.toContain("INCOMPLETE depth");
+    });
+    withDir((dir) => {
+      put(dir, "a/b/c/d/e/f/g/h/i/j/package.json", "{}"); // ten levels deep, nothing pruned on the way
+      expect(exec(dir).split("\n")).toContain("INCOMPLETE depth");
+    });
+  });
+
   it2("caps a pattern at 40 files with INCOMPLETE pattern, and still exits 0 when head closes the pipe early", () => {
     withDir((dir) => {
       for (let i = 0; i < 300; i++) put(dir, `m/f${i}.cmake`, "x");
@@ -1745,6 +1756,19 @@ describe("runScanner", () => {
     expect(a.slice(-4)).toEqual(["scan:1", "scan", "--sarif", "."]);
     const i = d.argvs.findIndex((x) => x[0] === "start");
     expect(d.optsList[i]).toEqual({ timeoutMs: 20_000, maxBytes: 8_000_000 });
+  });
+
+  it("passes an entrypoint override before the image, and the empty string as --entrypoint with an empty value", async () => {
+    for (const entrypoint of ["sh", ""]) {
+      const d = mk();
+      stage(d);
+      await d.runScanner(STAGING, { ...SCANNER, entrypoint, command: ["-c", "x"] }, { timeoutMs: 20_000 });
+      const a = d.created[0]!.args;
+      expect(a.filter((x) => x === "--entrypoint")).toHaveLength(1);
+      const i = a.indexOf("--entrypoint");
+      expect(a.slice(i, i + 3)).toEqual(["--entrypoint", entrypoint, "scan:1"]);
+      expect(a.slice(-3)).toEqual(["scan:1", "-c", "x"]);
+    }
   });
 
   it("uses the bridge network only when the scanner is configured for one, and passes the env file before the image", async () => {

@@ -136,14 +136,18 @@ b64() { printf %s "$1" | base64 | tr -d '\\n'; }
 np="$1"; shift
 prune=""; i=0
 while [ "$i" -lt "$np" ]; do prune="$prune $1"; shift; i=$((i + 1)); done
-# wfind <depth option> <depth> <-name|-path> <pattern>: files and links under the checkout, pruning .git and the prune names.
+# wfind <depth option> <depth> <-name|-path> <pattern> [<extra -path>]: files and links under the checkout, pruning .git and the prune names.
 wfind() {
-  d1="$1"; d2="$2"; t="$3"; pat="$4"
+  d1="$1"; d2="$2"; t="$3"; pat="$4"; deep="$5"
   set -- \\( -name .git
   set -f
   for p in $prune; do set -- "$@" -o -name "$p"; done
   set +f
-  find . "$d1" "$d2" "$@" \\) -prune -o \\( -type f -o -type l \\) "$t" "$pat" -print
+  if [ -n "$deep" ]; then
+    find . "$d1" "$d2" "$@" \\) -prune -o \\( -type f -o -type l \\) "$t" "$pat" -path "$deep" -print
+  else
+    find . "$d1" "$d2" "$@" \\) -prune -o \\( -type f -o -type l \\) "$t" "$pat" -print
+  fi
 }
 walkfind() { { wfind "$@" || echo '#WALKFAIL'; }; }
 verdict() {
@@ -185,7 +189,7 @@ while [ "$#" -ge 4 ]; do
   all="$all
 $out"
   if [ "$root" != 1 ]; then
-    verdict "$(walkfind -mindepth 9 "$t" "$pat" | head -n 1)" depth
+    verdict "$(walkfind -maxdepth 1000 "$t" "$pat" './*/*/*/*/*/*/*/*/*' | head -n 1)" depth
   fi
 done
 found=$(printf '%s\\n' "$all" | sort -u)
@@ -798,7 +802,7 @@ export class Docker {
 
   /**
    * Run one operator scanner over a staging volume. The volume must be this installation's staging volume
-   * (checked before any container exists). The image's own entrypoint runs with `spec.command` as its arguments, no
+   * (checked before any container exists). The image's own entrypoint runs with `spec.command` as its arguments (or `spec.entrypoint` replaces it; "" clears it), no
    * network unless the scanner is configured to have one, the checkout mounted read-only at /scan and the working
    * directory /scan/repo (a checkout with no `repo` directory makes `start` fail: the caller reports it as a failed run).
    */
@@ -811,6 +815,8 @@ export class Docker {
       mountFlags: [`type=volume,src=${volume},dst=/scan,readonly`],
       workdir: "/scan/repo",
       envFile: opts.envFile,
+      // Straight through: "" must reach `--entrypoint ""` (clears the image's entrypoint), so never `||`.
+      entrypoint: spec.entrypoint,
       args: spec.command,
       timeoutMs: opts.timeoutMs,
       maxBytes: 8_000_000,

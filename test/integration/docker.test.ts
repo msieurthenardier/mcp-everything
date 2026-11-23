@@ -1214,6 +1214,22 @@ describe.skipIf(!enabled)("docker integration: scanners, the copy and the sweep"
     }
   }, 120_000);
 
+  it("(c2) an entrypoint override replaces the image's own, and \"\" clears it (the pinned clone image's entrypoint is git)", async () => {
+    try {
+      await docker.ensureImage(cfg.docker.probeImage);
+      const image = cfg.docker.probeImage;
+      const out = await runScanners(docker, staging, [
+        scanner("override", "", { image, entrypoint: "sh", command: ["-c", `printf '%s' '${SARIF}'`] }),
+        scanner("cleared", "", { image, entrypoint: "", command: ["sh", "-c", `printf '%s' '${SARIF}'`] }),
+      ], { totalTimeoutSec: 300, dataDir });
+      expect(out[0], JSON.stringify(out[0])).toMatchObject({ name: "override", status: "ran", counts: { error: 1, warning: 0, note: 1 } });
+      expect(out[1], JSON.stringify(out[1])).toMatchObject({ name: "cleared", status: "ran", counts: { error: 1, warning: 0, note: 1 } });
+      expect(await gone()).toBe("");
+    } finally {
+      await sweepOwn();
+    }
+  }, 300_000);
+
   it("(d) copies a staging volume exactly: an owner other than root's, a mode-000 directory, a link, an executable, and the checkout's HEAD", async () => {
     const target = `${prefix}scancopy-${hex()}`;
     expect(mayRemove(target, [])).toBe(true);
@@ -1403,7 +1419,7 @@ describe.skipIf(!enabled)("docker integration: the checked install through the s
     proceed();
     const res = await blocking.callTool("install_project", { repo: "tomnomnom/gron" });
     expect(res.isError).toBe(true);
-    expect(text(res)).toMatch(/^Blocked by the scan policy: blocked: 1 finding at error or above, from fake\. Nothing was installed\./);
+    expect(text(res)).toMatch(/^Blocked by the scan policy: 1 finding at error or above, from fake\. Nothing was installed\./);
     expect(text(res)).toContain("[error] FAKE1: always an error");
     expect(text(res)).not.toMatch(/Generated tools are callable/);
     blocking.registry.refresh();
@@ -1436,7 +1452,7 @@ describe.skipIf(!enabled)("docker integration: the checked install through the s
     expect(after.container).toBe(before.container);
     expect(after.warnings.some((w) => w.includes(after.commit!.slice(0, 12)) || /blocked by the scan policy/.test(w))).toBe(true);
     // The warning names the scanned commit, which a blocked reinstall of an unchanged head shares with the record's.
-    expect(after.warnings.join("\n")).toMatch(/A reinstall at commit [0-9a-f]{12} was blocked by the scan policy on \d{4}-\d{2}-\d{2}/);
+    expect(after.warnings.join("\n")).toMatch(/A reinstall at commit [0-9a-f]{12} was blocked by the scan policy on \d{4}-\d{2}-\d{2} \(UTC\)/);
     expect(await noRoleLeft()).toEqual([]);
   }, 900_000);
 
