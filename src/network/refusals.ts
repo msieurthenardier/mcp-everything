@@ -1,4 +1,4 @@
-import type { ProxyRefusalRow } from "../sandbox/docker.js";
+import type { ProxyRefusalRow } from "../sandbox/network-spec.js";
 
 /**
  * Refusal messages (flight 02, DD9): what a project's or a one-shot's proxy refused, as lines an operator can act on.

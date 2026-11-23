@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { chooseToolchain, nodeMajor, pythonLineSatisfies, toolVersion } from "../src/install/toolchain.js";
-import type { ProbeData } from "../src/sandbox/docker.js";
+import type { ProbeData } from "../src/sandbox/scripts.js";
 
 const probe = (files: Record<string, string>): ProbeData => ({ commit: "0".repeat(40), entries: [], files, walk: { files: [] } });
 const pkg = (body: object) => JSON.stringify(body);

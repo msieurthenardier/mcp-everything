@@ -20,8 +20,6 @@ import {
   proxyVersionOf,
   RECORD_LABEL,
   recordLabelOf,
-  RESTART_AFTER_SWAP,
-  restartAfterSwap,
   SESSION_LABEL,
   sessionLabelOf,
   VERSION_LABEL,
@@ -31,19 +29,11 @@ import {
 import { buildHosts, sandboxHosts } from "../src/network/defaults.js";
 import { PROXY_PROGRAM_VERSION, type ProxyConfig } from "../src/network/proxy/config.js";
 import { Registry } from "../src/registry.js";
-import {
-  makeRef,
-  networkModeOf,
-  PROJECT_LABEL,
-  proxyAddress,
-  type AfterStartHook,
-  type ContainedNetwork,
-  type ContainmentHook,
-  type NetworkMode,
-  type ProjectProxy,
-  type SandboxInspectFacts,
-  type SandboxRef,
-} from "../src/sandbox/docker.js";
+import { makeRef } from "../src/sandbox/docker.js";
+import type { AfterStartHook, ContainmentHook, SandboxRef } from "../src/sandbox/docker-base.js";
+import type { ContainedNetwork, ProjectProxy } from "../src/sandbox/docker-network.js";
+import { networkModeOf, proxyAddress, type NetworkMode } from "../src/sandbox/network-spec.js";
+import { PROJECT_LABEL, type SandboxInspectFacts } from "../src/sandbox/ownership.js";
 import type { ProjectRecord } from "../src/types.js";
 import { record } from "./helpers.js";
 
@@ -801,7 +791,7 @@ describe("the lock", () => {
     fs.writeFileSync(lockPath(), "dead:token");
     const old = (clock.now() - LIMITS.staleMs - 5_000) / 1000;
     fs.utimesSync(lockPath(), old, old);
-    const c = make() as unknown as { removeIfStale(file: string): void };
+    const c = (make() as unknown as { locks: { removeIfStale(file: string): void } }).locks;
     c.removeIfStale(lockPath()); // the first waiter removes the stale lock...
     expect(fs.existsSync(lockPath())).toBe(false);
     fs.writeFileSync(lockPath(), "first:fresh"); // ...and takes a fresh one
@@ -1483,9 +1473,8 @@ describe("replacement by address (leg 13)", () => {
     expect(layer.count("restartSandbox")).toBe(0);
   });
 
-  // Leg 14: the named fallback is off, and a replacement under it never restarts the sandbox.
-  it("the restart-after-swap switch is off: a replacement of a running sandbox's proxy restarts nothing", async () => {
-    expect(RESTART_AFTER_SWAP).toBe(false);
+  // Leg 14: the fixed proxy MAC is relied on, so a replacement never restarts the sandbox (only a rollback does).
+  it("a replacement of a running sandbox's proxy restarts nothing", async () => {
     registryWith(rec());
     sandbox([NET]);
     await make().replace(KEY);
@@ -1768,25 +1757,5 @@ describe("proxyDiffers (leg 9)", () => {
     };
     expect(await c.proxyDiffers(KEY)).toBeUndefined();
     expect(layer.calls.filter((x) => /^(create|remove|start|setNetwork|attach)/.test(x))).toEqual([]);
-  });
-});
-
-describe("restartAfterSwap, the named fallback (leg 14)", () => {
-  const gvisor = { running: true, contained: true, runc: false };
-
-  it("is off by default (the shipped switch), and says no whatever the sandbox is", () => {
-    expect(RESTART_AFTER_SWAP).toBe(false);
-    expect(restartAfterSwap(gvisor)).toBe(false);
-  });
-
-  it("switched on, it says yes only for a running, contained sandbox under a non-runc runtime", () => {
-    expect(restartAfterSwap(gvisor, true)).toBe(true);
-    expect(restartAfterSwap({ ...gvisor, running: false }, true)).toBe(false);
-    expect(restartAfterSwap({ ...gvisor, contained: false }, true)).toBe(false);
-    expect(restartAfterSwap({ ...gvisor, runc: true }, true)).toBe(false);
-  });
-
-  it("switched off explicitly, it says no", () => {
-    expect(restartAfterSwap(gvisor, false)).toBe(false);
   });
 });

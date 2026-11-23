@@ -1,6 +1,6 @@
 # Flight: Groundwork, and Leaving Old Sandboxes Alone
 
-**Status**: ready
+**Status**: in-flight
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-23.** The mission's tentative flight 4 had three separate sets of design decisions:
@@ -181,7 +181,7 @@ Prepare the code and docs for flight 5, and close a way an installation can dele
 ### Prerequisites
 - [x] PR #32 (squawk turnaround 0057–0060) merged; `main` at `72a0420`.
 - [x] A unit baseline on `main` (2026-11-23, `72a0420`): `npx vitest run` gave 2,988 passed, 71 skipped, 0 failed in each of two runs (18.3 s, 17.4 s).
-- [ ] The Docker suite (`npm run test:docker`) run once on `main` as a baseline, before leg 3. It separates failures that already exist from the split's.
+- [x] The Docker suite (`npm run test:docker`) run once on `main` as a baseline, before leg 3. **Done 2026-11-23:** 66 passed, 5 skipped, 0 failed (678.8 s), and no Docker objects were left behind. It separates failures that already exist from the split's.
   - 0057's fix was not run against a live Docker 29 daemon; this run is the first to exercise it.
   - The baseline includes the old-sandbox (`before`) cases in `test/integration/docker.test.ts`, which leg 4 inverts.
 - [ ] The operator's `gron` (an old sandbox, label `mcp-everything=1`, no owner label) is still present for the HAT; checked with `docker inspect` (read-only) before the HAT.
@@ -233,10 +233,10 @@ Prepare the code and docs for flight 5, and close a way an installation can dele
 
 > **Note:** These are tentative suggestions, not commitments. Legs are planned and created one at a time as the flight progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] `docs-split` — Move the README's three security chapters to `docs/`, leave summaries and links, add `docs` to `package.json` `files`, and repoint `test/readme.test.ts` (DD2). Low risk.
-- [ ] `cleanups` — Squawks 0054–0056, the withheld-tool accessor, slow tests out of the default run, and the in-process outbound note (DD3). Low risk; behavior-neutral apart from the stated test moves.
-- [ ] `split-docker-and-containment` — The mechanical split of `docker.ts` and `containment.ts` (DD5). High risk for its size: it gets a design review.
-- [ ] `old-sandboxes` — Refuse `before` everywhere, with messages, inverted tests and the rewritten docs text (DD4). High risk: it touches ownership, the security-sensitive surface, and reverses pinned behavior.
+- [x] `docs-split` — Move the README's three security chapters to `docs/`, leave summaries and links, add `docs` to `package.json` `files`, and repoint `test/readme.test.ts` (DD2). Low risk.
+- [x] `cleanups` — Squawks 0054–0056, the withheld-tool accessor, slow tests out of the default run, and the in-process outbound note (DD3). Low risk; behavior-neutral apart from the stated test moves.
+- [x] `split-docker-and-containment` — The mechanical split of `docker.ts` and `containment.ts` (DD5). High risk for its size: it gets a design review.
+- [x] `old-sandboxes` — Refuse `before` everywhere, with messages, inverted tests and the rewritten docs text (DD4). High risk: it touches ownership, the security-sensitive surface, and reverses pinned behavior.
 - [ ] `hat-and-alignment` — Short guided HAT on the operator's installation:
   1. read `docs/` on GitHub;
   2. use one tool of the operator's `gron` and see the removal message;

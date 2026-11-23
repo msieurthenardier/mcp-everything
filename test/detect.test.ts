@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { detect, parseMakeTargets } from "../src/install/detect.js";
-import type { ProbeData } from "../src/sandbox/docker.js";
+import type { ProbeData } from "../src/sandbox/scripts.js";
 
 function probe(files: Record<string, string>, extra: string[] = [], dirs: string[] = []): ProbeData {
   return {

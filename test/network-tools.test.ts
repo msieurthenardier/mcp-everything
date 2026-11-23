@@ -7,8 +7,8 @@ import { allowanceFor, type ReplaceResult } from "../src/network/containment.js"
 import { HostEntryError, normalizeAgentHosts, unionHosts } from "../src/network/hosts.js";
 import { McpProxy } from "../src/proxy/mcp-proxy.js";
 import { Registry } from "../src/registry.js";
-import type { ProxyRefusalRow } from "../src/sandbox/docker.js";
-import { DockerUnavailableError } from "../src/sandbox/docker.js";
+import type { ProxyRefusalRow } from "../src/sandbox/network-spec.js";
+import { DockerUnavailableError } from "../src/sandbox/errors.js";
 import { App } from "../src/server.js";
 import type { ProjectRecord, ToolDef } from "../src/types.js";
 import { FakeDocker, fakeUpstream, record, type FakeUpstream } from "./helpers.js";

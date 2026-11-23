@@ -16,6 +16,25 @@ function section(title: string): string {
   return readme.slice(start, next < 0 ? undefined : next);
 }
 
+/**
+ * The three security chapters live in `docs/`. Each file is one chapter: its `# ` title is the chapter's old `## `
+ * heading and its subsections are `## ` (the old `### `). Reading one returns the whole file.
+ */
+function docFile(name: "checking" | "containment" | "security-model"): string {
+  return fs.readFileSync(path.join(root, "docs", `${name}.md`), "utf8");
+}
+const checkingDoc = docFile("checking");
+const containmentDoc = docFile("containment");
+const securityModelDoc = docFile("security-model");
+
+/** The text of one `## ` subsection of a docs file, up to the next `## ` (or the end of the file). */
+function docSection(doc: string, title: string): string {
+  const start = doc.indexOf(`\n## ${title}\n`);
+  expect(start, `the docs file has a "${title}" section`).toBeGreaterThanOrEqual(0);
+  const next = doc.indexOf("\n## ", start + 1);
+  return doc.slice(start, next < 0 ? undefined : next);
+}
+
 const SCAN_VARIABLES = ["MCPE_SCAN", "MCPE_SCAN_BLOCK_AT", "MCPE_SCAN_TIMEOUT", "MCPE_SCANNERS"];
 
 describe("the README and the code agree", () => {
@@ -23,7 +42,7 @@ describe("the README and the code agree", () => {
     expect(readme).toContain(`\`${name}\``);
   });
   it("documents a scanner's entrypoint", () => {
-    expect(section("Checking projects before they run")).toContain("`entrypoint`");
+    expect(checkingDoc).toContain("`entrypoint`");
   });
   it("names the check tool", () => {
     expect(readme).toContain("`check_project`");
@@ -90,16 +109,16 @@ describe("the README and the network containment code agree", () => {
     expect(tools).toMatch(/`install_project`[^\n]*`hosts`/);
   });
   it("accepts the MCPE_LOCAL_ACCESS example it gives", () => {
-    const m = /MCPE_LOCAL_ACCESS="([^"]+)"/.exec(section("Network containment"));
+    const m = /MCPE_LOCAL_ACCESS="([^"]+)"/.exec(containmentDoc);
     expect(m, "the section has an MCPE_LOCAL_ACCESS example").not.toBeNull();
     const c = loadConfig({ HOME: "/nonexistent", MCPE_DATA_DIR: "/nonexistent", MCPE_LOCAL_ACCESS: m![1]! });
     expect(Object.keys(c.network.localAccess).length).toBeGreaterThan(0);
   });
 
   describe("the default host table", () => {
-    const text = section("Network containment");
-    const start = text.indexOf("\n### The default hosts\n");
-    const body = text.slice(start, text.indexOf("\n### ", start + 1));
+    const text = containmentDoc;
+    const start = text.indexOf("\n## The default hosts\n");
+    const body = text.slice(start, text.indexOf("\n## ", start + 1));
     /** Row cells of the table in that subsection, without the header and the divider. */
     const rows = body
       .split("\n")
@@ -132,8 +151,8 @@ describe("the README and the network containment code agree", () => {
 });
 
 describe("the README and the dependency check agree", () => {
-  const checking = section("Checking projects before they run");
-  const dependencySection = checking.slice(checking.indexOf("### The dependency check"), checking.indexOf("### The tool-description check"));
+  const checking = checkingDoc;
+  const dependencySection = checking.slice(checking.indexOf("## The dependency check"), checking.indexOf("## The tool-description check"));
   it("has a section that says what it asks, of whom, and when, including check_project with scanning off", () => {
     expect(dependencySection).toContain("api.osv.dev");
     expect(dependencySection).toContain("GitHub");
@@ -152,7 +171,7 @@ describe("the README and the dependency check agree", () => {
     expect(checking).not.toContain("can never block anything");
   });
   it("says what reaches outside services, and what the graph misses", () => {
-    const outside = readme.slice(readme.indexOf("### What reaches outside services"));
+    const outside = docSection(containmentDoc, "What reaches outside services");
     expect(outside).toContain("`api.github.com`");
     expect(outside).toContain("not narrowed by containment");
     expect(outside).toContain("whatever `MCPE_SCAN` says");
@@ -161,11 +180,11 @@ describe("the README and the dependency check agree", () => {
 });
 
 describe("the README and the tool-description check agree", () => {
-  const checking = section("Checking projects before they run");
-  const start = checking.indexOf("### The tool-description check");
-  const text = checking.slice(start, checking.indexOf("### What none of this protects against"));
+  const checking = checkingDoc;
+  const start = checking.indexOf("## The tool-description check");
+  const text = checking.slice(start, checking.indexOf("## What none of this protects against"));
   it("has the section, between the dependency check and what none of this protects against", () => {
-    expect(start).toBeGreaterThan(checking.indexOf("### The dependency check"));
+    expect(start).toBeGreaterThan(checking.indexOf("## The dependency check"));
     expect(text).toContain("`tool-descriptions`");
   });
   it("says when it runs and what it reads, and that check_project does not run it", () => {
@@ -194,5 +213,73 @@ describe("the README and the tool-description check agree", () => {
   it("says in the tools table that find_project_tools leaves withheld tools out, and that the check never blocks an install", () => {
     expect(section("Built-in tools")).toContain("except tools withheld by the tool-description check");
     expect(checking).toMatch(/never blocks an install, whatever the level: under `block` it withholds tools/);
+  });
+});
+
+/** GitHub's anchor for a heading: lower case, backticks and punctuation dropped (but `-` and `_` kept), spaces to `-`. */
+function slug(heading: string): string {
+  return heading
+    .toLowerCase()
+    .replace(/`/g, "")
+    .replace(/[^\p{L}\p{N}_\- ]/gu, "")
+    .replace(/ /g, "-");
+}
+
+/** Anchors a file defines: one per heading outside fenced code, the second of two equal slugs getting `-1`, and so on. */
+function anchorsOf(text: string): Set<string> {
+  const seen = new Map<string, number>();
+  const anchors = new Set<string>();
+  let fenced = false;
+  for (const line of text.split("\n")) {
+    if (/^\s*```/.test(line)) {
+      fenced = !fenced;
+      continue;
+    }
+    const heading = !fenced && /^#{1,6} +(.+?) *$/.exec(line);
+    if (!heading) continue;
+    const base = slug(heading[1]!);
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    anchors.add(n === 0 ? base : `${base}-${n}`);
+  }
+  return anchors;
+}
+
+/** Targets of the inline links outside fenced code blocks and code spans. */
+function linkTargets(text: string): string[] {
+  const prose = text.replace(/^\s*```[\s\S]*?^\s*```/gm, "").replace(/(`+)[\s\S]*?\1/g, "");
+  return [...prose.matchAll(/\]\(([^)\s]+)\)/g)].map((m) => m[1]!);
+}
+
+describe("every link in the README and docs/ resolves", () => {
+  const files: Record<string, string> = {
+    "README.md": readme,
+    "docs/checking.md": checkingDoc,
+    "docs/containment.md": containmentDoc,
+    "docs/security-model.md": securityModelDoc,
+  };
+
+  it("slugs headings the way GitHub does", () => {
+    expect(slug("Local access (`MCPE_LOCAL_ACCESS`)")).toBe("local-access-mcpe_local_access");
+    expect(slug("Scanners' hosts")).toBe("scanners-hosts");
+    expect(slug("Upgrading, and switching from open to contained")).toBe("upgrading-and-switching-from-open-to-contained");
+    expect([...anchorsOf("# A\n\n## Same\n\n## Same\n\n```\n## Not a heading\n```\n")].sort()).toEqual(["a", "same", "same-1"]);
+  });
+
+  it.each(Object.keys(files))("%s: every relative link names an existing file and, with an anchor, a heading in it", (name) => {
+    const targets = linkTargets(files[name]!).filter((t) => !/^[a-z][a-z0-9+.-]*:/i.test(t));
+    expect(targets.length).toBeGreaterThan(0);
+    const broken: string[] = [];
+    for (const target of targets) {
+      const [file = "", anchor] = target.split("#", 2);
+      const resolved = file === "" ? path.join(root, name) : path.resolve(path.dirname(path.join(root, name)), file);
+      if (!fs.existsSync(resolved)) {
+        broken.push(`${target}: no such file`);
+        continue;
+      }
+      if (anchor === undefined || !resolved.endsWith(".md")) continue;
+      if (!anchorsOf(fs.readFileSync(resolved, "utf8")).has(anchor)) broken.push(`${target}: no such heading`);
+    }
+    expect(broken).toEqual([]);
   });
 });

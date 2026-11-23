@@ -8,7 +8,11 @@ import { Installer } from "../../src/install/installer.js";
 import { McpProxy } from "../../src/proxy/mcp-proxy.js";
 import { loadInstallationId } from "../../src/installation.js";
 import { Registry } from "../../src/registry.js";
-import { Docker, MANIFESTS, parseProbeOutput, proxyAddress, proxyMac, ProxyStartError, WALK_SCRIPT, walkArguments, type ExecOptions, type ExecResult, type OneShotSpec, type ProxyRefusalRow, type SandboxRef } from "../../src/sandbox/docker.js";
+import { Docker, type ExecOptions, type ExecResult } from "../../src/sandbox/docker.js";
+import type { OneShotSpec, SandboxRef } from "../../src/sandbox/docker-base.js";
+import { ProxyStartError } from "../../src/sandbox/errors.js";
+import { proxyAddress, proxyMac, type ProxyRefusalRow } from "../../src/sandbox/network-spec.js";
+import { MANIFESTS, parseProbeOutput, WALK_SCRIPT, walkArguments } from "../../src/sandbox/scripts.js";
 import { Containment } from "../../src/network/containment.js";
 import { buildHosts, sandboxHosts } from "../../src/network/defaults.js";
 import { refusalLines } from "../../src/network/refusals.js";
@@ -413,7 +417,7 @@ describe.skipIf(!enabled)("docker integration", () => {
     }
   }, 120_000);
 
-  it("works on, describes and removes a sandbox made before ownership was recorded", async () => {
+  it("refuses, describes and leaves alone a sandbox made before ownership was recorded", async () => {
     // Made by hand with the generic label and no owner label, as an earlier version made it.
     // Named with the suite's prefix, so the one name check below accepts it and no operator's sandbox can match.
     const name = `${prefix}before`;
@@ -454,19 +458,28 @@ describe.skipIf(!enabled)("docker integration", () => {
         selection: undefined,
       });
 
+      // Refused, with the short form: the prohibition and a pointer, and no docker command.
       const ran = await app.callTool("sandbox_exec", { project: slug, command: "echo still-works", cwd: "/workspace" });
-      expect(ran.isError).toBe(false);
-      expect(text(ran)).toContain("still-works");
+      expect(ran.isError).toBe(true);
+      expect(text(ran)).toContain("was made before ownership was recorded; this installation cannot tell whether it is its own and does not act on it. Do not remove it yourself; ask the operator");
+      expect(text(ran)).toContain("See project_info.");
+      expect(text(ran)).not.toContain("still-works");
+      expect(text(ran)).not.toMatch(/docker (rm|volume)/);
 
+      // The owner line is where the operator is told the two commands.
       const info = await app.callTool("project_info", { project: slug });
-      expect(text(info)).toMatch(/Sandbox owner: container "[^"]+" was made before ownership was recorded/);
+      expect(text(info)).toContain(
+        `Sandbox owner: container "${name}" was made before ownership was recorded; this installation cannot tell whether it is its own and does not act on it. Do not remove it yourself; ask the operator. If the operator confirms it is this installation's and not wanted, they can run \`docker rm -f ${name}\` and \`docker volume rm ${name}\`, then reinstall the project.`,
+      );
 
+      // Uninstall deletes the record and leaves both objects, and says so.
       const gone = await app.callTool("uninstall_project", { project: slug });
       expect(gone.isError).toBe(false);
-      expect(text(gone)).toMatch(/^Removed before .* and its sandbox\.$/);
+      expect(text(gone)).toContain("Its sandbox was left in place");
+      expect(text(gone)).toContain(`\`docker rm -f ${name}\` and \`docker volume rm ${name}\``);
       expect(app.registry.get(slug)).toBeUndefined();
-      expect((await run("docker", ["inspect", "--type", "container", name])).code).not.toBe(0);
-      expect((await run("docker", ["volume", "inspect", name])).code).not.toBe(0);
+      expect((await run("docker", ["inspect", "--type", "container", name])).code).toBe(0);
+      expect((await run("docker", ["volume", "inspect", name])).code).toBe(0);
     } finally {
       // Whatever state the case left. Exact name, checked.
       await removeContainerChecked(name, []);
@@ -939,7 +952,7 @@ describe.skipIf(!enabled)("docker integration: two installations on one daemon",
  * Opt-in: skipped unless MCPE_PRESSURE_TESTS=1 is set as well as
  * MCPE_DOCKER_TESTS=1 (`npm run test:docker:pressure`). The cases are slow (about
  * 30 s each) because they hold a sandbox at its process limit. Run them whenever
- * the watchdog script in src/sandbox/docker.ts or these cases change.
+ * the watchdog script in src/sandbox/scripts.ts or these cases change.
  */
 describe.skipIf(!pressureEnabled)("docker integration: sandbox at its process limit", () => {
   const IDLE = 6;

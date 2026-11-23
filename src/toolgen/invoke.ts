@@ -1,5 +1,5 @@
 import path from "node:path";
-import { WORK_DIR, WORKSPACE } from "../sandbox/docker.js";
+import { WORK_DIR, WORKSPACE } from "../sandbox/scripts.js";
 import type { ToolDef } from "../types.js";
 
 export interface Invocation {

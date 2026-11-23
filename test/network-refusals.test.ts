@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { failedCallSuffix, joinRefusals, MAX_FAILED_CALL_LINES, MAX_REFUSAL_CHARS, MAX_REFUSAL_LINES, refusalLines, refusalWarnings } from "../src/network/refusals.js";
-import type { ProxyRefusalRow } from "../src/sandbox/docker.js";
+import type { ProxyRefusalRow } from "../src/sandbox/network-spec.js";
 
 const row = (host: string | null, port: number | null = 443, reason: ProxyRefusalRow["reason"] = "not-allowed"): ProxyRefusalRow => ({
   kind: "connect", host, port, reason, count: 1, firstAt: "2026-01-01T00:00:00.000Z", lastAt: "2026-01-01T00:00:01.000Z",

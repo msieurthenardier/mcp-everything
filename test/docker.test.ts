@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { record, TEST_INSTALLATION_ID } from "./helpers.js";
+import { CONTAINMENT_SOURCES, DOCKER_SOURCES, prototypeChainNames, readSources } from "./sources.js";
 import { Containment, proxyEnvironment } from "../src/network/containment.js";
 import { Registry } from "../src/registry.js";
 import { createHash } from "node:crypto";
@@ -10,43 +11,28 @@ import os from "node:os";
 import path from "node:path";
 import type { RunOptions } from "../src/util/exec.js";
 import { proxyConfig, proxyLaunchArgs } from "../src/network/proxy/config.js";
+import { Docker, envFlags, makeRef, type ExecResult } from "../src/sandbox/docker.js";
+import { ONE_SHOT_ROLES, type ContainmentHook, type ContainmentHookMode, type OneShotSpec } from "../src/sandbox/docker-base.js";
 import {
-  classifySandbox,
   CloneFailedError,
   ContainmentUnavailableError,
-  Docker,
   DockerUnavailableError,
-  envFlags,
-  isStoppedExecFailure,
+  ProxyStartError,
+  RuntimeMismatchError,
+  RuntimeUnavailableError,
+  VolumeNotUsableError,
+} from "../src/sandbox/errors.js";
+import {
+  isRuncRuntime,
   LOCAL_ACCESS_SCRIPT,
-  makeRef,
-  MANIFESTS,
-  ONE_SHOT_ROLES,
-  OWNER_SHOWN,
-  parseProbeOutput,
   parseProxyReport,
   parseResolvConf,
-  isRuncRuntime,
   projectNetworkName,
   proxyAddress,
   proxyMac,
-  ProxyStartError,
-  PROBE_SCRIPT,
-  RuntimeMismatchError,
-  RuntimeUnavailableError,
-  WALK_SCRIPT,
-  WALK_SEPARATOR,
-  walkArguments,
-  SandboxRefusedError,
-  VolumeNotUsableError,
-  watchdogPollSec,
-  type ContainmentHook,
-  type ContainmentHookMode,
-  type ExecResult,
-  type OneShotSpec,
-  type SandboxClass,
-  type SandboxInspectFacts,
-} from "../src/sandbox/docker.js";
+} from "../src/sandbox/network-spec.js";
+import { classifySandbox, OWNER_SHOWN, SandboxRefusedError, type SandboxClass, type SandboxInspectFacts } from "../src/sandbox/ownership.js";
+import { isStoppedExecFailure, parseProbeOutput, WALK_SCRIPT, WALK_SEPARATOR, walkArguments, watchdogPollSec } from "../src/sandbox/scripts.js";
 
 type Reply = Partial<ExecResult>;
 const reply = (r: Reply): ExecResult => ({ code: 0, stdout: "", stderr: "", timedOut: false, truncated: false, ...r });
@@ -840,7 +826,7 @@ const EIGHT = ["exec", "state", "ensureRunning", "acquire", "networkState", "set
 describe("every method that takes a name resolves first", () => {
   describe.each(EIGHT)("%s", (method) => {
     const c = CASES[method]!;
-    it.each<SandboxClass>(["another", "not-ours"])("refuses a sandbox that is %s, with inspects only", async (cls) => {
+    it.each<SandboxClass>(["another", "not-ours", "before"])("refuses a sandbox that is %s, with inspects only", async (cls) => {
       const d = mk();
       setup(d, c, cls);
       const e = await settle(c.run(d));
@@ -858,7 +844,8 @@ describe("every method that takes a name resolves first", () => {
       for (const v of d.verbs) expect(READ_ONLY.has(v), `${method} issued ${v}`).toBe(true);
     });
 
-    it.each<SandboxClass>(["mine", "before"])("acts on the id of a sandbox that is %s", async (cls) => {
+    // A sandbox made before ownership was recorded was acted on here until leg 4 of flight 04; it is refused above now.
+    it.each<SandboxClass>(["mine"])("acts on the id of a sandbox that is %s, and of no other class", async (cls) => {
       const d = mk();
       const id = setup(d, c, cls)!;
       expect(await settle(c.run(d))).toBeNull();
@@ -918,18 +905,27 @@ describe("acquire", () => {
     expect(d.argvs).toHaveLength(1);
   });
 
-  it.each<SandboxClass>(["mine", "before"])("starts a stopped sandbox that is %s, by id", async (cls) => {
+  it.each<SandboxClass>(["mine"])("starts a stopped sandbox that is %s, by id, and no other class", async (cls) => {
     const d = mk();
     const id = d.put(N, cls, { running: false });
     expect(await d.acquire(N)).toEqual({ id, name: N });
     expect(d.argvs.filter((a) => a[0] === "start")).toEqual([["start", id]]);
   });
 
-  it.each<SandboxClass>(["another", "not-ours"])("refuses a stopped sandbox that is %s, and does not start it", async (cls) => {
+  it.each<SandboxClass>(["another", "not-ours", "before"])("refuses a stopped sandbox that is %s, and does not start it", async (cls) => {
     const d = mk();
     d.put(N, cls, { running: false });
     await expect(d.acquire(N)).rejects.toBeInstanceOf(SandboxRefusedError);
     expect(d.count("start")).toBe(0);
+  });
+
+  it("gives no reference for a sandbox made before ownership: acquire and startForContainment refuse, a stopped one stays stopped", async () => {
+    const d = mk();
+    d.put(N, "before", { running: false });
+    await expect(d.acquire(N)).rejects.toMatchObject({ reason: "before" });
+    await expect(d.startForContainment(N)).rejects.toMatchObject({ reason: "before" });
+    expect(d.count("start")).toBe(0);
+    for (const v of d.verbs) expect(READ_ONLY.has(v), `issued ${v}`).toBe(true);
   });
 });
 
@@ -997,9 +993,9 @@ describe("a reference", () => {
   });
 });
 
-describe("destroy classifies both before it removes either", () => {
+describe("destroy classifies both before it removes either, and refuses a pair with any part that is not mine (made before ownership included)", () => {
   const classes: SandboxClass[] = ["mine", "before", "another", "not-ours"];
-  const bad = (c: SandboxClass) => c === "another" || c === "not-ours";
+  const bad = (c: SandboxClass) => c !== "mine";
   const pairs = classes.flatMap((c) => classes.map((v) => [c, v] as const));
 
   it.each(pairs)("container %s, volume %s", async (c, v) => {
@@ -1025,6 +1021,19 @@ describe("destroy classifies both before it removes either", () => {
       const lastInspect = Math.max(...["inspect", "volume inspect", "ps", "network inspect"].map((v) => d.verbs.lastIndexOf(v)));
       expect(lastInspect).toBeLessThan(d.verbs.indexOf("rm"));
     }
+  });
+
+  it("a mixed pair (a container that is mine on a volume made before ownership) is refused, and the refusal names the volume", async () => {
+    const d = mk();
+    d.put(N, "mine");
+    d.putVolume(V, "before");
+    const r = (await settle(d.destroy(N, V))) as SandboxRefusedError;
+    expect(r).toBeInstanceOf(SandboxRefusedError);
+    expect([r.kind, r.sandbox, r.reason]).toEqual(["volume", V, "before"]);
+    expect(r.message).toContain(`container "${N}" is this installation's`);
+    expect(r.message).toContain(`volume "${V}" was made before ownership was recorded`);
+    expect(r.message).not.toContain("docker rm");
+    expect(r.message).not.toContain("docker volume rm");
   });
 
   it("a volume that cannot be asked about leaves the container alone", async () => {
@@ -1072,14 +1081,14 @@ describe("probe's volume", () => {
     expect(d.count("create")).toBe(1);
   });
 
-  it.each<SandboxClass>(["another", "not-ours"])("refuses a volume that is %s", async (cls) => {
+  it.each<SandboxClass>(["another", "not-ours", "before"])("refuses a volume that is %s", async (cls) => {
     const d = mk();
     d.putVolume(V, cls);
     await expect(probe(d)).rejects.toBeInstanceOf(SandboxRefusedError);
     expect(d.count("volume create") + d.count("create")).toBe(0);
   });
 
-  it.each<SandboxClass>(["mine", "before"])("says a volume that is %s already exists", async (cls) => {
+  it.each<SandboxClass>(["mine"])("says a volume that is %s already exists, and of no other class (made before ownership is refused)", async (cls) => {
     const d = mk();
     d.putVolume(V, cls);
     const e = await settle(probe(d));
@@ -1337,12 +1346,13 @@ describe("createContainer's volume and result", () => {
     expect(d.count("run")).toBe(0);
   });
 
-  it("says a volume from before cannot hold a new container", async () => {
+  it("refuses a volume made before ownership, so it cannot hold a new container", async () => {
     const d = mk();
     d.putVolume(V, "before");
     const e = await settle(create(d));
-    expect(e).not.toBeInstanceOf(SandboxRefusedError);
-    expect((e as Error).message).toMatch(/was made before ownership was recorded; it cannot hold/);
+    expect(e).toBeInstanceOf(SandboxRefusedError);
+    expect((e as SandboxRefusedError).reason).toBe("before");
+    expect((e as Error).message).toMatch(/was made before ownership was recorded; this installation cannot tell/);
     expect(d.count("run")).toBe(0);
   });
 
@@ -1416,7 +1426,7 @@ describe("the guard cannot be skipped unnoticed", () => {
     // Leg 13 (proxy by address). `probeSubnet` and `networkCreateFailure` are helpers of the network create: the probe acts only
     // on the throwaway network it just made (by the random name or the id it was given). `detachProjectProxy` and
     // `restoreProjectProxy` classify the project's proxy themselves (this installation's, role project-proxy) before they act.
-    // `writeLocalAccess` is given a container's id by containment and classifies it again (mine or from before) before its one
+    // `writeLocalAccess` is given a container's id by containment and classifies it again (only mine passes) before its one
     // root exec; `clearLocalAccess` is its best-effort call from `setNetworkNow`, on the container that guarded method resolved.
     // `afterStarted` only calls the post-start step it was handed, with facts it was given.
     "probeSubnet", "networkCreateFailure", "detachProjectProxy", "restoreProjectProxy", "writeLocalAccess", "clearLocalAccess", "afterStarted",
@@ -1435,8 +1445,7 @@ describe("the guard cannot be skipped unnoticed", () => {
   // Leg 8: projectRefusals reports too (the rows of a project's proxies' refusals; it lists and reads status, never throws).
   // Leg 10: listOwnSandboxes reports too (this installation's sandboxes, from `ps` and one inspect each; it never throws for an absent one).
   const REPORTING = [...STATE_REPORTERS, "listProjectProxies", "projectProxyStatus", "projectRefusals", "listOwnSandboxes"];
-  const own = () =>
-    Object.getOwnPropertyNames(Docker.prototype).filter((n) => n !== "constructor" && typeof Object.getOwnPropertyDescriptor(Docker.prototype, n)!.value === "function");
+  const own = () => prototypeChainNames(Docker.prototype, (d) => typeof d.value === "function");
 
   it("the class's methods are exactly the guarded table plus the two written lists", () => {
     const methods = own();
@@ -1508,11 +1517,11 @@ describe("the guard cannot be skipped unnoticed", () => {
     });
   });
 
-  it.each(Object.keys(CASES))("%s is refused against another's or not-ours sandbox, in every volume position, on a double that accepts only inspects", async (method) => {
+  it.each(Object.keys(CASES))("%s is refused against another's, not-ours or made-before-ownership sandbox, in every volume position, on a double that accepts only inspects", async (method) => {
     const c = CASES[method]!;
     const positions = c.resource === "volume" ? slots(c).map((_, i) => i) : [0];
     for (const position of positions) {
-      for (const cls of ["another", "not-ours"] as const) {
+      for (const cls of ["another", "not-ours", "before"] as const) {
         const d = mk();
         d.strict = true;
         setup(d, c, cls, position);
@@ -1534,7 +1543,8 @@ describe("the guard cannot be skipped unnoticed", () => {
 
   it("every exec, start, rm and network command names a 64-character id, never a name", async () => {
     const seen = new Set<string>();
-    for (const cls of ["mine", "before"] as const) {
+    // Narrowed to mine: a sandbox made before ownership is refused before any command names an id (the table above).
+    for (const cls of ["mine"] as const) {
       for (const [method, c] of Object.entries(CASES)) {
         const d = mk();
         setup(d, c, cls);
@@ -1719,241 +1729,6 @@ describe("probe passes the separator and the walk's arguments after the manifest
   });
 });
 
-/** The walk run in the host's own sh over a scratch directory (the integration case runs it in the pinned image). */
-describe("the walk script, in a local shell", () => {
-  const hasSh = fs.existsSync("/bin/sh");
-  const head = `HEAD ${"a".repeat(40)}\n`;
-  const exec = (dir: string) => {
-    const script = WALK_SCRIPT.replace("cd /workspace/repo", `cd '${dir}'`);
-    return execFileSync("/bin/sh", ["-c", script, "walk", ...walkArguments()], { encoding: "utf8", maxBuffer: 64_000_000 });
-  };
-  const withDir = (fn: (dir: string) => void) => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-walk-"));
-    try {
-      fn(dir);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  };
-  const put = (dir: string, rel: string, content: string | Buffer = "x\n") => {
-    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
-    fs.writeFileSync(path.join(dir, rel), content);
-  };
-  const walkOf = (raw: string) => parseProbeOutput(head + raw).walk;
-  const it2 = (name: string, fn: () => void) => it.skipIf(!hasSh)(name, { timeout: 60_000 }, fn);
-
-  it2("reads the root and nested package.json, prunes node_modules, and does not follow a link", () => {
-    withDir((dir) => {
-      put(dir, "package.json", '{"r":1}');
-      put(dir, "sub/package.json", '{"s":1}');
-      put(dir, "node_modules/x/package.json", "{}");
-      fs.writeFileSync(path.join(dir, "secret"), "s");
-      fs.symlinkSync(path.join(dir, "secret"), path.join(dir, "setup.py"));
-      const w = walkOf(exec(dir));
-      expect(w.files.map((f) => f.path)).toEqual(["package.json", "sub/package.json"]);
-      expect(w.skippedLinks).toEqual(["setup.py"]);
-      expect(w.incomplete).toBeUndefined();
-    });
-  });
-
-  it2("reports a nested link that a find pattern matches, and never reads it", () => {
-    withDir((dir) => {
-      fs.writeFileSync(path.join(dir, "outside"), "secret");
-      put(dir, "sub/x", "x");
-      fs.symlinkSync(path.join(dir, "outside"), path.join(dir, "sub/package.json"));
-      fs.symlinkSync("sub", path.join(dir, "linkdir"));
-      const w = walkOf(exec(dir));
-      expect(w.files).toEqual([]);
-      expect(w.skippedLinks).toEqual(["sub/package.json"]);
-    });
-  });
-
-  it2("reads root-only entries only at the root, once, and prints nothing for an empty tree", () => {
-    withDir((dir) => {
-      put(dir, ".cargo/config.toml", "a");
-      put(dir, "nested/.cargo/config.toml", "b");
-      put(dir, "nested/setup.py", "c");
-      put(dir, "setup.py", "d");
-      expect(walkOf(exec(dir)).files.map((f) => f.path).sort()).toEqual([".cargo/config.toml", "setup.py"]);
-    });
-    withDir((dir) => {
-      expect(exec(dir)).toBe("");
-    });
-  });
-
-  it2("reads a 5 MB pnpm-lock.yaml for presence only: empty, not truncated, no budget used", () => {
-    withDir((dir) => {
-      put(dir, "pnpm-lock.yaml", Buffer.alloc(5_000_000, 97));
-      put(dir, "yarn.lock", "y");
-      for (let i = 0; i < 30; i++) put(dir, `d${i}/Makefile`, Buffer.alloc(70_000, 98));
-      const raw = exec(dir);
-      const w = walkOf(raw);
-      expect(w.files.find((f) => f.path === "pnpm-lock.yaml")).toEqual({ path: "pnpm-lock.yaml", content: "" });
-      expect(w.files.find((f) => f.path === "yarn.lock")).toEqual({ path: "yarn.lock", content: "" });
-      expect(w.files.filter((f) => f.path.endsWith("Makefile"))).toHaveLength(30);
-      expect(w.incomplete).toBeUndefined();
-      expect(raw.length).toBeLessThan(3_500_000);
-    });
-  });
-
-  it2("reports a presence-only lockfile that is a link, and reads none that is not a file", () => {
-    withDir((dir) => {
-      fs.symlinkSync("/etc/hostname", path.join(dir, "yarn.lock"));
-      fs.mkdirSync(path.join(dir, "pnpm-lock.yaml"));
-      const w = walkOf(exec(dir));
-      expect(w.files).toEqual([]);
-      expect(w.skippedLinks).toEqual(["yarn.lock"]);
-    });
-  });
-
-  it2("truncates a file over 64 KB at 64 KB and flags it", () => {
-    withDir((dir) => {
-      put(dir, "configure", Buffer.alloc(70_000, 99));
-      put(dir, "Makefile", Buffer.alloc(65_536, 100));
-      const w = walkOf(exec(dir));
-      const c = w.files.find((f) => f.path === "configure")!;
-      expect(c.truncated).toBe(true);
-      expect(c.content).toHaveLength(65_536);
-      const m = w.files.find((f) => f.path === "Makefile")!;
-      expect(m.truncated).toBeUndefined();
-      expect(m.content).toHaveLength(65_536);
-    });
-  });
-
-  it2("reports a directory name with a newline as INCOMPLETE newline and skips what is inside it", () => {
-    withDir((dir) => {
-      put(dir, "package.json", "{}");
-      put(dir, "a\nb/package.json", "{}");
-      put(dir, "a\n./package.json", "{}");
-      const raw = exec(dir);
-      expect(raw.split("\n")).toContain("INCOMPLETE newline");
-      expect(walkOf(raw).files.map((f) => f.path)).toEqual(["package.json"]);
-    });
-  });
-
-  it2("reports INCOMPLETE depth for a match below the depth limit, and none at the limit", () => {
-    withDir((dir) => {
-      put(dir, "a/b/c/d/e/f/g/Makefile", "x"); // depth 8: read
-      const ok = exec(dir);
-      expect(ok).not.toContain("INCOMPLETE");
-      expect(walkOf(ok).files).toHaveLength(1);
-    });
-    withDir((dir) => {
-      put(dir, "a/b/c/d/e/f/g/h/Makefile", "x"); // depth 9: not read
-      expect(exec(dir).split("\n")).toContain("INCOMPLETE depth");
-    });
-  });
-
-  it2("does not report INCOMPLETE depth for a deep match that lies under a pruned directory", () => {
-    withDir((dir) => {
-      put(dir, "a/b/node_modules/c/d/e/f/g/h/i/j/package.json", "{}"); // ten levels deep, under a pruned node_modules at depth 3
-      expect(exec(dir).split("\n")).not.toContain("INCOMPLETE depth");
-    });
-    withDir((dir) => {
-      put(dir, "a/b/c/d/e/f/g/h/i/j/package.json", "{}"); // ten levels deep, nothing pruned on the way
-      expect(exec(dir).split("\n")).toContain("INCOMPLETE depth");
-    });
-  });
-
-  it2("caps a pattern at 40 files with INCOMPLETE pattern, and still exits 0 when head closes the pipe early", () => {
-    withDir((dir) => {
-      for (let i = 0; i < 300; i++) put(dir, `m/f${i}.cmake`, "x");
-      const lines = exec(dir).split("\n"); // execFileSync throws on a non-zero exit
-      expect(lines).toContain("INCOMPLETE pattern");
-      expect(lines.filter((l) => l.startsWith("BUILD "))).toHaveLength(40);
-    });
-  });
-
-  it2("enforces the file budget, reading the root package.json first", () => {
-    withDir((dir) => {
-      put(dir, "package.json", '{"root":1}');
-      for (const n of ["package.json", "Cargo.toml", "build.rs", "binding.gyp", "CMakeLists.txt", "Rakefile"]) {
-        for (let i = 0; i < 40; i++) put(dir, `d${i}/${n}`, "x");
-      }
-      const raw = exec(dir);
-      const w = walkOf(raw);
-      expect(w.files).toHaveLength(200);
-      expect(raw.split("\n")).toContain("INCOMPLETE files");
-      expect(w.files[0]).toEqual({ path: "package.json", content: '{"root":1}' });
-    });
-  });
-
-  it2("enforces the byte budget", () => {
-    withDir((dir) => {
-      for (let i = 0; i < 40; i++) put(dir, `d${i}/x.mk`, Buffer.alloc(70_000, 97));
-      const raw = exec(dir);
-      const w = walkOf(raw);
-      expect(w.files).toHaveLength(32); // 32 x 64 KB is exactly 2 MB
-      expect(w.files.every((f) => f.truncated === true)).toBe(true);
-      expect(raw.split("\n")).toContain("INCOMPLETE bytes");
-    });
-  });
-
-  it2("keeps the root match of a pattern inside its cap when nested ones are more than 40", () => {
-    withDir((dir) => {
-      for (let i = 0; i < 60; i++) put(dir, `A${i}/Makefile`, "x");
-      put(dir, "Makefile", "root\n");
-      const w = walkOf(exec(dir));
-      expect(w.files[0]).toEqual({ path: "Makefile", content: "root\n" });
-      expect(w.incomplete).toBe("pattern");
-    });
-  });
-
-  it2("treats file names as data: no expansion, no command substitution", () => {
-    withDir((dir) => {
-      // A stray file here would make the final check pass vacuously.
-      expect(fs.existsSync(path.resolve("pwned"))).toBe(false);
-      put(dir, "a.cmake", "x");
-      put(dir, "$(touch pwned).cmake", "x");
-      put(dir, "x;y.cmake", "x");
-      const w = walkOf(exec(dir));
-      expect(w.files.map((f) => f.path).sort()).toEqual(["$(touch pwned).cmake", "a.cmake", "x;y.cmake"]);
-      expect(fs.existsSync(path.join(dir, "pwned"))).toBe(false);
-      expect(fs.existsSync(path.resolve("pwned"))).toBe(false);
-    });
-  });
-
-  it2("is silent about a tree with no matches", () => {
-    withDir((dir) => {
-      put(dir, "README", "x");
-      expect(exec(dir)).toBe("");
-    });
-  });
-});
-
-/** The whole clone-and-walk script against a local git repository, with /workspace redirected to a scratch directory. */
-describe("the whole probe script, in a local shell", () => {
-  const hasTools = fs.existsSync("/bin/sh") && (() => { try { execFileSync("git", ["--version"]); return true; } catch { return false; } })();
-  it.skipIf(!hasTools)("prints each manifest once, none outside MANIFESTS, and the walk's files after the separator split", { timeout: 60_000 }, () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-probe-"));
-    try {
-      const src = path.join(root, "src");
-      fs.mkdirSync(src);
-      fs.writeFileSync(path.join(src, "package.json"), '{"a":1}');
-      fs.writeFileSync(path.join(src, "Makefile"), "all:\n");
-      fs.writeFileSync(path.join(src, "go.mod"), "module x\n");
-      fs.mkdirSync(path.join(src, "sub"));
-      fs.writeFileSync(path.join(src, "sub", "Makefile"), "all:\n");
-      const git = (...a: string[]) => execFileSync("git", ["-C", src, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { stdio: "pipe" });
-      git("init", "--quiet");
-      git("add", ".");
-      git("commit", "--quiet", "-m", "x");
-      const ws = path.join(root, "ws");
-      fs.mkdirSync(ws);
-      const probeScript = PROBE_SCRIPT.split("/workspace").join(ws);
-      const out = execFileSync("/bin/sh", ["-c", probeScript, "probe", src, "", "0", ...MANIFESTS, WALK_SEPARATOR, ...walkArguments()], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-      const names = out.split("\n").filter((l) => l.startsWith("FILE ")).map((l) => l.split(" ")[1]!);
-      expect(names.sort()).toEqual(["Makefile", "go.mod", "package.json"]);
-      for (const n of names) expect(MANIFESTS).toContain(n);
-      const data = parseProbeOutput(out);
-      expect(data.walk.files.map((f) => f.path).sort()).toEqual(["Makefile", "package.json", "sub/Makefile"]);
-      expect(data.walk.incomplete).toBeUndefined();
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-});
-
 // ---------------------------------------------------------------------------
 // Scanners, the copy and the leftovers sweep (leg 6)
 // ---------------------------------------------------------------------------
@@ -2007,7 +1782,7 @@ describe("runScanner", () => {
     ["another's", (d) => stage(d, "another"), undefined],
     ["not mcp-everything's", (d) => stage(d, "not-ours"), undefined],
     ["missing", () => undefined, /does not exist/],
-    ["from before ownership", (d) => stage(d, "before"), /before ownership/],
+    ["made before ownership (refused)", (d) => stage(d, "before"), undefined],
     ["without a role", (d) => stage(d, "mine", null), /not a staging volume/],
     ["a sandbox volume's role", (d) => stage(d, "mine", "sandbox"), /not a staging volume/],
   ])("throws for a volume that is %s, and creates no container", async (_n, set, text) => {
@@ -2051,8 +1826,8 @@ describe("copyVolume", () => {
   it.each<[string, (d: ScriptedDocker) => void, boolean]>([
     ["the source is another's", (d) => { both(d); d.putVolume(STAGING, "another", "staging"); }, true],
     ["the target is another's", (d) => { both(d); d.putVolume(TARGET, "another"); }, true],
-    ["the source is from before ownership", (d) => { both(d); d.putVolume(STAGING, "before", "staging"); }, false],
-    ["the target is from before ownership", (d) => { both(d); d.putVolume(TARGET, "before"); }, false],
+    ["the source was made before ownership (refused)", (d) => { both(d); d.putVolume(STAGING, "before", "staging"); }, true],
+    ["the target was made before ownership (refused)", (d) => { both(d); d.putVolume(TARGET, "before"); }, true],
     ["the source has no role", (d) => { both(d); d.putVolume(STAGING, "mine"); }, false],
     ["the target has a role", (d) => { both(d); d.putVolume(TARGET, "mine", "staging"); }, false],
     ["the source is missing", (d) => d.putVolume(TARGET, "mine"), false],
@@ -2087,7 +1862,7 @@ describe("createSandboxVolume", () => {
   });
 
   it("refuses a name that exists: another's by refusal, this installation's by a plain error, and creates nothing", async () => {
-    for (const cls of ["another", "not-ours"] as const) {
+    for (const cls of ["another", "not-ours", "before"] as const) {
       const d = mk();
       d.putVolume(TARGET, cls);
       expect(await settle(d.createSandboxVolume(TARGET))).toBeInstanceOf(SandboxRefusedError);
@@ -2122,13 +1897,22 @@ describe("stagingName and removeStagingVolume", () => {
     expect(d.count("volume rm")).toBe(0);
   });
 
-  it("leaves a volume of this installation that is not a staging volume: no role, another role, or from before", async () => {
-    for (const [cls, role] of [["mine", undefined], ["mine", "other"], ["before", undefined]] as const) {
+  it("leaves a volume of this installation that is not a staging volume: no role, or another role", async () => {
+    for (const [cls, role] of [["mine", undefined], ["mine", "other"]] as const) {
       const d = mk();
       d.putVolume(STAGING, cls, role);
       await expect(d.removeStagingVolume(STAGING)).rejects.toBeInstanceOf(VolumeNotUsableError);
       expect(d.count("volume rm")).toBe(0);
     }
+  });
+
+  it("refuses a volume made before ownership (it is not removed, and it is not VolumeNotUsableError)", async () => {
+    const d = mk();
+    d.putVolume(STAGING, "before", "staging");
+    const e = await settle(d.removeStagingVolume(STAGING));
+    expect(e).toBeInstanceOf(SandboxRefusedError);
+    expect(e).not.toBeInstanceOf(VolumeNotUsableError);
+    expect(d.count("volume rm")).toBe(0);
   });
 
   it("a failed removal says so", async () => {
@@ -2407,7 +2191,7 @@ describe("the required runtime", () => {
     });
 
     it("only assertRuntime's trial uses the runtime-check role", () => {
-      const src = fs.readFileSync(path.join(__dirname, "../src/sandbox/docker.ts"), "utf8");
+      const src = readSources(DOCKER_SOURCES);
       expect(src.match(/role: "runtime-check"/g)).toHaveLength(1);
       expect(src.slice(src.indexOf("private async checkRuntime"))).toContain('role: "runtime-check"');
       expect(src).toContain('spec.role !== "runtime-check"');
@@ -2898,7 +2682,7 @@ describe("the roles of one-shot containers", () => {
     expect(d.created[0]!.name).toMatch(new RegExp(`^mcpe-${ID}-${role}-[0-9a-f]{8}$`));
   });
   it("the source's type is derived from the list, so a role cannot be in one and not the other", () => {
-    const src = fs.readFileSync(path.join(__dirname, "../src/sandbox/docker.ts"), "utf8");
+    const src = readSources(DOCKER_SOURCES);
     expect(src).toContain("export type OneShotRole = (typeof ONE_SHOT_ROLES)[number];");
   });
 });
@@ -3994,6 +3778,7 @@ describe("listOwnSandboxes (leg 10)", () => {
     put(d, "stranger", { "com.example": "x" });
     const listed = await d.listOwnSandboxes();
     expect(listed.map((s) => s.name).sort()).toEqual(["mcpe-0123abcd-a", "mcpe-0123abcd-b"]);
+    expect(listed.map((s) => s.name)).not.toContain("mcpe-before"); // a sandbox made before ownership is never listed
     const a = listed.find((s) => s.name === "mcpe-0123abcd-a")!;
     expect(a).toEqual({ id: idFor("mcpe-0123abcd-a"), name: "mcpe-0123abcd-a", running: false, labels: sandboxLabels(), networks: ["bridge"], runtime: undefined });
     expect(d.argvs[0]).toEqual(["ps", "-a", "-q", "--no-trunc", "--filter", `label=${OWNER_L}=${ID}`, "--filter", `label=${PROJECT_L}`]);
@@ -4378,6 +4163,25 @@ describe('setNetwork: "contained"', () => {
       expect(d.count("network connect") + d.count("network disconnect")).toBe(0);
     });
 
+    // Squawk 0054: `whileStopped` throws when the stop fails and the sandbox is not simply gone; nothing is issued after the stop.
+    it("whileStopped: a stop that fails (not 'No such container') throws, and no connect, disconnect or start follows it", async () => {
+      for (const attempt of [
+        (d: ScriptedDocker) => d.restartSandbox(PS),
+        (d: ScriptedDocker) => d.setNetwork(PS, "contained"),
+      ]) {
+        const d = mkEgress();
+        putNet(d);
+        d.put(PS, "mine", { networks: ["bridge"], runtime: "runsc" });
+        d.script.push((a) => (a[0] === "stop" ? { code: 1, stderr: "Error response from daemon: cannot stop container: permission denied\n" } : undefined));
+        d.argvs.length = 0;
+        await expect(attempt(d)).rejects.toThrow(/Failed to stop sandbox .* to change its network: Error response from daemon: cannot stop container: permission denied/);
+        const issued = d.argvs.filter((a) => a[0] === "stop" || a[0] === "start" || (a[0] === "network" && a[1] !== "inspect"));
+        expect(issued.map((a) => a[0])).toEqual(["stop"]);
+        expect(d.count("network connect") + d.count("network disconnect") + d.count("start")).toBe(0);
+        expect(d.containers.get(PS)!.running).toBe(true);
+      }
+    });
+
     it("the repair's re-attach (attachProjectNetwork with the sandbox's facts) does the same: stop, attach, start; runc is live", async () => {
       const d = mkEgress();
       const id = d.put(PS, "mine", { networks: [PNET], runtime: "runsc" });
@@ -4479,13 +4283,16 @@ describe("destroy of a project with a proxy and a network", () => {
     expect(removals(d)).toEqual([["rm", "-f", "-v", px.id], ["network", "rm", net.id], ["volume", "rm", "-f", PV]]);
   });
 
-  it("a sandbox from before ownership (no project label) is destroyed the same way", async () => {
+  it("a sandbox from before ownership (no project label) is refused, and nothing of it, its proxy or its network is removed", async () => {
     const d = mkEgress();
-    const net = putNet(d);
-    const id = d.put(PS, "before", { networks: [PNET] });
-    const px = putProxy(d);
-    await d.destroy(PS, PV);
-    expect(removals(d)).toEqual([["rm", "-f", "-v", id], ["rm", "-f", "-v", px.id], ["network", "rm", net.id]]);
+    putNet(d);
+    d.put(PS, "before", { networks: [PNET] });
+    putProxy(d);
+    const e = await settle(d.destroy(PS, PV));
+    expect(e).toBeInstanceOf(SandboxRefusedError);
+    expect((e as SandboxRefusedError).reason).toBe("before");
+    expect(removals(d)).toEqual([]);
+    expect(d.containers.has(PS)).toBe(true);
   });
 
   it.each<[string, Labels]>([
@@ -5566,10 +5373,8 @@ describe("proxyAddress", () => {
 });
 
 describe("no embedded DNS anywhere (leg 13)", () => {
-  const read = (rel: string) => fs.readFileSync(path.join(__dirname, "..", rel), "utf8");
-
   it("no `network connect` in docker.ts carries --alias, and the file has no alias at all", () => {
-    const src = read("src/sandbox/docker.ts");
+    const src = readSources(DOCKER_SOURCES);
     expect(src).not.toMatch(/--alias/);
     expect(src).not.toMatch(/PROXY_ALIAS/);
     // Leg 14: a proxy's address is given at its create (`--network name=...,ip=...`); a connect of a proxy is `bridge` (no address) or,
@@ -5582,8 +5387,8 @@ describe("no embedded DNS anywhere (leg 13)", () => {
   });
 
   it("no source file names the proxy by host name", () => {
-    expect(read("src/sandbox/docker.ts")).not.toMatch(/mcpe-proxy/);
-    expect(read("src/network/containment.ts")).not.toMatch(/mcpe-proxy/);
+    expect(readSources(DOCKER_SOURCES)).not.toMatch(/mcpe-proxy/);
+    expect(readSources(CONTAINMENT_SOURCES)).not.toMatch(/mcpe-proxy/);
   });
 
   it("the proxy environment holds an address and no host name, for every subnet shape", () => {
