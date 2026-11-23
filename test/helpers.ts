@@ -158,6 +158,8 @@ export interface FakeUpstream {
   answerIf?: (launch: Launch) => boolean;
   /** Live upstream server objects, to simulate a crash with .close(). */
   servers: Server[];
+  /** What `tools/list` answers instead of the default four, when set. */
+  tools?: Tool[];
 }
 
 /**
@@ -172,7 +174,7 @@ export function fakeUpstream(): FakeUpstream {
     if (state.answer && (state.answerIf?.(launch) ?? true)) {
       const upstream = new Server({ name: "upstream", version: "1" }, { capabilities: { tools: {} } });
       upstream.setRequestHandler("tools/list", async () => ({
-        tools: <Tool[]>[
+        tools: state.tools ?? <Tool[]>[
           { name: "add", description: "Add two numbers", inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } }, required: ["a", "b"] } },
           { name: "whoami", description: "Report which launch this is", inputSchema: { type: "object", properties: {} } },
           { name: "hang", description: "Never answers", inputSchema: { type: "object" } },

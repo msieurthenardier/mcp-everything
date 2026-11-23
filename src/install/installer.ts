@@ -2,47 +2,40 @@ import type { Config } from "../config.js";
 import type { ContainResult, ReplaceResult } from "../network/containment.js";
 import { normalizeAgentHosts, unionHosts } from "../network/hosts.js";
 import { joinRefusals, refusalLines, refusalWarnings } from "../network/refusals.js";
-import { hostVariableNames, isUnusableValueError, launchVariables } from "../proxy/host-env.js";
-import type { McpProxy, UpstreamTool } from "../proxy/mcp-proxy.js";
+import { hostVariableNames, launchVariables } from "../proxy/host-env.js";
+import type { McpProxy } from "../proxy/mcp-proxy.js";
 import type { Registry } from "../registry.js";
 import {
-  BIN_DIR,
   CloneFailedError,
   Docker,
-  DockerUnavailableError,
   REPO_DIR,
   OWNER_SHOWN,
   SandboxRefusedError,
-  VENV_DIR,
-  WORK_DIR,
   WORKSPACE,
   type ExecResult,
   type ProbeData,
   type SandboxFacts,
   type SandboxRef,
 } from "../sandbox/docker.js";
-import { buildTools, crawlCommand, fetchRootHelp, selectPublished, type SandboxExec } from "../toolgen/discover.js";
-import { parseHelp } from "../toolgen/help-parser.js";
-import { helpLaunches, manifestLaunches, type LaunchCandidate } from "../toolgen/mcp-launch.js";
+import { selectPublished, type SandboxExec } from "../toolgen/discover.js";
 import { makeSlug } from "../toolgen/naming.js";
 import type {
-  CommandSpec,
   Ecosystem,
   McpServerSpec,
-  ParsedHelp,
-  ProjectMeta,
   ProjectRecord,
   RepoRef,
   ToolSelection,
 } from "../types.js";
 import { cleanTerminalText, oneLine } from "../util/text.js";
 import { analyzeBuildHooks } from "../scan/build-hooks.js";
+import { inertDependencyLookup, type DependencyLookup } from "../scan/dependencies.js";
 import { decide } from "../scan/policy.js";
 import { runScanners } from "../scan/run.js";
 import { emptyCounts } from "../scan/sarif.js";
 import type { CheckOutcome, ScanReport } from "../scan/types.js";
 import { detect } from "./detect.js";
-import { NODE_DISCOVERY, PYTHON_DISCOVERY, recipeFor } from "./recipes.js";
+import { discover, type McpDiscovery } from "./discovery.js";
+import { recipeFor } from "./recipes.js";
 import { chooseToolchain, type ToolchainChoice } from "./toolchain.js";
 
 /** Where an install is, for its failure branch. A later state before "old" can be added as a member. */
@@ -137,19 +130,8 @@ export function isStaleInstall(record: ProjectRecord, now: number, cfg: Config):
   return now - started > staleInstallLimitSec(cfg) * 1000;
 }
 
-const COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
-const COMMAND_PATH = /^\/[A-Za-z0-9._+/-]{1,200}$/;
-const MAX_COMMANDS = 12;
-/** Upper bound on a project's catalog; what is advertised is far smaller. */
-const MAX_CATALOG = 1500;
-const NO_EXECUTABLES =
-  "No executables were discovered. Use sandbox_exec to explore or build manually, then discover_tools with the executables you produced.";
-/** Warnings about MCP proxying and tool publication are recomputed on every discovery. */
-const MCP_WARNING = "MCP: ";
+/** Warnings about tool publication are recomputed on every discovery (MCP warnings are discovery's own). */
 const TOOLS_WARNING = "Tools: ";
-/** Handshake budget when merely probing whether a command is an MCP server. */
-const MCP_PROBE_SEC = 15;
-const MAX_MCP_PROBES = 6;
 const MAX_BUILD_WARNINGS = 20;
 
 // Returns the checkout to a pristine state before rebuilding on another image.
@@ -167,30 +149,6 @@ class Tail {
   }
 }
 
-function parseJsonLine(stdout: string): Record<string, unknown> {
-  const line = stdout.trim().split("\n").pop() ?? "";
-  try {
-    const value: unknown = JSON.parse(line);
-    return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
-}
-
-const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
-
-interface McpDiscovery {
-  servers: McpServerSpec[];
-  lists: Array<{ server: string; tools: UpstreamTool[] }>;
-  /** Commands that are MCP servers when run without arguments: no CLI to crawl. */
-  bare: Set<string>;
-  /** Registered servers whose tool listing failed, with the first line of the error. */
-  failed: Array<{ server: string; reason: string }>;
-  /** Candidate launches that did not answer, and the first reason given. */
-  unanswered: string[];
-  reason: string;
-}
-
 /** What `Installer.refreshMcp` hands back beside the record. */
 export interface RefreshOutcome {
   record: ProjectRecord;
@@ -203,11 +161,6 @@ export interface RefreshOutcome {
   /** MCP server names recorded before the call and after it. */
   before: string[];
   after: string[];
-}
-
-/** Said where a server did not start and the cause may be a missing variable. */
-function routeHint(slug: string): string {
-  return `If it needs environment variables, set ${slug}__NAME in the environment of mcp-everything, reconnect it, and call refresh_mcp.`;
 }
 
 /** What an install that checks first came to. `kept` is the repository's existing record, whatever its status. */
@@ -250,6 +203,8 @@ export class Installer {
     private readonly env: Record<string, string | undefined> = process.env,
     /** Required under `MCPE_NETWORK=contained`: an installer that was not given one never builds on the network instead. */
     private readonly containment?: InstallContainment,
+    /** The dependency check's lookup; inert (no outcome, nothing sent) unless one is given. */
+    private readonly dependencies: DependencyLookup = inertDependencyLookup(),
   ) {
     if (cfg.network.mode === "contained" && !containment) {
       throw new Error("An installer under MCPE_NETWORK=contained needs containment; none was given.");
@@ -319,8 +274,15 @@ export class Installer {
    * caller removes it), the clone's data and the report. On any failure it removes the staging volume (best
    * effort) and throws an Error whose message is a cleaned, bounded one-line reason.
    */
-  private async checkClone(params: InstallParams, log: Logger): Promise<{ staging: string; probe: ProbeData; report: ScanReport }> {
+  private async checkClone(
+    params: InstallParams,
+    log: Logger,
+    lookupDependencies: boolean,
+  ): Promise<{ staging: string; probe: ProbeData; report: ScanReport }> {
     const staging = this.docker.stagingName();
+    const controller = new AbortController();
+    // Started before the clone and wrapped here, at creation, so that it can never reject unhandled.
+    const lookup = lookupDependencies ? this.startDependencyLookup(params, controller.signal) : undefined;
     try {
       log(`Cloning ${params.repo.cloneUrl}${params.ref ? ` @ ${params.ref}` : ""} to check it…`);
       const probe = await this.docker.probe(params.repo, staging, {
@@ -340,22 +302,58 @@ export class Installer {
           error: "the built-in check could not analyze this repository",
         };
       }
+      const dependencies = lookup ? await lookup : undefined;
       log("Running the scanners…");
       const scanned = await runScanners(this.docker, staging, this.cfg.scan.scanners, {
         totalTimeoutSec: this.cfg.scan.timeoutSec,
         dataDir: this.cfg.dataDir,
       });
-      const checks = [builtin, ...scanned];
+      const checks = [...(dependencies ? [dependencies] : []), builtin, ...scanned];
       const decision = decide(this.cfg.scan.mode, this.cfg.scan.blockAt, checks);
       return { staging, probe, report: { commit: probe.commit, checks, decision, at: new Date().toISOString() } };
     } catch (e) {
+      controller.abort();
       await this.dropStaging(staging);
+      // A failed check never hides a send: what the lookup contacted before it was stopped is appended after the cut.
+      const sent = await this.sentBeforeFailure(lookup);
       // A refused clone says so first, so that the cut of a long reason is of git's own text and never of the refusal.
       if (e instanceof CloneFailedError && e.refusals.length > 0) {
-        throw new Error(oneLine(`${joinRefusals(e.refusals, " ")} ${e.detail}`, CHECK_REASON_MAX));
+        throw new Error(oneLine(`${joinRefusals(e.refusals, " ")} ${e.detail}`, CHECK_REASON_MAX) + sent);
       }
-      throw new Error(oneLine(e instanceof Error ? e.message : String(e), CHECK_REASON_MAX));
+      throw new Error(oneLine(e instanceof Error ? e.message : String(e), CHECK_REASON_MAX) + sent);
     }
+  }
+
+  /** Starts the dependency lookup; the promise never rejects (a throw or a rejection is a failed outcome). */
+  private startDependencyLookup(params: InstallParams, signal: AbortSignal): Promise<CheckOutcome | undefined> {
+    const failed: CheckOutcome = {
+      name: "dependencies", kind: "builtin", status: "failed", counts: emptyCounts(), findings: [], omitted: 0, notes: [],
+      error: "the dependency check could not complete",
+    };
+    try {
+      return Promise.resolve(this.dependencies.check(params.repo, params.ref, signal)).catch(() => failed);
+    } catch {
+      return Promise.resolve(failed);
+    }
+  }
+
+  /** The sentence added to a failed check's reason when the dependency lookup had sent something; "" otherwise. */
+  private async sentBeforeFailure(lookup: Promise<CheckOutcome | undefined> | undefined): Promise<string> {
+    if (!lookup) return "";
+    let timer: NodeJS.Timeout | undefined;
+    const outcome = await Promise.race([
+      lookup,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), 2000);
+        timer.unref();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    const contacted = outcome?.contacted ?? [];
+    const parts: string[] = [];
+    if (contacted.includes("github")) parts.push("the repository's name to GitHub");
+    if (contacted.includes("osv")) parts.push("package versions to OSV");
+    return parts.length > 0 ? ` (before it failed, the dependency check sent ${parts.join(" and ")})` : "";
   }
 
   /** Removes a staging volume; best effort, never throws. */
@@ -378,7 +376,7 @@ export class Installer {
     await this.docker.assertRuntime();
     let checked: { staging: string; probe: ProbeData; report: ScanReport };
     try {
-      checked = await this.checkClone(params, log);
+      checked = await this.checkClone(params, log, true);
     } catch (e) {
       return { kind: "check-failed", reason: (e as Error).message };
     }
@@ -414,7 +412,7 @@ export class Installer {
     hooks?.onChecking?.();
     let checked: { staging: string; probe: ProbeData; report: ScanReport };
     try {
-      checked = await this.checkClone(params, log);
+      checked = await this.checkClone(params, log, this.cfg.scan.mode !== "off");
     } catch (e) {
       return { kind: "check-failed", reason: (e as Error).message, kept: this.currentRecord(params.repo.id) };
     }
@@ -1061,304 +1059,18 @@ export class Installer {
   }
 
   private async discover(record: ProjectRecord, sandbox: SandboxRef, extraCommands: string[]): Promise<McpDiscovery> {
-    // Every command of a discovery has a place that reads its failure as "no": eight `.catch(() => null)` in this
-    // file and the `catch` in `fetchHelp` (toolgen/discover.ts), which receives this wrapped function. "Docker could not be asked" must not become "no commands", so the first one
-    // is remembered, thrown again on every later command, and thrown by the discovery before it writes or returns.
-    // Only that type: a command on a held reference reads no labels, so it cannot raise a refusal.
-    let unavailable: DockerUnavailableError | undefined;
-    const bound = this.execFor(sandbox);
-    const exec: SandboxExec = async (argv, opts) => {
-      if (unavailable) throw unavailable;
-      try {
-        return await bound(argv, opts);
-      } catch (e) {
-        if (e instanceof DockerUnavailableError) unavailable = e;
-        throw e;
-      }
-    };
-    const checkAsked = () => {
-      if (unavailable) throw unavailable;
-    };
-    const quick = { timeoutSec: 60, cwd: REPO_DIR };
-    const commands = new Map<string, CommandSpec>();
-    const add = (name: string, origin: string) => {
-      const ok = COMMAND_NAME.test(name) || COMMAND_PATH.test(name);
-      if (ok && !commands.has(name) && commands.size < MAX_COMMANDS) commands.set(name, { name, origin });
-    };
-
-    // Commands registered by hand survive re-discovery for as long as they exist.
-    const exists = async (name: string) => {
-      const res = await exec(["sh", "-c", 'command -v "$1" >/dev/null', "sh", name], quick).catch(() => null);
-      checkAsked(); // not "there is no such executable"
-      return res?.code === 0;
-    };
-    for (const c of record.commands) {
-      if (c.origin === "registered" && (await exists(c.name))) add(c.name, c.origin);
-    }
-    for (const name of extraCommands) {
-      if (!COMMAND_NAME.test(name) && !COMMAND_PATH.test(name)) {
-        throw new Error(`"${name}" is not a valid executable name or absolute path`);
-      }
-      if (!(await exists(name))) throw new Error(`No executable "${name}" was found in the sandbox`);
-      add(name, "registered");
-    }
-
-    const meta: ProjectMeta = { ...record.meta, pythonModules: [], nodePackages: [], hasPythonEnv: false, hasNode: false };
-    // Commands whose own package depends on an MCP SDK, and the packages the checkout provides.
-    const sdkCommands: string[] = [];
-    const packages: string[] = [];
-    const owners = new Map<string, string>();
-    const own = (value: unknown) => {
-      if (!value || typeof value !== "object") return;
-      for (const [command, owner] of Object.entries(value)) if (typeof owner === "string") owners.set(command, owner);
-    };
-
-    const py = await exec([`${VENV_DIR}/bin/python`, "-c", PYTHON_DISCOVERY], quick).catch(() => null);
-    if (py && py.code === 0) {
-      const info = parseJsonLine(py.stdout);
-      meta.hasPythonEnv = true;
-      meta.pythonModules = strings(info.modules).filter((m) => /^[A-Za-z_][\w.]{0,60}$/.test(m)).slice(0, 30);
-      for (const script of strings(info.scripts)) add(script, "console_script");
-      sdkCommands.push(...strings(info.mcp_scripts));
-      packages.push(...strings(info.dists));
-      own(info.owners);
-    }
-
-    const nodeCheck = await exec(["sh", "-c", `[ -f ${REPO_DIR}/package.json ] && command -v node`], quick).catch(() => null);
-    if (nodeCheck && nodeCheck.code === 0) {
-      meta.hasNode = true;
-      const node = await exec(["node", "-e", NODE_DISCOVERY], quick).catch(() => null);
-      if (node && node.code === 0) {
-        const info = parseJsonLine(node.stdout);
-        meta.nodePackages = strings(info.packages).filter((p) => /^[@\w./-]{1,80}$/.test(p)).slice(0, 20);
-        sdkCommands.push(...strings(info.mcp));
-        packages.push(...meta.nodePackages);
-        own(info.owners);
-        const missing = strings(info.missing).filter((n) => COMMAND_NAME.test(n));
-        if (missing.length > 0) {
-          record.warnings.push(`package.json bin targets missing (build step needed?): ${missing.slice(0, 8).join(", ")}`);
-        }
-      }
-    }
-
-    const bins = await exec(["ls", "-1", BIN_DIR], quick).catch(() => null);
-    if (bins && bins.code === 0) {
-      const names = bins.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
-      // The command named after the project is the one people came for.
-      const repoName = record.repo.name.toLowerCase();
-      names.sort((a, b) => Number(b.toLowerCase() === repoName) - Number(a.toLowerCase() === repoName));
-      for (const name of names) add(name, `built by ${record.primary} recipe`);
-    }
-
-    const limits = {
-      maxDepth: 2,
-      maxSubcommands: 25,
-      helpTimeoutSec: this.cfg.helpTimeoutSec,
-      budget: { remaining: 90 },
-    };
-
-    // Top-level help of every command: it identifies aliases, may reveal an
-    // MCP mode, and is where the subcommand crawl starts.
-    const rootText = new Map<string, string | null>();
-    for (const name of commands.keys()) rootText.set(name, await fetchRootHelp(exec, name, limits));
-    const { kept, aliasOf } = await this.foldAliases(exec, [...commands.values()], rootText);
-    const rootHelp = new Map<string, ParsedHelp | null>();
-    for (const c of kept) {
-      const text = rootText.get(c.name);
-      rootHelp.set(c.name, text ? parseHelp(text) : null);
-    }
-
-    checkAsked(); // before any proxied server is opened
-    const mcp = await this.discoverMcp(record, exec, {
-      commands: kept.map((c) => c.name),
-      aliasOf,
-      packages,
-      // An alias that was folded away hands its owner to the name that was kept.
-      owners: new Map([...owners].map(([command, owner]) => [aliasOf.get(command) ?? command, owner] as const)),
-      pythonModules: meta.pythonModules,
-      sdkCommands: [...new Set(sdkCommands.map((c) => aliasOf.get(c) ?? c))],
-      hinted: Boolean(meta.mcpHint),
-      rootHelp,
-    });
-
-    const roots = [];
-    for (const command of kept) {
-      if (mcp.bare.has(command.name)) continue;
-      const text = rootText.get(command.name);
-      roots.push({ command, node: text ? await crawlCommand(exec, command.name, limits, text) : null });
-    }
-
-    checkAsked(); // before anything is written to the record
-    record.meta = meta;
-    record.commands = kept;
-    record.mcpServers = mcp.servers;
-    record.tools = buildTools({
-      slug: record.slug,
-      repoId: record.repo.id,
-      meta,
-      mcp: mcp.lists,
-      roots,
-      maxTools: MAX_CATALOG,
-    });
-    record.warnings = [...new Set(record.warnings)].filter((w) => w !== NO_EXECUTABLES);
-    if (record.commands.length === 0 && mcp.lists.length === 0) record.warnings.push(NO_EXECUTABLES);
-    this.publish(record);
-    // Scratch dir may have been removed by the project; tools default to it.
-    await exec(["mkdir", "-p", WORK_DIR], quick).catch(() => null);
-    checkAsked();
-    return mcp;
-  }
-
-  /**
-   * Fold commands that are the same program under another name into one.
-   * Two names are aliases only if they resolve to the same file *and* print
-   * the same help: a multi-call binary (one file, behaviour chosen by the
-   * name it is run as) keeps all of its names.
-   */
-  private async foldAliases(
-    exec: SandboxExec,
-    commands: CommandSpec[],
-    rootText: Map<string, string | null>,
-  ): Promise<{ kept: CommandSpec[]; aliasOf: Map<string, string> }> {
-    const real = new Map<string, string>();
-    const script = 'for c in "$@"; do p=$(command -v "$c") && printf "%s\\t%s\\n" "$c" "$(readlink -f "$p")"; done; true';
-    const res = await exec(["sh", "-c", script, "sh", ...commands.map((c) => c.name)], { timeoutSec: 60 }).catch(() => null);
-    for (const line of (res?.stdout ?? "").split("\n")) {
-      const [name, target] = line.split("\t");
-      if (name && target) real.set(name, target);
-    }
-    const kept: CommandSpec[] = [];
-    const aliasOf = new Map<string, string>();
-    for (const command of commands) {
-      const file = real.get(command.name);
-      const help = rootText.get(command.name);
-      const twin =
-        command.origin === "registered" || !file || !help
-          ? undefined
-          : kept.find((k) => real.get(k.name) === file && rootText.get(k.name) === help);
-      if (twin) {
-        twin.aliases = [...(twin.aliases ?? []), command.name];
-        aliasOf.set(command.name, twin.name);
-      } else {
-        kept.push({ name: command.name, origin: command.origin });
-      }
-    }
-    return { kept, aliasOf };
-  }
-
-  /**
-   * Work out which MCP servers the sandbox offers and what tools they list.
-   *
-   * Registered servers are kept as they are. Beyond those, launch commands
-   * are tried in order of how much evidence backs them: what the repository
-   * declares (server.json, mcp.json), then, for commands whose package
-   * depends on an MCP SDK or whose repository hints at MCP, running the
-   * command bare, then whatever MCP mode its help advertises. A command stops
-   * being probed once one launch answers the handshake.
-   */
-  private async discoverMcp(
-    record: ProjectRecord,
-    exec: SandboxExec,
-    ctx: {
-      commands: string[];
-      aliasOf: Map<string, string>;
-      packages: string[];
-      owners: Map<string, string>;
-      pythonModules: string[];
-      sdkCommands: string[];
-      hinted: boolean;
-      rootHelp: Map<string, ParsedHelp | null>;
-    },
-  ): Promise<McpDiscovery> {
-    record.warnings = record.warnings.filter((w) => !w.startsWith(MCP_WARNING));
-    const servers: McpServerSpec[] = [];
-    const lists: McpDiscovery["lists"] = [];
-    const bare = new Set<string>();
-    const startFailures: McpDiscovery["failed"] = [];
-    // Commands that need no further probing: registered, or already answered.
-    const claimed = new Set<string>();
-    const brief = (e: unknown) => cleanTerminalText(e instanceof Error ? e.message : String(e)).split("\n")[0]!.slice(0, 240);
-
-    for (const server of record.mcpServers ?? []) {
-      if (server.origin !== "registered") continue;
-      servers.push(server);
-      claimed.add(ctx.aliasOf.get(server.argv[0]!) ?? server.argv[0]!);
-      if (server.argv.length === 1) bare.add(server.argv[0]!);
-      try {
-        lists.push({ server: server.name, tools: await this.proxy.listTools(record.container, this.launchSpec(record, server)) });
-      } catch (e) {
-        // A refusal or "could not be asked" is not "the server did not start": it ends the discovery.
-        if (e instanceof SandboxRefusedError || e instanceof DockerUnavailableError) throw e;
-        const text = brief(e);
-        startFailures.push({ server: server.name, reason: text });
-        // The hint goes after the cut; an unusable value already says what to fix.
-        record.warnings.push(`${MCP_WARNING}${text}${isUnusableValueError(e) ? "" : ` ${routeHint(record.slug)}`}`);
-      }
-    }
-
-    const read = async (file: string) => {
-      const res = await exec(["head", "-c", "200000", `${REPO_DIR}/${file}`], { timeoutSec: 30 }).catch(() => null);
-      return res && res.code === 0 ? res.stdout : undefined;
-    };
-    const declared = manifestLaunches(
-      { serverJson: await read("server.json"), mcpJson: await read("mcp.json"), dotMcpJson: await read(".mcp.json") },
-      ctx,
+    return discover(
+      {
+        cfg: this.cfg,
+        proxy: this.proxy,
+        execFor: (s) => this.execFor(s),
+        launchSpec: (p, s) => this.launchSpec(p, s),
+        publish: (r) => this.publish(r),
+      },
+      record,
+      sandbox,
+      extraCommands,
     );
-
-    const candidates: LaunchCandidate[] = [...declared];
-    const suspects = ctx.sdkCommands.filter((c) => ctx.commands.includes(c));
-    // Without a declared launch or a telling dependency, a repository that
-    // merely hints at MCP gets each of its commands tried bare.
-    const bareProbes = suspects.length > 0 ? suspects : ctx.hinted && declared.length === 0 ? ctx.commands : [];
-    for (const command of ctx.commands) {
-      if (bareProbes.includes(command)) candidates.push({ name: command, argv: [command], source: "run without arguments" });
-      for (const argv of helpLaunches(command, ctx.rootHelp.get(command) ?? null)) {
-        candidates.push({ name: command, argv, source: "its help text" });
-      }
-    }
-
-    const tried = new Set<string>();
-    const failed: string[] = [];
-    let reason = "";
-    let reasonUnusable = false;
-    let probes = 0;
-    for (const candidate of candidates) {
-      const command = candidate.argv[0]!;
-      const key = JSON.stringify(candidate.argv);
-      if (claimed.has(command) || tried.has(key) || probes >= MAX_MCP_PROBES) continue;
-      tried.add(key);
-      probes++;
-      let name = COMMAND_NAME.test(candidate.name) ? candidate.name : command;
-      if (servers.some((s) => s.name === name)) name = `${name}-${probes}`;
-      const spec: McpServerSpec = { name, argv: candidate.argv, cwd: REPO_DIR, env: {}, origin: "detected" };
-      try {
-        const tools = await this.proxy.listTools(record.container, this.launchSpec(record, spec), MCP_PROBE_SEC);
-        servers.push(spec);
-        lists.push({ server: spec.name, tools });
-        claimed.add(command);
-        if (candidate.argv.length === 1) bare.add(command);
-      } catch (e) {
-        // Same rule as above: not "did not answer the handshake".
-        if (e instanceof SandboxRefusedError || e instanceof DockerUnavailableError) throw e;
-        failed.push(candidate.argv.join(" "));
-        if (!reason) {
-          reason = brief(e);
-          reasonUnusable = isUnusableValueError(e);
-        }
-      }
-    }
-    // Launches that failed for a command which then answered another way are not news.
-    const unanswered = failed.filter((f) => !claimed.has(f.split(" ")[0]!));
-    if (unanswered.length > 0) {
-      record.warnings.push(
-        `${MCP_WARNING}this project looks like an MCP server, but none of these completed an MCP handshake: ${unanswered.map((u) => `\`${u}\``).join(", ")} (${reason}). ${
-          reasonUnusable
-            ? "If it needs other arguments, environment variables or network access, register it with connect_mcp_server."
-            : `${routeHint(record.slug)} If it needs other arguments or network access, register it with connect_mcp_server.`
-        }`,
-      );
-    }
-    return { servers, lists, bare, failed: startFailures, unanswered, reason };
   }
 
   /**

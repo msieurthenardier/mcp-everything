@@ -130,3 +130,69 @@ describe("the README and the network containment code agree", () => {
     });
   });
 });
+
+describe("the README and the dependency check agree", () => {
+  const checking = section("Checking projects before they run");
+  const dependencySection = checking.slice(checking.indexOf("### The dependency check"), checking.indexOf("### The tool-description check"));
+  it("has a section that says what it asks, of whom, and when, including check_project with scanning off", () => {
+    expect(dependencySection).toContain("api.osv.dev");
+    expect(dependencySection).toContain("GitHub");
+    expect(dependencySection).toMatch(/`check_project` \*\*whatever `MCPE_SCAN` says\*\*/);
+    expect(dependencySection).toContain("`malicious-package`");
+    expect(dependencySection).toContain("`vulnerable-package`");
+    expect(dependencySection).toMatch(/Ranges are not looked up/);
+    expect(dependencySection).toMatch(/Workflow actions .* are not\s+checked/);
+    expect(dependencySection).toMatch(/pinned `ref`/);
+    expect(dependencySection).toContain("`GITHUB_TOKEN`");
+    expect(dependencySection).toContain("github.com");
+  });
+  it("warns about block at warning and at note, and no longer says the built-in check can never block", () => {
+    expect(checking).toMatch(/Blocking at `warning`\*\* also blocks any GitHub repository with a\s+known-vulnerable dependency/);
+    expect(checking).toMatch(/Blocking at `note`\*\* blocks every project/);
+    expect(checking).not.toContain("can never block anything");
+  });
+  it("says what reaches outside services, and what the graph misses", () => {
+    const outside = readme.slice(readme.indexOf("### What reaches outside services"));
+    expect(outside).toContain("`api.github.com`");
+    expect(outside).toContain("not narrowed by containment");
+    expect(outside).toContain("whatever `MCPE_SCAN` says");
+    expect(checking).toMatch(/What the dependency graph misses/);
+  });
+});
+
+describe("the README and the tool-description check agree", () => {
+  const checking = section("Checking projects before they run");
+  const start = checking.indexOf("### The tool-description check");
+  const text = checking.slice(start, checking.indexOf("### What none of this protects against"));
+  it("has the section, between the dependency check and what none of this protects against", () => {
+    expect(start).toBeGreaterThan(checking.indexOf("### The dependency check"));
+    expect(text).toContain("`tool-descriptions`");
+  });
+  it("says when it runs and what it reads, and that check_project does not run it", () => {
+    expect(text).toMatch(/end of every discovery, while `MCPE_SCAN` is not\s+`off`/);
+    expect(text).toContain("`refresh_mcp`");
+    expect(text).toMatch(/`check_project` does not run it either/);
+    expect(text).toMatch(/every tool in the catalog, published or not/);
+  });
+  it("lists the rules by level, and that a proxied server's own tool name is exempt from the last error rule", () => {
+    expect(text).toMatch(/`error`: hidden characters/);
+    expect(text).toMatch(/`warning`: invisible characters/);
+    expect(text).toMatch(/own tool name is exempt/);
+    expect(text).toMatch(/does not quote|never quote the text they matched/);
+  });
+  it("says what block withholds, that select_project_tools cannot bring it back, and that other sessions republish it", () => {
+    expect(text).toMatch(/\*\*withheld\*\*/);
+    expect(text).toMatch(/`select_project_tools` cannot bring a withheld tool back/);
+    expect(text).toMatch(/`off` or\s+`warn` republishes what a `block` session withheld/);
+    expect(text).toMatch(/The check failing never withholds anything/);
+  });
+  it("says it is a reading aid that can be evaded and can misfire", () => {
+    expect(text).toMatch(/reading aid/);
+    expect(text).toMatch(/evaded/);
+    expect(text).toMatch(/misfire/);
+  });
+  it("says in the tools table that find_project_tools leaves withheld tools out, and that the check never blocks an install", () => {
+    expect(section("Built-in tools")).toContain("except tools withheld by the tool-description check");
+    expect(checking).toMatch(/never blocks an install, whatever the level: under `block` it withholds tools/);
+  });
+});

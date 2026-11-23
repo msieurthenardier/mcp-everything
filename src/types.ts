@@ -1,6 +1,6 @@
 /** Shared data model. Everything in here is persisted to the registry as JSON. */
 
-import type { ScanReport } from "./scan/types.js";
+import type { CheckOutcome, Level, ScanReport } from "./scan/types.js";
 
 export type Forge = "github" | "gitlab";
 
@@ -154,6 +154,39 @@ export interface ProjectRecord {
   installedAt: string;
   /** What the check of the repository found before this install built it; absent when none was made. */
   scan?: ScanReport;
+  /**
+   * What the tool-description check did at the last discovery that ran it; absent when scanning was off then or the
+   * project predates the check. Written only by discovery, so it always describes the catalog as it stands.
+   */
+  toolCheck?: ToolCheck;
+}
+
+/** One tool the tool-description check withheld. Holds only names mcp-everything generated or validated. */
+export interface WithheldTool {
+  /** The generated tool name. */
+  tool: string;
+  /** The registered MCP server (name validated at registration). */
+  server?: string;
+  /** The command path of a CLI tool, when every word of it is a validated command name. */
+  command?: string;
+  /** The tool's highest finding. */
+  ruleId: string;
+  level: Level;
+}
+
+export interface ToolCheck {
+  /** ISO time of the discovery. */
+  at: string;
+  mode: "warn" | "block";
+  blockAt: Level;
+  outcome: CheckOutcome;
+  /** At most 50, in catalog order; the rest are counted in `withheldOmitted`. */
+  withheld: WithheldTool[];
+  /** Every withheld generated name, uncapped, so a call to one is always recognized. */
+  withheldNames: string[];
+  withheldOmitted: number;
+  /** Registered servers that had tools built and have none left. */
+  allWithheldServers: string[];
 }
 
 export interface ProjectMeta {
