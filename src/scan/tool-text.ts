@@ -4,7 +4,8 @@
  * hold a fixed sentence per rule and a location made of the generated tool name and mcp-everything's own field label.
  * Every regex is written with `\u{…}` escapes: no invisible character appears in this file.
  */
-import { clean, emptyCounts, MAX_FINDINGS } from "./sarif.js";
+import { emptyCounts, MAX_FINDINGS } from "./sarif.js";
+import { clean } from "./util.js";
 import { LEVELS, type CheckOutcome, type Finding, type Level } from "./types.js";
 
 export const CHECK_NAME = "tool-descriptions";

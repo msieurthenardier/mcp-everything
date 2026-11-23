@@ -240,13 +240,24 @@ describe("parseSarif: bounds", () => {
     expect(r.findings[0]!.message).toHaveLength(200);
     expect(performance.now() - t0).toBeLessThan(3000);
   });
-  it("parses 8 MB of empty results in under 3 s", () => {
-    const body = "{},".repeat(2_800_000) + "{}";
-    const text = `{"version":"2.1.0","runs":[{"results":[${body}]}]}`;
+  it("parses 8 MB of empty results in linear time", () => {
+    const doc = (n: number): string => `{"version":"2.1.0","runs":[{"results":[${"{},".repeat(n - 1)}{}]}]}`;
+    const text = doc(2_800_001);
     expect(text.length).toBeGreaterThanOrEqual(8_000_000);
+    // Relative, not absolute: compare against the same document at 1/10 size (best of 3, so a
+    // load spike on one run does not inflate the baseline). Linear is about 10x; quadratic is
+    // about 100x. A 40x ceiling separates them and is insensitive to machine load.
+    const small = doc(280_000);
+    let smallBest = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const s0 = performance.now();
+      ok(small);
+      smallBest = Math.min(smallBest, performance.now() - s0);
+    }
     const t0 = performance.now();
     const r = ok(text);
-    expect(performance.now() - t0).toBeLessThan(3000);
+    const full = performance.now() - t0;
+    expect(full).toBeLessThan(40 * Math.max(smallBest, 5));
     expect(r.counts.warning).toBe(2_800_001);
     expect(r.findings).toHaveLength(20);
     expect(r.omitted).toBe(2_800_001 - 20);
