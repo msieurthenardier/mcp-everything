@@ -1,31 +1,34 @@
 name: Docker gVisor measurements
 
-# Measurement-only workflow (flight 02, leg 4). It answers, on native Linux,
-# the premises the flight measured only on Docker Desktop. A measured "no"
-# never fails the job; the results go to the run's step summary.
-# Leg 10 (`gvisor-ci`) rewrites this file into the full job.
+# Two jobs (flight 02).
+#   measure (leg 4): answers, on native Linux, the premises the flight measured
+#     only on Docker Desktop. A measured "no" never fails the job; the results
+#     go to the run's step summary. It uses no repository code.
+#   gvisor (leg 12): registers a pinned, checksum-verified gVisor as `runsc`
+#     and runs mcp-everything's Docker suite under it, then the runtime proof
+#     (test/integration/gvisor.test.ts). Advisory, not a required check: the
+#     runner's Docker version floats.
 
 on:
   workflow_dispatch:
   pull_request:
     types: [opened, synchronize, ready_for_review]
     paths:
-      - "src/sandbox/**"
-      - "src/proxy/**"
-      - "src/install/**"
-      - "src/network/**"
-      - "src/config.ts"
-      - "src/server.ts"
-      - "src/registry.ts"
+      - "src/**"
+      - "test/**"
       - "package.json"
-      - "test/integration/**"
+      - "package-lock.json"
+      - ".nvmrc"
+      - "tsconfig*.json"
       - ".github/workflows/docker-gvisor.yml"
 
 permissions:
   contents: read
 
-# No `actions/*` is used: no repository code is needed (plain docker and
-# shell), so there is no checkout and nothing to pin.
+concurrency:
+  group: docker-gvisor-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   measure:
     name: measure
@@ -282,3 +285,202 @@ jobs:
             echo "(expected: nothing listed under either heading)"
             echo '```'
           } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+  gvisor:
+    name: gvisor
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      # The gVisor release and the SHA-512 of its `runsc`, read together from
+      # https://storage.googleapis.com/gvisor/releases/release/<date>/x86_64/runsc.sha512
+      # (the newest date that answered 200 on 2026-11-23). To bump: read both
+      # again the same way and change the pair together. The download is checked
+      # against this pin and against the published file.
+      GVISOR_RELEASE: "20260817"
+      GVISOR_SHA512: 84936438d583ec976800f464e75a83e1515f0890b451b9b4db219c4472b54ca9b106a6772ee683f1e64cce2128871d7637b14d800591f8451b8137f6c39fb2ef
+      # The smoke test's image: `probeImage` in src/config.ts; bump the two together.
+      IMAGE: alpine/git:2.54.1@sha256:29cff25811f790b9f72fc266bf8009a5a911714c0e03c31c47339c50909d9aef
+    # The steps from setup-node on carry `if: hashFiles('src/network/proxy/proxy.cjs') != ''`.
+    # That file exists only from the flight's commit on, so until then the job runs its
+    # setup half only (download, checksum, registration, smoke test).
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker version
+        run: |
+          set -euo pipefail
+          out=$(docker version 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          {
+            echo "## Docker"
+            echo '```'
+            echo "$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download and verify runsc
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/gvisor"
+          mkdir -p "$dir"
+          cd "$dir"
+          base="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64"
+          curl -fsSL --retry 3 -o runsc "$base/runsc"
+          curl -fsSL --retry 3 -o runsc.sha512 "$base/runsc.sha512"
+          # The published checksum must be the pinned one, and the file must match it.
+          want="${GVISOR_SHA512}  runsc"
+          got=$(cat runsc.sha512)
+          if [ "$got" != "$want" ]; then
+            echo "the published runsc.sha512 differs from the pin"
+            echo "pinned:    $want"
+            echo "published: $got"
+            exit 1
+          fi
+          sha512sum -c runsc.sha512
+          echo "runsc ${GVISOR_RELEASE} verified"
+
+      - name: Install runsc and register it with Docker
+        run: |
+          set -euo pipefail
+          sudo install -m 0755 "$RUNNER_TEMP/gvisor/runsc" /usr/local/bin/runsc
+          runsc --version
+          sudo runsc install
+          sudo systemctl restart docker
+          ready=0
+          for _ in $(seq 1 30); do
+            if docker info >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" != 1 ]; then
+            echo "Docker did not come back after the restart"
+            exit 1
+          fi
+          runtimes=$(docker info --format '{{json .Runtimes}}')
+          echo "$runtimes"
+          case "$runtimes" in
+            *'"runsc"'*) ;;
+            *)
+              echo "Docker does not list a runtime called runsc"
+              exit 1
+              ;;
+          esac
+
+      - name: Smoke test, dmesg under runsc
+        run: |
+          set -euo pipefail
+          status=0
+          out=$(docker run --rm --runtime runsc --entrypoint dmesg "$IMAGE" 2>&1) || status=$?
+          echo "$out"
+          if [ "$status" != 0 ]; then
+            echo "dmesg under runsc exited with $status"
+            exit 1
+          fi
+          case "$out" in
+            *[Gg][Vv]isor*) ;;
+            *)
+              echo "dmesg under runsc does not mention gVisor"
+              exit 1
+              ;;
+          esac
+          {
+            echo "## Smoke test"
+            echo '```'
+            sed -n '1,3p' <<<"$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: hashFiles('src/network/proxy/proxy.cjs') != ''
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        if: hashFiles('src/network/proxy/proxy.cjs') != ''
+        run: npm ci
+
+      - name: Build
+        if: hashFiles('src/network/proxy/proxy.cjs') != ''
+        run: npm run build
+
+      # Run A: the whole Docker suite, every container under gVisor. Everything but
+      # the runtime proof, which Run B runs on its own.
+      - name: Run A, the Docker suite under gVisor
+        id: run_a
+        if: hashFiles('src/network/proxy/proxy.cjs') != ''
+        timeout-minutes: 50
+        env:
+          MCPE_DOCKER_TESTS: "1"
+          MCPE_DOCKER_RUNTIME: runsc
+        run: |
+          set -uo pipefail
+          start=$(date +%s)
+          status=0
+          npx vitest run test/integration --exclude test/integration/gvisor.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/run-a.json" || status=$?
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      # Run B: the runtime proof (test/integration/gvisor.test.ts).
+      - name: Run B, the runtime proof
+        id: run_b
+        if: "!cancelled() && hashFiles('src/network/proxy/proxy.cjs') != ''"
+        timeout-minutes: 15
+        env:
+          MCPE_DOCKER_TESTS: "1"
+          MCPE_DOCKER_RUNTIME: runsc
+        run: |
+          set -uo pipefail
+          start=$(date +%s)
+          status=0
+          npx vitest run test/integration/gvisor.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/run-b.json" || status=$?
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Summary
+        if: "always() && hashFiles('src/network/proxy/proxy.cjs') != ''"
+        env:
+          SECONDS_A: ${{ steps.run_a.outputs.seconds }}
+          SECONDS_B: ${{ steps.run_b.outputs.seconds }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const out = [];
+            const read = (name) => {
+              try {
+                return JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/" + name, "utf8"));
+              } catch (e) {
+                return undefined;
+              }
+            };
+            const cases = (r) => (r.testResults || []).flatMap((f) => f.assertionResults || []);
+            for (const [label, file, secs] of [
+              ["Run A (the Docker suite under gVisor)", "run-a.json", process.env.SECONDS_A],
+              ["Run B (the runtime proof)", "run-b.json", process.env.SECONDS_B],
+            ]) {
+              const r = read(file);
+              if (!r) {
+                out.push("### " + label, "", "no report (the run did not finish or did not start)", "");
+                continue;
+              }
+              out.push("### " + label, "", "passed " + r.numPassedTests + ", failed " + r.numFailedTests + ", skipped " + r.numPendingTests + ", " + (secs || "?") + " s", "");
+              const skipped = cases(r).filter((c) => c.status === "skipped" || c.status === "pending");
+              if (skipped.length > 0) {
+                out.push("Skipped:", "");
+                for (const c of skipped) out.push("- " + c.fullName);
+                out.push("");
+              }
+              if (file === "run-a.json") {
+                const local = cases(r).filter((c) => (c.ancestorTitles || []).join(" ").includes("local access"));
+                out.push("Local access through host-gateway (leg 9), the cases of that describe:", "");
+                for (const c of local) out.push("- " + c.status + ": " + c.title);
+                if (local.length === 0) out.push("- (none found in the report)");
+                out.push("");
+              }
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out.join("\n") + "\n");
+          '
