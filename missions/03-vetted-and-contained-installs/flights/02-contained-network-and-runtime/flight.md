@@ -1,6 +1,6 @@
 # Flight: Contained Network and Isolation Runtime
 
-**Status**: landed
+**Status**: completed
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-22.** Decisions taken in that conversation are marked "(operator, 2026-11-22)". Before the questions were asked, the Flight Director ran the trials flight 1's debrief asked for, on the operator's daemon, in throwaway containers and networks that were removed afterwards; their results are under **Trials** and every design decision that rests on one cites it.
