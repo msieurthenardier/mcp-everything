@@ -1,0 +1,284 @@
+name: Docker gVisor measurements
+
+# Measurement-only workflow (flight 02, leg 4). It answers, on native Linux,
+# the premises the flight measured only on Docker Desktop. A measured "no"
+# never fails the job; the results go to the run's step summary.
+# Leg 10 (`gvisor-ci`) rewrites this file into the full job.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    paths:
+      - "src/sandbox/**"
+      - "src/proxy/**"
+      - "src/install/**"
+      - "src/network/**"
+      - "src/config.ts"
+      - "src/server.ts"
+      - "src/registry.ts"
+      - "package.json"
+      - "test/integration/**"
+      - ".github/workflows/docker-gvisor.yml"
+
+permissions:
+  contents: read
+
+# No `actions/*` is used: no repository code is needed (plain docker and
+# shell), so there is no checkout and nothing to pin.
+jobs:
+  measure:
+    name: measure
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUN: ${{ github.run_id }}
+      # The only image used. Source: `probeImage` in src/config.ts; bump the
+      # two together.
+      IMAGE: alpine/git:2.54.1@sha256:29cff25811f790b9f72fc266bf8009a5a911714c0e03c31c47339c50909d9aef
+    steps:
+      - name: Docker
+        run: |
+          set +e
+          {
+            echo "## Docker"
+            echo '```'
+            docker version
+            echo "--- Runtimes:"
+            docker info --format '{{json .Runtimes}}'
+            echo "--- DefaultRuntime:"
+            docker info --format '{{.DefaultRuntime}}'
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: DD3 isolated network
+        run: |
+          set +e
+          P="mcpe-measure-${RUN}-dd3"
+          cleanup() {
+            docker network rm "$P-isolated" "$P-inhibit" >/dev/null 2>&1
+          }
+          trap cleanup EXIT
+          {
+            echo "## DD3: isolated gateway mode"
+            echo '```'
+            echo "### gateway_mode_ipv4=isolated, --internal, --ipv6=false"
+            if out=$(docker network create --internal \
+              -o com.docker.network.bridge.gateway_mode_ipv4=isolated \
+              --ipv6=false "$P-isolated" 2>&1); then
+              echo "create: ok"
+              docker network inspect "$P-isolated" \
+                --format 'Internal={{.Internal}} EnableIPv6={{.EnableIPv6}} IPAM.Config={{json .IPAM.Config}}'
+              if docker network inspect "$P-isolated" --format '{{json .IPAM.Config}}' | grep -q '"Gateway"'; then
+                echo "RESULT: Gateway present = yes"
+              else
+                echo "RESULT: Gateway present = no"
+              fi
+            else
+              echo "create: REFUSED: $out"
+            fi
+            echo
+            echo "### inhibit_ipv4=true, --internal, --ipv6=false"
+            if out=$(docker network create --internal \
+              -o com.docker.network.bridge.inhibit_ipv4=true \
+              --ipv6=false "$P-inhibit" 2>&1); then
+              echo "create: ok"
+              docker network inspect "$P-inhibit" \
+                --format 'Internal={{.Internal}} EnableIPv6={{.EnableIPv6}} IPAM.Config={{json .IPAM.Config}}'
+              if docker network inspect "$P-inhibit" --format '{{json .IPAM.Config}}' | grep -q '"Gateway"'; then
+                echo "RESULT: Gateway present = yes"
+              else
+                echo "RESULT: Gateway present = no"
+              fi
+            else
+              echo "create: REFUSED: $out"
+            fi
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolver
+        run: |
+          set +e
+          P="mcpe-measure-${RUN}-dns"
+          cleanup() {
+            docker rm -f "$P-c" >/dev/null 2>&1
+          }
+          trap cleanup EXIT
+          {
+            echo "## Resolver"
+            echo '```'
+            echo "### runner /etc/resolv.conf"
+            cat /etc/resolv.conf
+            echo "### systemd-resolved active?"
+            if systemctl is-active systemd-resolved 2>&1; then
+              :
+            else
+              echo "(systemd-resolved not active or not present)"
+            fi
+            echo "### container on bridge: /etc/resolv.conf"
+            docker run -d --name "$P-c" --entrypoint sleep "$IMAGE" 120 >/dev/null
+            docker exec "$P-c" cat /etc/resolv.conf
+            echo "### resolve github.com through each nameserver"
+            if docker exec "$P-c" sh -c 'command -v getent >/dev/null'; then
+              echo "(getent present; it uses the container's resolv.conf, so nslookup is used per nameserver)"
+            else
+              echo "(getent missing; nslookup used)"
+            fi
+            for ns in $(docker exec "$P-c" sh -c "awk '/^nameserver/ {print \$2}' /etc/resolv.conf"); do
+              echo "--- nameserver $ns"
+              docker exec "$P-c" nslookup github.com "$ns"
+              echo "RESULT: nslookup via $ns exit=$?"
+            done
+            echo "--- default resolution (getent, else nslookup)"
+            if docker exec "$P-c" sh -c 'command -v getent >/dev/null'; then
+              docker exec "$P-c" getent hosts github.com
+              echo "RESULT: getent exit=$?"
+            else
+              docker exec "$P-c" nslookup github.com
+              echo "RESULT: nslookup exit=$?"
+            fi
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: host-gateway
+        run: |
+          set +e
+          P="mcpe-measure-${RUN}-hg"
+          # The measuring group below runs in a pipeline subshell, so the
+          # listener's pid goes through a file for the trap to read.
+          PIDF="${RUNNER_TEMP:-/tmp}/$P.pid"
+          cleanup() {
+            [ -s "$PIDF" ] && kill "$(cat "$PIDF")" >/dev/null 2>&1
+            docker network rm "$P-internal" >/dev/null 2>&1
+          }
+          trap cleanup EXIT
+          {
+            echo "## host-gateway"
+            echo '```'
+            # Listener on the runner; try three ports.
+            PORT=""
+            for p in 18080 18081 18082; do
+              python3 -m http.server "$p" --bind 0.0.0.0 >/dev/null 2>&1 &
+              LISTENER=$!
+              echo "$LISTENER" > "$PIDF"
+              sleep 2
+              if kill -0 "$LISTENER" 2>/dev/null; then
+                PORT=$p
+                break
+              fi
+              : > "$PIDF"
+            done
+            if [ -z "$PORT" ]; then
+              echo "RESULT: no listener port available; step skipped"
+              echo '```'
+              exit 0
+            fi
+            echo "listener: pid $LISTENER port $PORT"
+
+            D0=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+            if [ -z "$D0" ]; then
+              D0=$(docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')
+              echo "(docker0 address from bridge's gateway)"
+            fi
+            echo "docker0 address: $D0"
+
+            echo "### bridge container with --add-host host.docker.internal:host-gateway"
+            docker run --rm --entrypoint sh --add-host host.docker.internal:host-gateway "$IMAGE" -c "
+              echo '--- /etc/hosts'; cat /etc/hosts
+              echo '--- host.docker.internal'
+              wget -q -T 5 -O /dev/null http://host.docker.internal:$PORT/ && echo 'RESULT: bridge -> host.docker.internal: reachable' || echo 'RESULT: bridge -> host.docker.internal: unreachable'
+              echo '--- docker0 address'
+              wget -q -T 5 -O /dev/null http://$D0:$PORT/ && echo 'RESULT: bridge -> docker0 address: reachable' || echo 'RESULT: bridge -> docker0 address: unreachable'
+            "
+
+            echo "### container on an isolated internal network"
+            docker network create --internal \
+              -o com.docker.network.bridge.gateway_mode_ipv4=isolated \
+              --ipv6=false "$P-internal" 2>&1 || echo "(isolated mode refused; this trial is not valid)"
+            docker run --rm --entrypoint sh --network "$P-internal" \
+              --add-host host.docker.internal:host-gateway "$IMAGE" -c "
+              echo '--- /etc/hosts'; cat /etc/hosts
+              wget -q -T 5 -O /dev/null http://host.docker.internal:$PORT/ && echo 'RESULT: isolated -> host.docker.internal: reachable' || echo 'RESULT: isolated -> host.docker.internal: unreachable'
+              wget -q -T 5 -O /dev/null http://$D0:$PORT/ && echo 'RESULT: isolated -> docker0 address: reachable' || echo 'RESULT: isolated -> docker0 address: unreachable'
+            "
+
+            echo "### does the host-gateway address fall inside bridge's subnet?"
+            docker network inspect bridge --format '{{json .IPAM.Config}}'
+            HG=$(docker run --rm --entrypoint sh --add-host host.docker.internal:host-gateway "$IMAGE" -c "awk '/host.docker.internal/ {print \$1}' /etc/hosts" | head -n1)
+            echo "host-gateway resolves to: $HG"
+            SUBNET=$(docker network inspect bridge --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
+            echo "bridge subnet: $SUBNET"
+            python3 -c "
+          import ipaddress, sys
+          hg, subnet = '$HG', '$SUBNET'
+          try:
+              inside = ipaddress.ip_address(hg) in ipaddress.ip_network(subnet, strict=False)
+              print('RESULT: host-gateway address inside bridge subnet =', 'yes' if inside else 'no')
+          except Exception as e:
+              print('RESULT: could not compare:', e)
+          "
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Two-holder alias
+        run: |
+          set +e
+          P="mcpe-measure-${RUN}-alias"
+          cleanup() {
+            docker rm -f "$P-a" "$P-b" "$P-probe" >/dev/null 2>&1
+            docker network rm "$P-net" >/dev/null 2>&1
+          }
+          trap cleanup EXIT
+          resolve() {
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if docker exec "$P-probe" sh -c 'command -v getent >/dev/null'; then
+                docker exec "$P-probe" getent hosts mcpe-proxy | awk '{print $1}' | head -n1
+              else
+                docker exec "$P-probe" nslookup mcpe-proxy | awk '/^Address/ && !/#/ {print $NF}' | tail -n1
+              fi
+            done | tr '\n' ' '
+            echo
+          }
+          {
+            echo "## Two-holder alias"
+            echo '```'
+            docker network create --internal \
+              -o com.docker.network.bridge.gateway_mode_ipv4=isolated \
+              --ipv6=false "$P-net" 2>&1 || echo "(isolated mode refused; trial continues on whatever was created)"
+            for h in a b; do
+              docker run -d --name "$P-$h" --network "$P-net" --network-alias mcpe-proxy \
+                --entrypoint sleep "$IMAGE" 600 >/dev/null
+              echo "holder $h: $(docker inspect "$P-$h" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')"
+            done
+            docker run -d --name "$P-probe" --network "$P-net" --entrypoint sleep "$IMAGE" 600 >/dev/null
+            if docker exec "$P-probe" sh -c 'command -v getent >/dev/null'; then
+              echo "resolver tool: getent"
+            else
+              echo "resolver tool: nslookup (getent missing)"
+            fi
+            echo "--- ten lookups, both holders up (first answer each time)"
+            resolve
+            echo "--- restarting holder a"
+            docker restart "$P-a" >/dev/null
+            sleep 2
+            echo "holder a now: $(docker inspect "$P-a" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')"
+            echo "--- ten lookups after restart"
+            resolve
+            echo "--- all answers for the alias"
+            docker exec "$P-probe" nslookup mcpe-proxy
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup check
+        run: |
+          set +e
+          {
+            echo "## Cleanup check"
+            echo '```'
+            echo "containers:"
+            docker ps -a --filter "name=mcpe-measure-${RUN}-" --format '{{.Names}}'
+            echo "networks:"
+            docker network ls --filter "name=mcpe-measure-${RUN}-" --format '{{.Name}}'
+            echo "(expected: nothing listed under either heading)"
+            echo '```'
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
