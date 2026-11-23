@@ -1,7 +1,10 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Ecosystem } from "./types.js";
 import { ConfigError } from "./errors.js";
+import { parseScannersFile } from "./scan/scanners-file.js";
+import { LEVELS, type Level, type ScannerSpec } from "./scan/types.js";
 
 export interface Config {
   dataDir: string;
@@ -37,6 +40,15 @@ export interface Config {
   sandboxIdleSec: number;
   maxToolsPerProject: number;
   maxOutputBytes: number;
+  /** Checking a project's own code before it runs. */
+  scan: {
+    mode: "off" | "warn" | "block";
+    /** The configured threshold, whatever the mode. */
+    blockAt: Level;
+    timeoutSec: number;
+    scanners: ScannerSpec[];
+    scannersFile?: string;
+  };
 }
 
 // Docker reads a zero --memory / --cpus as "no limit"; treat it like an unset
@@ -85,7 +97,26 @@ export function parseHosts(spec: string | undefined): Config["hosts"] {
   return hosts;
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+/** Largest scanners file accepted. */
+const MAX_SCANNERS_FILE_BYTES = 1_000_000;
+
+/**
+ * Default reader for the scanners file. It stats first and refuses anything but a regular file of
+ * at most 1 MB, so a FIFO or /dev/zero cannot hang startup.
+ */
+function readScannersFileFromDisk(file: string): string {
+  const st = fs.statSync(file);
+  if (!st.isFile()) throw new ConfigError(`MCPE_SCANNERS=${JSON.stringify(file)} is not a regular file`);
+  if (st.size > MAX_SCANNERS_FILE_BYTES) {
+    throw new ConfigError(`MCPE_SCANNERS=${JSON.stringify(file)} is ${st.size} bytes; at most ${MAX_SCANNERS_FILE_BYTES}`);
+  }
+  return fs.readFileSync(file, "utf8");
+}
+
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  readFile: (path: string) => string = readScannersFileFromDisk,
+): Config {
   const dataHome = env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
   const img = (eco: string, fallback: string) =>
     env[`MCPE_IMAGE_${eco.toUpperCase()}`] || env.MCPE_IMAGE || fallback;
@@ -105,7 +136,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       cpus: limit(env.MCPE_CPUS, "2", false),
       pidsLimit: int(env.MCPE_PIDS_LIMIT, 1024),
       namePrefix: parseNamePrefix(env.MCPE_NAME_PREFIX),
-      probeImage: env.MCPE_PROBE_IMAGE || "alpine/git:latest",
+      // Pinned by the index digest (the multi-arch manifest list), with the tag it was read under.
+      // To bump: `docker buildx imagetools inspect alpine/git:latest` gives the digest and Docker Hub
+      // lists the version tag that `latest` points to; then run the Docker suite and the pressure cases.
+      probeImage: env.MCPE_PROBE_IMAGE || "alpine/git:2.54.1@sha256:29cff25811f790b9f72fc266bf8009a5a911714c0e03c31c47339c50909d9aef",
       images: {
         rust: img("rust", "rust:1"),
         go: img("go", "golang:1"),
@@ -137,7 +171,52 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxIdleSec: nonNegativeInt(env.MCPE_SANDBOX_IDLE_TIMEOUT, 1800),
     maxToolsPerProject: int(env.MCPE_MAX_TOOLS_PER_PROJECT, 40),
     maxOutputBytes: int(env.MCPE_MAX_OUTPUT_BYTES, 100_000),
+    scan: parseScan(env, readFile),
   };
+}
+
+function parseScan(env: NodeJS.ProcessEnv, readFile: (path: string) => string): Config["scan"] {
+  const rawMode = (env.MCPE_SCAN ?? "").trim().toLowerCase();
+  let mode: Config["scan"]["mode"];
+  if (rawMode === "" || rawMode === "off") mode = "off";
+  else if (rawMode === "on" || rawMode === "warn") mode = "warn";
+  else if (rawMode === "block") mode = "block";
+  else throw new ConfigError(`MCPE_SCAN=${JSON.stringify(env.MCPE_SCAN)} is not valid: use off, on, warn or block.`);
+
+  const rawAt = (env.MCPE_SCAN_BLOCK_AT ?? "").trim().toLowerCase();
+  let blockAt: Level = "error";
+  if (rawAt !== "") {
+    if (!(LEVELS as readonly string[]).includes(rawAt)) {
+      throw new ConfigError(`MCPE_SCAN_BLOCK_AT=${JSON.stringify(env.MCPE_SCAN_BLOCK_AT)} is not valid: use error, warning or note.`);
+    }
+    if (mode !== "block") throw new ConfigError("MCPE_SCAN_BLOCK_AT has effect only with MCPE_SCAN=block.");
+    blockAt = rawAt as Level;
+  }
+
+  const rawTimeout = env.MCPE_SCAN_TIMEOUT;
+  let timeoutSec = 900;
+  if (rawTimeout !== undefined && rawTimeout !== "") {
+    const n = /^[0-9]+$/.test(rawTimeout) ? Number(rawTimeout) : NaN;
+    if (!(n >= 60 && n <= 3600)) {
+      throw new ConfigError(`MCPE_SCAN_TIMEOUT=${JSON.stringify(rawTimeout)} is not valid: use whole seconds from 60 to 3600.`);
+    }
+    timeoutSec = n;
+  }
+
+  const file = env.MCPE_SCANNERS;
+  if (file === undefined || file === "") return { mode, blockAt, timeoutSec, scanners: [] };
+  let text: string;
+  try {
+    text = readFile(file);
+  } catch (e) {
+    if (e instanceof ConfigError) throw e;
+    const code = (e as NodeJS.ErrnoException).code;
+    throw new ConfigError(`MCPE_SCANNERS=${JSON.stringify(file)} cannot be read${code ? ` (${code})` : ""}.`);
+  }
+  if (text.length > MAX_SCANNERS_FILE_BYTES) {
+    throw new ConfigError(`MCPE_SCANNERS=${JSON.stringify(file)} is larger than ${MAX_SCANNERS_FILE_BYTES} bytes.`);
+  }
+  return { mode, blockAt, timeoutSec, scanners: parseScannersFile(text, file), scannersFile: file };
 }
 
 /** Unset or empty gives the default; a set value that is not a valid name prefix is an error, not a silent fallback. */
