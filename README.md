@@ -68,15 +68,16 @@ claude mcp add mcp-everything -- node "$PWD/dist/index.js"
 | Tool | What it does |
 | --- | --- |
 | `search_projects` | Search GitHub and GitLab; returns ids, stars, language, license. |
-| `install_project` | Clone, build and generate tools for a repository. When scanning is on (see [Checking projects before they run](#checking-projects-before-they-run)), the repository is checked first, and the install can be blocked or can go ahead with the findings reported. |
+| `install_project` | Clone, build and generate tools for a repository. When scanning is on (see [Checking projects before they run](#checking-projects-before-they-run)), the repository is checked first, and the install can be blocked or can go ahead with the findings reported. Its `hosts` parameter (up to 64 entries) adds hosts the project may reach under network containment; see [Network containment](#network-containment). |
 | `check_project` | Clone and check a repository without installing it: the built-in check and the operator's scanners, whatever the scanning setting. Reports what an install would do now. Nothing from the repository is built or run. |
-| `list_projects` / `project_info` | What is installed, its status, warnings, and its published tools. `list_projects` states this installation's id; `project_info` also says whose its sandbox container is, according to Docker. |
+| `list_projects` / `project_info` | What is installed, its status, warnings, and its published tools. `list_projects` states this installation's id; `project_info` also says whose its sandbox container is, according to Docker, and the sandbox's network as Docker shows it (`off`, `contained`, `open` or `unknown`); for a contained one it adds the hosts it may reach and the proxy's latest refusals. |
 | `find_project_tools` | Search every generated tool, published or not, by keyword. |
 | `select_project_tools` | Choose which of a project's tools are published in the tool list. |
 | `call_project_tool` | Call a generated tool by name, for clients that do not refresh their tool list. |
 | `sandbox_exec` | Run a shell command in a project's sandbox. |
 | `sandbox_read_file` / `sandbox_write_file` | Move text in and out of a sandbox. |
-| `set_project_network` | Turn a sandbox's outbound network on or off. |
+| `set_project_network` | Turn a sandbox's outbound network on or off. Under `MCPE_NETWORK=contained`, on means contained: only the project's registries and hosts. |
+| `set_project_hosts` | Add or remove hosts a project may reach under network containment (`add`, `remove`), without a reinstall. Without containment the hosts are recorded and have no effect. It cannot add local addresses. |
 | `discover_tools` | Regenerate tools, optionally for executables you built by hand. |
 | `connect_mcp_server` / `disconnect_mcp_server` | Proxy an MCP server that runs inside a project's sandbox. |
 | `refresh_mcp` | Stop a project's MCP servers and run discovery again, e.g. after giving a server its environment variables. Reports what started and what did not. |
@@ -444,8 +445,11 @@ or times out never blocks an install.
   `entrypoint` (optional) replaces the image's entrypoint: a string of at
   most 256 characters, and `""` clears it so `command` is the whole command
   line. `network` defaults to `false`; `timeout_seconds` to 300 (10 to 1800);
-  `env` to none. At most 16 scanners. Any other key is refused at startup (`stage`
-  is accepted with the value `"source"` and has no effect today).
+  `env` to none. `hosts` (1 to 64 strings) names what a scanner with `network:
+  true` may reach under `MCPE_NETWORK=contained`; see
+  [Scanners' hosts](#scanners-hosts). At most 16 scanners. Any other key is
+  refused at startup (`stage` is accepted with the value `"source"` and has no
+  effect today).
 - **Pin the image by digest**, as the example does, and bump the digest
   yourself when you choose a newer version: a tag can be moved. mcp-everything
   pins the images it chooses itself (`MCPE_PROBE_IMAGE`) the same way.
@@ -485,7 +489,8 @@ or times out never blocks an install.
   change what is built. Its network is **off** unless `network` is `true`.
   Vulnerability scanners usually download a database, so they need it, and a
   scanner with its network on can reach the internet and your local network
-  (see below). Each scanner runs in its own container with a sandbox's
+  (see below), unless you turn on `MCPE_NETWORK=contained`, which narrows it to
+  the scanner's own `hosts` (see [Scanners' hosts](#scanners-hosts)). Each scanner runs in its own container with a sandbox's
   memory, CPU and process limits, all capabilities dropped, `no-new-privileges`
   and `MCPE_DOCKER_RUNTIME` when set, and the container is
   removed afterwards.
@@ -607,10 +612,13 @@ inside one of them is not seen. Submodules are cloned and checked only when
 - **Evasion.** Scanners and the built-in check find known patterns and known
   advisories; an author who knows them can write around them.
 - **Dependencies' build code**, which this version does not list (above).
-- **The network is not contained.** This version does not restrict where a
-  build, a sandbox with its network on, the clone, or a scanner with
-  `network: true` can connect: the internet, services on your host and your
-  local network are reachable from each.
+- **The network is contained only if you turn it on.** With `MCPE_NETWORK=open`
+  (the default) nothing restricts where a build, a sandbox with its network on,
+  the clone, or a scanner with `network: true` can connect: the internet,
+  services on your host and your local network are reachable from each. With
+  `MCPE_NETWORK=contained` they reach only the hosts described in
+  [Network containment](#network-containment), which also lists
+  [what containment does not stop](#what-containment-does-not-stop).
 - **Discovery runs the built programs.** After the build, mcp-everything runs
   the project's executables with `--help` (and their subcommands) to generate
   tools; the check covers what the build runs, not that.
@@ -621,8 +629,318 @@ inside one of them is not seen. Submodules are cloned and checked only when
   files, and a credential you give it is available to it.
 
 Stronger isolation of the containers (including the clone and the scanners) is
-available by setting `MCPE_DOCKER_RUNTIME` (for example `runsc`); the server's
-instructions name the runtime in use, or say that Docker's default is.
+available by setting `MCPE_DOCKER_RUNTIME` (for example `runsc`), which also
+requires it (see [The isolation runtime](#the-isolation-runtime)); the server's
+instructions name the runtime, or say that Docker's default is in use.
+
+## Network containment
+
+Containment is **off by default**. With `MCPE_NETWORK=open` (or nothing set)
+networks behave as they always have, and the server's instructions tell the agent
+that sandbox networks are not contained and that the operator turns containment
+on with `MCPE_NETWORK=contained`. With it on, the instructions say what is
+contained and how it is changed. The agent cannot turn containment on or off.
+
+What it does not mean: a hostile agent is still out of scope (`sandbox_exec`
+runs anything inside a sandbox; containment bounds where that code can connect),
+and image pulls stay outside it. See [What containment does not stop](#what-containment-does-not-stop).
+
+### Turning it on
+
+Set `MCPE_NETWORK=contained` in the environment of the mcp-everything process.
+It is read once, at startup, so a change needs a reconnect, and an invalid value
+is refused at startup.
+
+- **Docker must be able to make a network with no gateway.** mcp-everything
+  creates each network `--internal` with
+  `com.docker.network.bridge.gateway_mode_ipv4=isolated` and IPv6 off, then
+  inspects what Docker made and refuses to use it unless it is internal, has no
+  IPv6, has exactly one IPv4 subnet and no gateway. A Docker that ignores the
+  option is caught by that check, not by a version number. When the check fails,
+  installs, checks that clone, and turning a sandbox's network on refuse with a
+  message that names what Docker must support; mcp-everything never falls back
+  to Docker's default bridge. Projects whose network is off are unaffected.
+- **Tested Docker versions.** Docker 29.4.2 (Linux, on a GitHub-hosted runner)
+  and 29.8.2 (Docker Desktop) were tested. The minimum version is not
+  established.
+- **The proxy image.** The proxies run in `MCPE_PROXY_IMAGE` (a digest-pinned
+  `node:22-alpine` by default), which the Docker daemon pulls like any image.
+
+### How it works
+
+- **Every network is its own.** Each project gets a Docker network of its own
+  (named after its sandbox, with `-net`), and each networked clone or scanner
+  gets one for the length of its run. These networks have no gateway and no
+  route anywhere, and Docker's embedded DNS answers nothing for outside names.
+  A contained sandbox is on its own network and no other, so two contained
+  projects cannot reach each other. A sandbox whose network is off is on no
+  network at all, as before.
+- **The proxy is the only way out.** For each project (and for each networked
+  clone or scanner) a proxy container sits on that network and on Docker's
+  default bridge. It is a small program of mcp-everything's own, run with
+  `node -e` in `MCPE_PROXY_IMAGE`: read-only, all capabilities dropped, a
+  non-root user, nothing published, and under `MCPE_DOCKER_RUNTIME` when one is
+  named. It listens only on its address on the project's network, so containers
+  on the bridge cannot use it. The sandbox reaches it by the name `mcpe-proxy`
+  (port 3128).
+- **What the sandbox's commands get.** Every command mcp-everything starts in a
+  contained sandbox gets `HTTP_PROXY`, `HTTPS_PROXY` (and the lower-case
+  forms), `NO_PROXY` empty, and `NODE_USE_ENV_PROXY=1` (Node's `fetch` ignores
+  the variables otherwise). They are given per command, not at creation, so an
+  existing sandbox can be contained without a reinstall. In the npm build
+  sandbox that was measured (Node 26.13.1, npm 11.20.0), `fetch` used the proxy
+  and npm installed through it; with `NODE_USE_ENV_PROXY` unset, `fetch` failed
+  closed. Which other clients (pip, cargo, gem, apt) honor the variables was
+  not measured. A process the project
+  starts itself with the variables unset, and a client that ignores them, has
+  no route.
+- **The proxy decides by address, not by name.** It resolves every name itself,
+  through the upstream resolvers it reads from a throwaway container on the
+  bridge (never Docker's embedded DNS, which answers a network alias with the
+  proxy itself), refuses the host's, local and link-local addresses whatever a
+  name resolves to, and connects to exactly the address it checked. If a name
+  resolves to both a public and a refused address, the refused one is dropped
+  and the public one used; if it resolves only to refused addresses, the
+  request is refused.
+  - Refused: IPv4 `0/8`, `10/8`, `100.64/10`, `127/8`, `169.254/16`,
+    `172.16/12`, `192.0.0/24`, `192.168/16`, `198.18/15`, multicast and
+    reserved ranges, `255.255.255.255`, and the networks the proxy itself is
+    on. IPv6 is an allowlist: only addresses in `2000::/3` pass, so
+    loopback, unique-local, link-local and the rest are refused. IPv4-mapped,
+    NAT64, 6to4 and Teredo addresses are judged by the IPv4 address inside them.
+  - An IP literal in a request is refused unless it is itself an allowed entry
+    (only a scanner's `hosts` can hold one). Hosts are otherwise matched by name.
+  - **Plain HTTP is `GET` and `HEAD` only**, as an absolute URI to an allowed
+    host. Every other method is refused. HTTPS goes through `CONNECT`.
+  - Ports: 443 and 80, unless an entry names one (`example.com:8443`), in which
+    case only that port.
+- **Hosts are matched** by exact name, or `*.example.com` for names under it
+  (not `example.com` itself), case-insensitively.
+- **The proxy keeps at most 50 refusals** (host, port, reason). They are read
+  with `docker exec` only when something failed, and they go when the proxy is
+  replaced, including by the `set_project_hosts` that fixes them.
+- **A change replaces the proxy.** A project's hosts, its stage (build or after
+  install), the operator's local access and the resolvers decide its proxy's
+  configuration, which is fixed when it is created. A change builds a new proxy
+  beside the old one, and removes the old one only when the new one answers; a
+  proxy that does not start is reported as that and the old one stays.
+
+### What each stage reaches
+
+| Stage | Reaches |
+| --- | --- |
+| The clone (`install_project`, `check_project`) | Only the repository's forge: `github.com`, `gitlab.com`, or a host named in `MCPE_EXTRA_HOSTS`. Submodules on another forge are refused. |
+| The build | The default hosts of its build system and of every build ([below](#the-default-hosts)), plus the project's `hosts`. |
+| A sandbox with its network on | The default hosts of its build system (not Debian's servers, not GitHub), plus the project's `hosts`; and local addresses only as the operator allows ([Local access](#local-access-mcpe_local_access)). |
+| A sandbox with its network off | Nothing. It is on no network. |
+| A scanner with `network: true` | Only its own `hosts` ([Scanners' hosts](#scanners-hosts)). A scanner without a network has none. |
+
+A sandbox with its network on reaches its package registries so that turning
+the network on and rerunning an install step by hand works. A running server can
+therefore reach a registry, which is a way out as well as in.
+
+### The default hosts
+
+GitHub is in the default hosts of every build: git dependencies and prebuilt
+binaries are common. Anyone can host anything there, as on the package registries.
+
+| Build system | Hosts |
+| --- | --- |
+| Every build | `deb.debian.org`, `security.debian.org`, `github.com`, `codeload.github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com` |
+| `python` | `pypi.org`, `files.pythonhosted.org` |
+| `node` | `registry.npmjs.org`, `nodejs.org`, `repo.yarnpkg.com`, `registry.yarnpkg.com` |
+| `rust` | `crates.io`, `index.crates.io`, `static.crates.io`, `static.rust-lang.org` |
+| `go` | `proxy.golang.org`, `sum.golang.org` |
+| `ruby` | `rubygems.org`, `index.rubygems.org` |
+| `cmake`, `autotools`, `make`, `generic` | none beyond every build's |
+
+This is a starting table. **Only Go (`tomnomnom/gron`) and npm (`piuccio/cowsay`)
+were measured under containment**: both installed with no refused host. The
+Debian rows (the recipes' `apt-get`), Python, Rust, Ruby, CMake and autotools,
+and `pnpm` and `yarn` were not measured; a project that needs more fails with
+the host named (below) and can be given it with `hosts`.
+
+### A project's hosts
+
+- `install_project` takes `hosts`, and `set_project_hosts` adds and removes
+  them without a reinstall (the project's proxy is replaced, and its proxied MCP
+  servers are closed so their next start has the new environment). A reinstall
+  adds the new `hosts` to those the project has; removing goes through
+  `set_project_hosts`. `project_info` shows the hosts a contained project may
+  reach and the ones recorded for it.
+- An entry is `host` or `host:port`, or `*.example.com`; up to 64 per list. The
+  agent's entries are refused when they are: a bare `*`; a wildcard on a public
+  suffix (`*.com`, `*.co.uk`; this is a heuristic list of two-label suffixes, not
+  the public suffix list); an IP address in any form (including shorthand like
+  `127.1`); a local name (ending in `localhost`, `local`, `internal`, `lan`,
+  `home`, `arpa` or `localdomain`); or anything that is not a host name. The
+  refusal names the step that failed.
+- The defaults cannot be removed per project: `set_project_hosts` says so.
+- Under `MCPE_NETWORK=open` the hosts are recorded and have no effect, and the
+  tools say so.
+- Entries are checked again when a proxy is built: one that fails (for example
+  from a hand-edited registry) is dropped with a warning.
+
+### Local access (`MCPE_LOCAL_ACCESS`)
+
+Only the operator can let a sandbox reach a local service; the agent cannot, and
+`set_project_hosts` refuses local addresses.
+
+```sh
+MCPE_LOCAL_ACCESS="acme/postgres-mcp=host.docker.internal:5432;acme/redis-mcp=db.lan:6379,db.lan:6380"
+```
+
+- **Syntax**: `<repository>=<host name>:<port>[,<host name>:<port>...]`, entries
+  separated by `;`. A malformed value, a repository named twice, two targets on
+  one port for one repository, a target on port 3128 (the proxy's own), and an
+  IP literal are startup errors, in either mode.
+- **Keyed by repository**, in any form `install_project` accepts (`owner/name`,
+  `gitlab:group/name`, a URL, or a forge from `MCPE_EXTRA_HOSTS`), compared
+  case-insensitively, never by slug: two repositories can share a slug.
+- **Names only, not IP addresses.** A contained sandbox has no route to any
+  address; it reaches a local service only through a name that resolves to its
+  proxy.
+- **How it works.** For each target the project's proxy listens on that port and
+  forwards raw TCP, and joins the project's network with the target's name as an
+  alias, so the sandbox connects to `host.docker.internal:5432` and reaches the
+  proxy. Nothing in the sandbox is changed. The exemption from the refused
+  addresses applies only to connections arriving on that port, to the addresses
+  that name resolves to: a `CONNECT host.docker.internal:5432` through the HTTP
+  side is still refused. The proxy carries the forwards for as long as the
+  project has a proxy, including during its build.
+- **`host.docker.internal`** is resolved from the proxy's own `/etc/hosts`
+  (it is created with `--add-host host.docker.internal:host-gateway`); every
+  other name goes through the upstream resolvers, once per connection.
+  - On Docker Desktop, a container with that setting got `192.168.65.254` and
+    an IPv6 address, and a published port of a container on your machine was
+    reached; a sandbox allowed to reach it did, another repository's did not.
+  - On native Linux, `host-gateway` was `172.17.0.1`, inside the bridge's own
+    range, and a container on the bridge reached a host service listening on all
+    addresses. A service bound only to `127.0.0.1` is not expected to be
+    reachable that way (not measured). A full local-access forward has not been
+    run on native Linux.
+  - Names that only your host's split-DNS knows may not resolve for the proxy:
+    on a Linux host with systemd-resolved, Docker gives containers the uplink's
+    resolvers and not the stub.
+- **A change needs a reconnect** (the variable is read at startup). The startup
+  pass then rebuilds the proxy of an online, contained project with the new
+  targets; for a project whose network is off they apply when it is turned on.
+- A forge named in `MCPE_EXTRA_HOSTS` may resolve to local addresses for the
+  clone of its repositories: you already vouched for it. A repository on one
+  whose name your Docker's resolvers cannot resolve fails to clone with
+  `resolve-failed`.
+
+### Scanners' hosts
+
+In the scanners file, a scanner with `network: true` takes a `hosts` list, in
+the same entry form as above except that it may hold IP literals and local names
+(only the operator writes the file). Under `MCPE_NETWORK=contained` it reaches
+only those hosts, through a one-shot proxy that lives as long as the scanner
+runs, and local addresses are allowed for them. **A scanner with `network: true`
+and no `hosts` is refused at startup** under containment, naming the scanner.
+Under `open`, `hosts` has no effect. The Trivy example above has no `hosts`: the
+hosts a real Trivy run needs were not measured here, so find them from the
+scanner's documentation, add them, and test.
+
+### What reaches outside services
+
+With scanning on, these reach outside services (and without containment, any
+host): the clone container (the repository's forge); a scanner with `network:
+true`; and the Docker daemon, which pulls the clone, sandbox, scanner and proxy
+images from whatever registries the image names. Under containment the clone
+reaches only the forge and a scanner only its `hosts`; the daemon's pulls are
+not narrowed. A credential given to a scanner through `env` can be sent by
+that scanner to any host it is allowed.
+
+### When something is refused
+
+- A failed install ends with what the build's proxy refused (at most 10 lines),
+  and a build that finishes after a refusal carries a warning for each host
+  refused as not allowed (at most five).
+  A failed tool call (including `sandbox_exec` and a proxied MCP server's) in a
+  contained sandbox with its network on adds the proxy's latest refusals, at
+  most 3, marked as possibly including earlier calls. `project_info` shows them
+  or says "no refusals recorded since the proxy started". A proxy that did not
+  start is reported as that ("the network proxy did not start: ..."), never as a
+  refusal.
+- **The hints are advisory, on purpose.** The host a build asked for was chosen
+  by the project's own code, and a hostile project can ask for a host whose name
+  reads as an instruction. So a refused host is reported as `` `host:443` was
+  refused `` followed by a caution (allow it only if you expect the project to need
+  it), never as a ready-made `hosts` call, and host names are cut to name
+  characters and shown in backticks. A clone's refusal says that submodules on
+  other forges are not reachable, and a scanner's that only the operator can
+  allow a host for it: the agent cannot. A refused local address says that
+  only the operator can allow it (`MCPE_LOCAL_ACCESS`).
+- A build refused its package registry fails only when the install times out,
+  because npm retries without pause: in the one measurement, 3,155,582 refused
+  connections in about 11 minutes, and a failure after 648 seconds at a
+  600-second limit, with the correct host named.
+
+### Upgrading, and switching from open to contained
+
+- Nothing is reinstalled for projects mcp-everything has a record for. At the
+  next start with `MCPE_NETWORK=contained`, a background pass looks at every
+  sandbox of this installation by Docker's view together with its record. A
+  sandbox whose record says the network is on and that is on the bridge or on no
+  network gets its network and proxy and leaves the bridge (a stopped one stays
+  stopped); one with its own network is repaired if need be. A sandbox whose
+  record says off but that is on a network is taken off every network (with a
+  warning on the project when it was on the bridge or a network mcp-everything
+  does not manage). One whose record says on and that is on a network
+  mcp-everything does not manage is not contained: commands in it are refused
+  with that reason. A young install of another session is skipped.
+- **Nothing runs uncontained meanwhile**: a command in a sandbox waits for the
+  pass's step for that sandbox, and a failed step refuses the command with the
+  reason. The pass is bounded at five minutes; steps it did not reach are
+  refused. If Docker cannot list the sandboxes at all, commands are refused
+  unless the sandbox is on no network or is already contained.
+- **A session never loosens another's containment.** A session with
+  `MCPE_NETWORK=open` leaves a contained sandbox contained, and
+  `set_project_network` there leaves it so. It gives commands the proxy variables
+  but does not repair the proxy.
+- **Sessions with different settings.** Sessions of one installation may have
+  different `MCPE_LOCAL_ACCESS`, `MCPE_EXTRA_HOSTS` or resolvers. The last to
+  start or change a project decides its local-access and resolver
+  configuration; on use, a session compares only what the record decides, so
+  they do not replace each other's proxies. `project_info` says when the proxy
+  carries a configuration other than this session's.
+- **Not contained by the pass** (see below): a sandbox from before ownership
+  labels, and a labelled sandbox with no record. A sandbox created before
+  `MCPE_DOCKER_RUNTIME` was named must be reinstalled
+  ([The isolation runtime](#the-isolation-runtime)).
+
+### What containment does not stop
+
+- **An allowed host is a way out as well as in.** A build can fetch from GitHub
+  releases or a registry and a running server can reach its registry; a project
+  can send data to any host it is allowed, and GitHub is in every build's list.
+- **DNS under a wildcard.** A wildcard entry lets the sandbox cause lookups of
+  arbitrary labels under it.
+- **The Docker host's own public addresses and published ports** are reachable
+  as ordinary internet addresses. The proxy is on the bridge, so its table of
+  refused addresses is the whole boundary.
+- **Azure's `168.63.129.16`** looks public and is not covered by the table.
+- **IPv6 forms that are not decoded**: ISATAP addresses in a public prefix and
+  non-standard NAT64 prefixes, reachable only where such a translator is on the
+  path.
+- **Image pulls** are done by the Docker daemon, outside every container.
+- **Clients that do not use the proxy fail closed, with unhelpful messages.** A
+  process started without the proxy variables, and a client that resolves
+  names itself (busybox `wget`: `bad address`), gets no route.
+- **The window during a replacement.** While a new proxy and the old one both
+  exist, both answer; a host that was removed, or a stage's wider list, may
+  still be allowed until the old proxy is removed. The two share one name, and
+  in the measurements the answers alternated between them.
+- **Sandboxes from before ownership labels, and labelled sandboxes with no
+  record, stay uncontained** under `contained`: the pass does not list the first
+  and leaves the second as it is. A project of the first kind needs a
+  reinstall to be contained.
+- **Leftover proxies** of stopped sandboxes, and of an uninstall that crashed,
+  are not removed yet (squawk 0052). A proxy keeps running when its sandbox's
+  idle timeout stops the sandbox. A leftover proxy listens only on its own
+  network, so the cost is memory and clutter, not a way in.
+- **A refused package registry** makes a build fail only at its timeout (above).
 
 ## Security model
 
@@ -650,24 +968,29 @@ What the sandbox does:
   `SETUID`, `SETGID`); `no-new-privileges` is set; memory, CPU and process
   counts are limited.
 - Outbound network is removed after the build, and stays off until
-  `set_project_network` turns it on.
+  `set_project_network` (or `network: true` on the install) turns it on. Off
+  means the sandbox is on no Docker network at all, in either mode.
 - Commands are passed as argument vectors, never assembled into shell
   strings, and are killed inside the container when they time out.
 - Only `https` clone URLs on allow-listed hosts are accepted.
 
 What it does not do:
 
-- **The build has network access**, on Docker's default bridge. Code running
-  then (and whenever you enable the network) can reach the internet and
-  services on your host and local network. So can the clone container and any
-  scanner configured with `network: true`. Scanning does not change this; see
-  [What none of this protects against](#what-none-of-this-protects-against).
+- **The network is contained only when you turn containment on.** With
+  `MCPE_NETWORK=open` (the default) the build has network access on Docker's
+  default bridge: code running then (and whenever you enable the network) can
+  reach the internet and services on your host and local network, and so can
+  the clone container and any scanner configured with `network: true`.
+  Scanning does not change this. With `MCPE_NETWORK=contained` each of those
+  reaches only what [Network containment](#network-containment) says, and that
+  section lists [what containment does not stop](#what-containment-does-not-stop).
 - **Container isolation is not a security boundary against a determined
   attacker.** A kernel or runtime escape reaches your host. For stronger
   isolation set `MCPE_DOCKER_RUNTIME=runsc` (gVisor) or run the Docker daemon
-  in a VM. The runtime applies to the clone, scanner and copy containers as
-  well as the sandboxes, and the server's instructions tell the agent which
-  runtime is in use (or that it is Docker's default).
+  in a VM. The runtime applies to the clone, scanner and copy containers and
+  the network proxies as well as the sandboxes, naming it requires it, and the
+  server's instructions tell the agent which runtime is named (or that Docker's
+  default is in use); see [The isolation runtime](#the-isolation-runtime).
 - **Disk usage is not limited.** A build can fill the Docker data directory.
 - **Tool output and tool descriptions come from the project.** Descriptions
   are length-capped, flattened to one line and prefixed with
@@ -728,6 +1051,47 @@ What it does not do:
 - **License is reported, not enforced.** The license found in the repository
   is shown at install time with a warning when none is found; the server does
   not verify that a repository is open source.
+
+### The isolation runtime
+
+`MCPE_DOCKER_RUNTIME` names the container runtime for everything mcp-everything
+runs in a container: the clone, the scanners, the copy, the sandboxes and the
+network proxies. **Naming a runtime requires it.** There is no separate switch,
+because Docker refuses an unregistered runtime and does not fall back.
+
+- Before an install, a check, or any other container starts, mcp-everything
+  asks Docker whether it lists the runtime (`docker info`) and runs a trial
+  container under it: the command `true`, from the clone image
+  (`MCPE_PROBE_IMAGE`), with no network, within 60 seconds. If either fails,
+  the call is refused before anything is created, with: `MCPE_DOCKER_RUNTIME
+  names <runtime>, but Docker cannot run containers with it (<Docker's first
+  line>); install it and register it with Docker, or unset
+  MCPE_DOCKER_RUNTIME.` A success is remembered for the life of the process; a
+  failure is not, and is asked again at the next call.
+- **Name it as `docker info` lists it.** The comparison is exact. Naming
+  `io.containerd.runc.v2` is refused for sandboxes that Docker reports as
+  `runc`, and the refusal says so.
+- **The clone image must contain `true`.** The default one does (BusyBox
+  provides it). An `MCPE_PROBE_IMAGE` without it fails the trial with Docker's
+  "executable file not found".
+- **Sandboxes created under another runtime are refused.** Docker cannot change
+  a container's runtime. Once a runtime is named, executing in or starting a
+  sandbox whose runtime differs is refused with `Sandbox <name> was created
+  before MCPE_DOCKER_RUNTIME=<runtime> was set; Docker reports its runtime as
+  <other>. Reinstall the project to run it under <runtime>.` Nothing is
+  started. `set_project_network` with `enabled: false` still works on such a
+  sandbox.
+- **At startup** the runtime is checked in the background and one line is
+  logged ("Docker runs it", or why not). It does not fail the start, because
+  Docker may not be up yet. The server's instructions say which runtime is named
+  and that it is required, or that Docker's default is in use.
+- **What is tested.** The check, its caching, the refusal messages and the
+  comparison with an existing sandbox's runtime are tested against a test
+  double of Docker. No runtime other than Docker's default has been run by this
+  project's tests so far; in particular, a build that a stronger runtime
+  refuses (a syscall it does not support) would show up only when you run it.
+  Behavior under gVisor (`runsc`) is not yet tested in CI.
+  <!-- LEG 12 (gvisor-ci): replace the sentence above once docker-gvisor.yml has passed with: "Behavior under gVisor is tested in CI on Linux (docker-gvisor.yml)." and say what that run covers; until then it stays as it is. -->
 
 ## Several installations on one Docker daemon
 
@@ -922,7 +1286,10 @@ Environment variables, all optional:
 | `MCPE_DATA_DIR` | `$XDG_DATA_HOME/mcp-everything`, else `~/.local/share/mcp-everything` | Where the project registry and the `installation-id` file are stored. The default follows `XDG_DATA_HOME` when it is set. Copying the directory copies the id, and two installations with one id cannot be told apart; see [Several installations on one Docker daemon](#several-installations-on-one-docker-daemon). A registry written by a newer version of mcp-everything is refused and left untouched; upgrade, or move `registry.json` aside to start with an empty registry (the sandboxes of the projects in it stay in Docker). |
 | `MCPE_DOCKER_BIN` | `docker` | The Docker client command, run on the host. |
 | `MCPE_MEMORY` / `MCPE_CPUS` / `MCPE_PIDS_LIMIT` | `4g` / `2` / `1024` | Per-sandbox limits; a zero memory or CPU value (which Docker reads as unlimited) falls back to the default. |
-| `MCPE_DOCKER_RUNTIME` | Docker's default | Container runtime, e.g. `runsc`. |
+| `MCPE_DOCKER_RUNTIME` | Docker's default | Container runtime, e.g. `runsc`. Naming one requires it: installs and checks refuse to start when Docker cannot run it. See [The isolation runtime](#the-isolation-runtime). |
+| `MCPE_NETWORK` | `open` | `open` (networks as they always were) or `contained` (every network mcp-everything uses has no route out except through a proxy that allows named hosts). Anything else is refused at startup. See [Network containment](#network-containment). |
+| `MCPE_LOCAL_ACCESS` | none | Local services a repository's sandbox may reach under `MCPE_NETWORK=contained`, as `<repository>=<host name>:<port>[,<host name>:<port>][;<repository>=...]`. Only the operator can set it. See [Local access](#local-access-mcpe_local_access). |
+| `MCPE_PROXY_IMAGE` | `node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a` | Image the network proxies run in (needs `node`). The default is pinned by digest; pin your own the same way. |
 | `MCPE_PROBE_IMAGE` | `alpine/git:2.54.1@sha256:29cff25811f790b9f72fc266bf8009a5a911714c0e03c31c47339c50909d9aef` | Image of the throwaway container that clones a repository, lists its manifests and build files before the build, and (with scanning on) copies the checked clone (needs `sh`, `git` and `cp`). The default is pinned by digest; pin your own the same way. |
 | `MCPE_SCAN` | `off` | Check repositories before they build: `off`, `on` or `warn` (report, always build), or `block`. See [Checking projects before they run](#checking-projects-before-they-run). |
 | `MCPE_SCAN_BLOCK_AT` | `error` | With `MCPE_SCAN=block` only: the lowest level that blocks an install, `error`, `warning` or `note`. |
@@ -998,6 +1365,16 @@ Environment variables, all optional:
     same timeout and latency as above. It logs one line to the container's
     stderr the first time this happens.
   - Idle stopping has not been verified under gVisor (`runsc`).
+  - Under `MCPE_NETWORK=contained`, the project's proxy is not stopped with
+    its sandbox; see [What containment does not stop](#what-containment-does-not-stop).
+- Under `MCPE_NETWORK=contained`, every project network and every networked
+  clone or scanner takes an address range from Docker's own pools, and a stopped
+  sandbox's network keeps its range. When Docker has none left, the error names
+  `default-address-pools` in the daemon's configuration; turning a project's
+  network off releases its range. The pools can overlap your local network;
+  they are Docker's, and mcp-everything does not choose ranges.
+- The default hosts of build systems other than Go and npm have not been
+  measured under containment; see [The default hosts](#the-default-hosts).
 
 ## Development
 

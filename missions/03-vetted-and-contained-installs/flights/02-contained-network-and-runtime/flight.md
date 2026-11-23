@@ -1,6 +1,6 @@
 # Flight: Contained Network and Isolation Runtime
 
-**Status**: ready
+**Status**: in-flight
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-22.** Decisions taken in that conversation are marked "(operator, 2026-11-22)". Before the questions were asked, the Flight Director ran the trials flight 1's debrief asked for, on the operator's daemon, in throwaway containers and networks that were removed afterwards; their results are under **Trials** and every design decision that rests on one cites it.
@@ -113,6 +113,7 @@ The trials used throwaway objects named `mcpe-plan-<n>`, all of them removed. Th
 - Trade-off: no per-project switch; a project that must be open needs an installation with `MCPE_NETWORK=open`.
 
 **DD2 — One proxy per project** (operator, 2026-11-22).
+> *In flight, 2026-11-23: the startup pass's housekeeping named below (stopping proxies of stopped sandboxes) moved out to squawk 0052 at leg 10's design review; see the flight log.*
 - **A project with its network on, under containment.**
   - Its sandbox is on a network of its own (`<sandbox name>-net`) and on no other.
   - A proxy container (`<sandbox name>-proxy`) is on that network and on `bridge`, and is the sandbox's only way out (T1, T4).
@@ -284,6 +285,7 @@ The trials used throwaway objects named `mcpe-plan-<n>`, all of them removed. Th
 - `describe()` and `project_info` show Docker's view of the network (off / contained / open), not the record's boolean. They differ, for instance, mid-install, when the record says off while the build runs contained.
 
 **DD8 — Existing sandboxes: contained at startup; never loosened** (operator, 2026-11-22).
+> *In flight, 2026-11-23: the table below was refined into leg 10's binding `startupAction` table; orphan removal, stopped-sandbox proxies and lock-file cleanup moved out to squawk 0052. Two standing gaps are recorded: sandboxes from before ownership labels, and labelled sandboxes with no record, stay uncontained (README).*
 - **At startup with `MCPE_NETWORK=contained`**, beside the reconciliation, a pass looks at every sandbox of this installation. It goes by **Docker's view** together with the record, never by the record alone:
 
   | Record | Docker: sandbox's networks | Proxy | Action |
@@ -546,16 +548,18 @@ Legs are cut by kind of risk (flight 1 debrief):
 
 > **Note:** These are tentative suggestions, not commitments. Legs are planned and created one at a time as the flight progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] `network-config` - `MCPE_NETWORK`, `MCPE_LOCAL_ACCESS`, scanner `hosts`, the host grammar, the default host table; no Docker
-- [ ] `runtime-required` - The named runtime checked (listed and runnable) before any container starts
-- [ ] `proxy-program` - The proxy: ranges, matching, resolver, resolve-then-connect, CONNECT, HTTP, bind address, TCP forwards, refusals; no Docker
-- [ ] `contained-networks` - Networks with the gateway check, the one-shot proxy beside `runOnce`, the exec environment, the sweep
-- [ ] `project-proxy-lifecycle` - The project network and proxy, three-way network state, replacement and its lock, repair, aliases
-- [ ] `contained-install` - Clone, build, check and scanners through containment; default hosts measured; refused-host messages
-- [ ] `network-tools` - `set_project_network`, `hosts` and `set_project_hosts`, local access, refusals reported
-- [ ] `startup-containment` - Existing sandboxes contained at startup, exec waits, never loosen
-- [ ] `status-and-docs` - Instructions, status lines, tool wording, README
-- [ ] `gvisor-ci` - CI workflow on plain Linux with gVisor and containment
+- [x] `network-config` - `MCPE_NETWORK`, `MCPE_LOCAL_ACCESS`, scanner `hosts`, the host grammar, the default host table; no Docker
+- [x] `runtime-required` - The named runtime checked (listed and runnable) before any container starts
+- [x] `proxy-program` - The proxy: ranges, matching, resolver, resolve-then-connect, CONNECT, HTTP, bind address, TCP forwards, refusals; no Docker
+- [x] `linux-measurements` - Measurement-only CI workflow on a draft pull request: DD3's check, `host-gateway`, the resolver and a two-holder alias on native Linux *(split from `contained-networks` at its design review, 2026-11-22)*
+- [x] `contained-networks` - Networks with the gateway check, the one-shot proxy beside `runOnce`, the sweep
+- [x] `project-network-primitives` - Docker-layer primitives for the project network and proxy, three-way network state, the exec environment, `rm -f -v` for one-shots *(split from `project-proxy-lifecycle` at its design review, 2026-11-22)*
+- [x] `containment-hook` - `Containment`: configuration and labels, locked replacement, repair, and the `ensureContained` hook every exec and start passes through *(split from `project-proxy-lifecycle`, 2026-11-22)*
+- [x] `contained-install` - Clone, build, check and scanners through containment; default hosts measured; refused-host messages
+- [x] `network-tools` - `set_project_network`, `hosts` and `set_project_hosts`, local access, refusals reported
+- [x] `startup-containment` - Existing sandboxes contained at startup, exec waits, never loosen
+- [x] `status-and-docs` - Instructions, status lines, tool wording, README
+- [x] `gvisor-ci` - CI workflow on plain Linux with gVisor and containment
 - [ ] `hat-and-alignment` *(optional)* - Guided HAT (human acceptance test) session with iterative fixes
 
 ---

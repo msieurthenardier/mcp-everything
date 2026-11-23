@@ -5,16 +5,20 @@ import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, type Config } from "../src/config.js";
 import { parseRepoRef } from "../src/forge/repo-ref.js";
-import { Installer, staleInstallLimitSec } from "../src/install/installer.js";
+import { Installer, staleInstallLimitSec, type InstallContainment } from "../src/install/installer.js";
+import type { ContainResult, ReplaceResult } from "../src/network/containment.js";
+import { CloneFailedError, type ProxyRefusalRow } from "../src/sandbox/docker.js";
 import { McpProxy } from "../src/proxy/mcp-proxy.js";
 import type { Connector, Launch } from "../src/proxy/mcp-proxy.js";
 import { Registry } from "../src/registry.js";
+import { RuntimeUnavailableError } from "../src/sandbox/docker.js";
 import { App } from "../src/server.js";
 import {
   DockerUnavailableError,
   SandboxRefusedError,
   type ExecOptions,
   type ExecResult,
+  type NetworkMode,
   OWNER_SHOWN,
   type ProbeData,
   type SandboxFacts,
@@ -98,13 +102,13 @@ class ScriptedDocker extends FakeDocker {
   unavailable = false;
   onAvailable?: () => void;
   onSetNetwork?: () => void;
-  override async setNetwork(target: SandboxTarget, enabled: boolean): Promise<void> {
-    this.traced("setNetwork", targetName(target), String(enabled));
+  override async setNetwork(target: SandboxTarget, mode: NetworkMode): Promise<void> {
+    this.traced("setNetwork", targetName(target), mode);
     this.onSetNetwork?.();
     if (typeof target !== "string" && this.gone.has(target.id)) throw new Error(`Sandbox ${target.name} no longer exists`);
     if (this.setNetworkError) throw this.setNetworkError;
     this.fail("setNetwork", this.setNetworkFails);
-    return super.setNetwork(target, enabled);
+    return super.setNetwork(target, mode);
   }
   override async removeContainer(container: string): Promise<void> {
     this.traced("removeContainer", container);
@@ -122,8 +126,18 @@ class ScriptedDocker extends FakeDocker {
 
   override async assertAvailable(): Promise<void> {
     this.availableCalls++;
+    this.order.push("assertAvailable");
     this.onAvailable?.();
     if (this.unavailable) throw new Error("Docker CLI could not be run");
+  }
+  /** The required-runtime check: counted, ordered against `assertAvailable`, and made to refuse by setting `runtimeError`. */
+  runtimeCalls = 0;
+  runtimeError?: Error;
+  order: string[] = [];
+  override async assertRuntime(): Promise<void> {
+    this.runtimeCalls++;
+    this.order.push("assertRuntime");
+    if (this.runtimeError) throw this.runtimeError;
   }
   /** The volume and role of every `probe`, in order. */
   probes: Array<{ volume: string; volumeRole?: string }> = [];
@@ -162,14 +176,22 @@ class ScriptedDocker extends FakeDocker {
     this.traced("runScanner");
     throw this.runScannerError ?? new Error("no scanner expected");
   }
+  /** Leg 8: the project's proxy refusals are read through the trace, so that their order against the network change is visible. */
+  override async projectRefusals(sandbox: string): Promise<ProxyRefusalRow[]> {
+    this.traced("projectRefusals", sandbox);
+    return super.projectRefusals(sandbox);
+  }
   override async ensureImage(image: string): Promise<void> {
     if (this.missingImages.has(image)) throw new Error(`Failed to pull image ${image}: not found`);
   }
   /** Every reference `createContainer` handed out, in order; each has a different id. */
   created: SandboxRef[] = [];
   private createCalls = 0;
-  override async createContainer(opts: { image: string; name: string }): Promise<SandboxRef> {
+  /** Leg 8: the `start` option of every `createContainer` (undefined where the caller gave none: today's `run -d`). */
+  createStarts: Array<boolean | undefined> = [];
+  override async createContainer(opts: { image: string; name: string; start?: boolean }): Promise<SandboxRef> {
     this.traced("createContainer", opts.name);
+    this.createStarts.push(opts.start);
     const call = ++this.createCalls;
     if (this.createContainerFails.includes(call)) throw new Error(`createContainer failed (call ${call})`);
     this.images.push(opts.image);
@@ -213,8 +235,43 @@ class ScriptedDocker extends FakeDocker {
   }
 }
 
+/**
+ * Containment as the installer sees it (leg 8): `contain` and `replace` are traced into the Docker double's trace with the
+ * record the registry holds at that moment, and can be made to fail. `contain` hands back the started reference.
+ */
+class FakeContainment implements InstallContainment {
+  containError?: Error;
+  replaceError?: Error;
+  /** The options of every `contain`. */
+  containOpts: Array<{ start?: boolean } | undefined> = [];
+  /** The ecosystems and status the registry's record had at each `contain` (what the real one builds the allowlist from). */
+  seen: Array<{ status: string | undefined; ecosystems: string[] | undefined; primary: string | undefined }> = [];
+  constructor(private readonly dock: ScriptedDocker) {}
+  async contain(key: string, opts?: { start?: boolean }): Promise<ContainResult> {
+    this.dock.traced("contain", key, opts?.start ? "start" : "");
+    this.containOpts.push(opts);
+    const rec = onDisk("widget");
+    this.seen.push({ status: rec?.status, ecosystems: rec?.ecosystems, primary: rec?.primary });
+    if (this.containError) return { ok: false, error: this.containError };
+    const created = this.dock.created.at(-1)!;
+    const sandbox = Object.freeze({ id: created.id, name: created.name });
+    this.returned.push(sandbox);
+    return { ok: true, result: { kind: "replaced", proxy: { id: "p".repeat(64), name: "proxy" }, removed: 0, warnings: [] }, sandbox };
+  }
+  /** The started references `contain` handed back, in order. */
+  returned: SandboxRef[] = [];
+  /** How many `exec`s the Docker double had seen when `replace` was called. */
+  replaceAt?: number;
+  async replace(key: string): Promise<ReplaceResult> {
+    this.dock.traced("replace", key);
+    this.replaceAt = this.dock.calls.length;
+    if (this.replaceError) throw this.replaceError;
+    return { kind: "unchanged", proxy: { id: "p".repeat(64), name: "proxy" }, warnings: [] };
+  }
+}
+
 /** The sandbox name a fresh install of acme/widget gets: prefix, installation id, slug. */
-const WIDGET = `mcpe-${TEST_INSTALLATION_ID}-widget`;
+const WIDGET =`mcpe-${TEST_INSTALLATION_ID}-widget`;
 /** What a staging name begins with: prefix and installation id. */
 const WIDGET_PREFIX = `mcpe-${TEST_INSTALLATION_ID}`;
 
@@ -241,6 +298,7 @@ let docker: ScriptedDocker;
 let up: FakeUpstream;
 let registry: Registry;
 let installer: Installer;
+let containment: FakeContainment;
 
 function setup(env: Record<string, string> = {}): void {
   cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, ...env });
@@ -249,7 +307,9 @@ function setup(env: Record<string, string> = {}): void {
   up.answer = false;
   registry = new Registry(dir);
   proxy = new McpProxy(cfg, docker, up.connector);
-  installer = new Installer(cfg, docker, registry, proxy);
+  // Leg 8: the installer is given containment as `App` gives it one; under `open` (the default here) it is never used.
+  containment = new FakeContainment(docker);
+  installer = new Installer(cfg, docker, registry, proxy, undefined, undefined, containment);
 }
 const install = (extra: object = {}) => installer.install({ repo: parseRepoRef("acme/widget", cfg.hosts), ...extra });
 
@@ -685,7 +745,7 @@ describe("install failure paths", () => {
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: false, error: "Install recipe for node exited with code 1." });
       expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
-      expect(lastNetwork()).toEqual([WIDGET, false]);
+      expect(lastNetwork()).toEqual([WIDGET, "off"]);
     });
 
     it("takes it off the network when the recipe times out, and names the limit", async () => {
@@ -695,7 +755,7 @@ describe("install failure paths", () => {
       expect(record).toMatchObject({ status: "failed", network: false });
       expect(record.error).toMatch(/^Install timed out after 45s/);
       expect(registry.get("widget")?.network).toBe(false);
-      expect(lastNetwork()).toEqual([WIDGET, false]);
+      expect(lastNetwork()).toEqual([WIDGET, "off"]);
     });
 
     it("takes it off the network when the second attempt's image cannot be pulled", async () => {
@@ -704,7 +764,7 @@ describe("install failure paths", () => {
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: false, error: "Failed to pull image node:lts: not found" });
       expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
-      expect(lastNetwork()).toEqual([WIDGET, false]);
+      expect(lastNetwork()).toEqual([WIDGET, "off"]);
     });
 
     it("takes it off the network when removing the container for the second attempt fails", async () => {
@@ -713,7 +773,7 @@ describe("install failure paths", () => {
       docker.removeContainerFails = [1];
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: false, error: "removeContainer failed (call 1)" });
-      expect(lastNetwork()).toEqual([WIDGET, false]);
+      expect(lastNetwork()).toEqual([WIDGET, "off"]);
     });
 
     it("keeps no claim about a container that is gone when the second container cannot be created", async () => {
@@ -751,8 +811,8 @@ describe("install failure paths", () => {
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: false, error: "discovery lost the daemon" });
       expect(docker.network).toEqual([
-        [WIDGET, true],
-        [WIDGET, false],
+        [WIDGET, "open"],
+        [WIDGET, "off"],
       ]);
       expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
     });
@@ -791,7 +851,7 @@ describe("install failure paths", () => {
       docker.setNetworkFails = [1];
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "failed", network: false, error: "setNetwork failed (call 1)" });
-      expect(lastNetwork()).toEqual([WIDGET, false]);
+      expect(lastNetwork()).toEqual([WIDGET, "off"]);
     });
 
     it("keeps the original error and records the network as on when it cannot be turned off", async () => {
@@ -820,14 +880,14 @@ describe("install failure paths", () => {
       docker.repoFiles = { "package.json": pkg({}) };
       const record = await install({ network: true });
       expect(record).toMatchObject({ status: "ready", network: true });
-      expect(docker.network).toEqual([[WIDGET, true]]);
+      expect(docker.network).toEqual([[WIDGET, "open"]]);
     });
 
     it("leaves the sandbox detached and recorded off by default", async () => {
       docker.repoFiles = { "package.json": pkg({}) };
       const record = await install();
       expect(record).toMatchObject({ status: "ready", network: false });
-      expect(docker.network).toEqual([[WIDGET, false]]);
+      expect(docker.network).toEqual([[WIDGET, "off"]]);
     });
   });
 
@@ -879,7 +939,7 @@ describe("stale installs at startup", () => {
     const r = seed("x", { errorLog: "old log" });
     const log: string[] = [];
     expect(await installer.reconcileStale(NOW, (l) => log.push(l))).toEqual(["x"]);
-    expect(docker.network).toEqual([["mcpe-x", false]]);
+    expect(docker.network).toEqual([["mcpe-x", "off"]]);
     const stored = registry.get("x")!;
     expect(stored).toMatchObject({ status: "failed", network: false });
     expect(stored.error).toBe(
@@ -923,7 +983,7 @@ describe("stale installs at startup", () => {
     seed("old");
     const fresh = seed("new", { installedAt: ago(60_000) });
     expect(await installer.reconcileStale(NOW)).toEqual(["old"]);
-    expect(docker.network).toEqual([["mcpe-old", false]]);
+    expect(docker.network).toEqual([["mcpe-old", "off"]]);
     expect(registry.get("new")).toEqual(fresh);
   });
 
@@ -1351,7 +1411,7 @@ describe("sandbox names and reinstall order", () => {
       const record = await install({ reinstall: true });
       expect(record.status).toBe("failed");
       expect(onDisk("widget")).toMatchObject({ status: "failed", container: WIDGET, volume: WIDGET, network: false });
-      expect(docker.network).toEqual([[WIDGET, false]]);
+      expect(docker.network).toEqual([[WIDGET, "off"]]);
     });
   });
 
@@ -1384,7 +1444,7 @@ describe("the reference of one operation", () => {
       const id = docker.created[0]!.id;
       expect(docker.calls.length).toBeGreaterThan(5); // the recipe and a discovery, not an empty set
       expect(docker.calls.map(ref)).toEqual(docker.calls.map(() => id));
-      expect(docker.network).toEqual([[WIDGET, false]]);
+      expect(docker.network).toEqual([[WIDGET, "off"]]);
       expect(docker.networkRefs[0]).toBe(docker.created[0]);
       // Nothing resolved the name again: no acquire, no ensureRunning.
       expect(docker.ensureCalls).toEqual([]);
@@ -1674,7 +1734,7 @@ describe("what a refusal does to each operation", () => {
       };
       await install({ network: true });
       expect(docker.networkRefs).toEqual([docker.created[0], docker.created[0]]);
-      expect(docker.network.map((n) => n[1])).toEqual([true, false]);
+      expect(docker.network.map((n) => n[1])).toEqual(["open", "off"]);
     });
 
     describe("the startup reconciliation", () => {
@@ -1919,7 +1979,7 @@ describe("installChecked", () => {
     });
 
     it("a refusal from the scanners is a failed check, with the staging volume removed", async () => {
-      cfg.scan.scanners = [{ name: "s1", image: "scan:1", command: ["scan"], network: false, timeoutSec: 60, env: [] }];
+      cfg.scan.scanners = [{ name: "s1", image: "scan:1", command: ["scan"], network: false, hosts: [], timeoutSec: 60, env: [] }];
       const before = seed();
       docker.runScannerError = refusal(part("volume", "whatever", "another", OTHER));
       const out = await checked({ reinstall: true });
@@ -2147,7 +2207,7 @@ describe("check", () => {
 
   it("runs a configured scanner when scanning is off", async () => {
     setup({ MCPE_SCAN: "off" });
-    cfg.scan.scanners = [{ name: "s1", image: "scan:1", command: ["scan"], network: false, timeoutSec: 60, env: [] }];
+    cfg.scan.scanners = [{ name: "s1", image: "scan:1", command: ["scan"], network: false, hosts: [], timeoutSec: 60, env: [] }];
     await run();
     expect(calls()).toEqual(["probe", "runScanner", "removeStagingVolume"]);
   });
@@ -2156,5 +2216,531 @@ describe("check", () => {
     docker.unavailable = true;
     await expect(run()).rejects.toThrow(/Docker CLI could not be run/);
     expect(docker.trace).toEqual([]);
+  });
+});
+
+describe("a required runtime that Docker cannot run", () => {
+  const REPO = () => parseRepoRef("acme/widget", cfg.hosts);
+  const REFUSAL = new RuntimeUnavailableError("runsc", "Docker lists no runtime called runsc");
+  const entries: Record<string, () => Promise<unknown>> = {
+    install: () => install({ reinstall: true }),
+    installChecked: () => installer.installChecked({ repo: REPO(), reinstall: true }, () => {}),
+    check: () => installer.check({ repo: REPO() }, () => {}),
+  };
+
+  it.each(Object.keys(entries))("%s asks assertRuntime right after assertAvailable", async (entry) => {
+    await entries[entry]!().catch(() => undefined);
+    expect(docker.order.slice(0, 2)).toEqual(["assertAvailable", "assertRuntime"]);
+  });
+
+  it.each(Object.keys(entries))("%s refuses with the message, and writes no record, closes no proxy and touches no sandbox", async (entry) => {
+    const old = { ...seedRecord("widget", "acme/widget"), status: "ready" as const };
+    registry.put(old);
+    const raw = fs.readFileSync(path.join(dir, "registry.json"), "utf8");
+    const close = vi.spyOn(proxy, "closeProject");
+    docker.runtimeError = REFUSAL;
+    await expect(entries[entry]!()).rejects.toThrow(REFUSAL.message);
+    expect(close).not.toHaveBeenCalled();
+    expect(docker.trace).toEqual([]);
+    expect(fs.readFileSync(path.join(dir, "registry.json"), "utf8")).toBe(raw);
+    expect(onDisk("widget")).toEqual(registry.get("widget"));
+  });
+
+  it("the refusal reaches an install_project tool result as the message", async () => {
+    docker.runtimeError = REFUSAL;
+    await expect(install()).rejects.toThrow(/^MCPE_DOCKER_RUNTIME names runsc, but Docker cannot run containers with it \(Docker lists no runtime called runsc\); install it and register it with Docker, or unset MCPE_DOCKER_RUNTIME\.$/);
+  });
+
+  it("reconcileStale never asks about the runtime", async () => {
+    docker.runtimeError = REFUSAL;
+    await installer.reconcileStale(Date.now());
+    expect(docker.runtimeCalls).toBe(0);
+  });
+});
+
+/** An installer under `MCPE_NETWORK=contained` (leg 8): the sandbox is created stopped, contained, then started; the end of the install has three branches. */
+describe("a contained install", () => {
+  const row = (host: string | null, port: number | null = 443, reason: ProxyRefusalRow["reason"] = "not-allowed"): ProxyRefusalRow => ({
+    kind: "connect", host, port, reason, count: 1, firstAt: "2026-01-01T00:00:00.000Z", lastAt: "2026-01-01T00:00:01.000Z",
+  });
+  const steps = () => docker.trace.map((t) => `${t.call} ${t.args.join(" ")}`.trim());
+  const calls = () => docker.trace.map((t) => t.call);
+  const modes = () => docker.network.map((n) => n[1]);
+  const REPO = () => parseRepoRef("acme/widget", cfg.hosts);
+  /** The exec that runs the install recipe, and the ones after it (discovery). */
+  const recipeAt = () => docker.calls.findIndex((c) => (c.argv[2] ?? "").includes("soft_fail()"));
+
+  beforeEach(() => {
+    setup({ MCPE_NETWORK: "contained", MCPE_SCAN: "off" });
+    docker.repoFiles = { "package.json": pkg({}) };
+  });
+
+  it("an installer under containment that is given none refuses to be built; under open it is fine", () => {
+    const c = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_NETWORK: "contained" });
+    expect(() => new Installer(c, docker, registry, proxy)).toThrow(/needs containment/);
+    expect(() => new Installer(c, docker, registry, proxy, undefined, undefined, containment)).not.toThrow();
+    const open = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir });
+    expect(() => new Installer(open, docker, registry, proxy)).not.toThrow();
+  });
+
+  describe("the order", () => {
+    it("clones, writes the record, creates the sandbox stopped, contains and starts it, builds, takes it offline, then discovers", async () => {
+      let offAt = -1;
+      docker.onSetNetwork = () => {
+        offAt = docker.calls.length;
+      };
+      const record = await installer.install({ repo: REPO() });
+      expect(record).toMatchObject({ status: "ready", network: false });
+      expect(steps().filter((s) => /^(probe|createContainer|contain|projectRefusals|setNetwork)/.test(s))).toEqual([
+        "probe",
+        `createContainer ${WIDGET}`,
+        "contain github:acme/widget start",
+        `projectRefusals ${WIDGET}`,
+        `setNetwork ${WIDGET} off`,
+      ]);
+      expect(docker.createStarts).toEqual([false]);
+      expect(containment.containOpts).toEqual([{ start: true }]);
+      // Discovery runs after the network went (as it does under open).
+      expect(recipeAt()).toBeGreaterThanOrEqual(0);
+      expect(recipeAt()).toBeLessThan(offAt);
+      expect(docker.calls.length).toBeGreaterThan(offAt);
+      expect(containment.replaceAt).toBeUndefined();
+    });
+
+    it("never opens the network under containment, on any branch", async () => {
+      await installer.install({ repo: REPO() });
+      await installer.install({ repo: REPO(), network: true, reinstall: true });
+      docker.recipe = () => ({ code: 1, stderr: "boom\n" });
+      await installer.install({ repo: REPO(), network: true, reinstall: true });
+      expect(modes()).not.toContain("open");
+    });
+
+    it("writes the record, still installing, with its detected ecosystems, before it contains the sandbox", async () => {
+      docker.repoFiles = { "package.json": pkg({}), Makefile: "all:\n" };
+      await installer.install({ repo: REPO() });
+      expect(containment.seen).toHaveLength(1);
+      expect(containment.seen[0]).toMatchObject({ status: "installing", primary: "node" });
+      expect(containment.seen[0]!.ecosystems).toContain("node");
+      expect(containment.seen[0]!.ecosystems!.length).toBeGreaterThan(0);
+    });
+
+    it("a caller-chosen ecosystem is in the record at containment, first, and not twice", async () => {
+      await installer.install({ repo: REPO(), ecosystem: "python" });
+      expect(containment.seen[0]!.primary).toBe("python");
+      expect(containment.seen[0]!.ecosystems![0]).toBe("python");
+      expect(new Set(containment.seen[0]!.ecosystems).size).toBe(containment.seen[0]!.ecosystems!.length);
+      expect(containment.seen[0]!.ecosystems).toContain("node");
+    });
+
+    it("the written record is a snapshot: the failed status the install sets later does not change what containment read", async () => {
+      docker.recipe = () => ({ code: 1, stderr: "boom\n" });
+      await installer.install({ repo: REPO(), ecosystem: "node" });
+      expect(containment.seen.every((s) => s.status === "installing")).toBe(true);
+    });
+
+    it("builds on the reference contain returned", async () => {
+      await installer.install({ repo: REPO() });
+      const recipe = docker.calls[recipeAt()]!;
+      expect(recipe.sandbox).toBe(containment.returned[0]);
+    });
+
+    it("under open it issues today's calls: no contain, no refusal read, createContainer without a start option", async () => {
+      setup();
+      docker.repoFiles = { "package.json": pkg({}) };
+      await installer.install({ repo: REPO(), network: true });
+      expect(calls()).not.toContain("contain");
+      expect(calls()).not.toContain("replace");
+      expect(calls()).not.toContain("projectRefusals");
+      expect(docker.createStarts).toEqual([undefined]);
+      expect(docker.network).toEqual([[WIDGET, "open"]]);
+      expect(onDisk("widget")!.ecosystems).toEqual(["node"]);
+    });
+  });
+
+  describe("the second attempt", () => {
+    beforeEach(() => {
+      docker.repoFiles = { "package.json": pkg({ engines: { node: "^22.23.4 || ^24.22.1 || >=26.12.1" } }) };
+      docker.recipe = (image) => (image === "node:26" ? SOFT_FAIL : { stdout: "built\n" });
+    });
+
+    it("creates stopped, contains and starts again, and runs the cleanup and the recipe on the new reference", async () => {
+      const record = await installer.install({ repo: REPO() });
+      expect(record.status).toBe("ready");
+      expect(docker.images).toEqual(["node:26", "node:24"]);
+      expect(docker.createStarts).toEqual([false, false]);
+      expect(containment.containOpts).toEqual([{ start: true }, { start: true }]);
+      const seq = steps().filter((s) => /^(createContainer|contain|removeContainer)/.test(s));
+      expect(seq).toEqual([
+        `createContainer ${WIDGET}`, "contain github:acme/widget start",
+        `removeContainer ${WIDGET}`,
+        `createContainer ${WIDGET}`, "contain github:acme/widget start",
+      ]);
+      const clean = docker.calls.find((c) => (c.argv[2] ?? "").includes("git clean"))!;
+      expect(clean.sandbox).toBe(containment.returned[1]);
+      expect(modes()).not.toContain("open");
+    });
+  });
+
+  describe("a failed containment", () => {
+    it("fails the install with containment's message, builds nothing, and takes the sandbox offline again", async () => {
+      containment.containError = new Error("the proxy did not start: boom");
+      const record = await installer.install({ repo: REPO() });
+      expect(record).toMatchObject({ status: "failed", error: "the proxy did not start: boom", network: false });
+      expect(registry.get("widget")).toMatchObject({ status: "failed", error: "the proxy did not start: boom" });
+      expect(recipeAt()).toBe(-1);
+      expect(docker.network).toEqual([[WIDGET, "off"]]);
+      expect(docker.createStarts).toEqual([false]);
+      expect(calls()).not.toContain("replace");
+    });
+  });
+
+  describe("the end of the install", () => {
+    it("with the network on: no network call, discovery under the build's allowlist, ready, then the run allowlist, then the sessions are closed", async () => {
+      const close = vi.spyOn(proxy, "closeProject");
+      close.mockClear();
+      const record = await installer.install({ repo: REPO(), network: true });
+      expect(record).toMatchObject({ status: "ready", network: true });
+      expect(docker.network).toEqual([]);
+      // `replace` ran after discovery's execs, and the record it saw said ready.
+      expect(containment.replaceAt).toBeGreaterThan(recipeAt() + 1);
+      expect(containment.replaceAt).toBe(docker.calls.length);
+      const replaceTrace = docker.trace.find((t) => t.call === "replace")!;
+      expect(replaceTrace.rec?.status).toBe("ready");
+      expect(close.mock.calls.at(-1)).toEqual([WIDGET]);
+      expect(registry.get("widget")).toMatchObject({ status: "ready", network: true });
+    });
+
+    it("with the network on, discovery's record is still installing (the hook gives the build's hosts)", async () => {
+      let seen: string | undefined;
+      const real = docker.exec.bind(docker);
+      let afterRecipe = false;
+      vi.spyOn(docker, "exec").mockImplementation(async (t, argv, o) => {
+        if ((argv[2] ?? "").includes("soft_fail()")) afterRecipe = true;
+        else if (afterRecipe && seen === undefined) seen = onDisk("widget")?.status;
+        return real(t, argv, o);
+      });
+      await installer.install({ repo: REPO(), network: true });
+      expect(seen).toBe("installing");
+    });
+
+    it("with the network on, a failed replacement leaves the project ready and offline, with a warning that names the error", async () => {
+      containment.replaceError = new Error("the proxy did not start: boom");
+      const record = await installer.install({ repo: REPO(), network: true });
+      expect(record).toMatchObject({ status: "ready", network: false });
+      expect(record.warnings.join("\n")).toMatch(/The run allowlist could not be applied \(the proxy did not start: boom\); its network was turned off\./);
+      expect(docker.network).toEqual([[WIDGET, "off"]]);
+      expect(registry.get("widget")).toMatchObject({ status: "ready", network: false });
+      expect(onDisk("widget")!.warnings.join("\n")).toMatch(/run allowlist could not be applied/);
+      expect(modes()).not.toContain("open");
+    });
+
+    it("with the network on, a failed replacement whose offline step also fails says so, and the record stays on", async () => {
+      containment.replaceError = new Error("nope");
+      docker.setNetworkError = new Error("disconnect failed");
+      const record = await installer.install({ repo: REPO(), network: true });
+      expect(record).toMatchObject({ status: "ready", network: true });
+      expect(record.warnings.join("\n")).toMatch(/turning its network off also failed/);
+    });
+
+    it("with the network off: off before discovery, and no replacement", async () => {
+      const record = await installer.install({ repo: REPO() });
+      expect(record.network).toBe(false);
+      expect(docker.network).toEqual([[WIDGET, "off"]]);
+      expect(calls()).not.toContain("replace");
+    });
+  });
+
+  describe("what the proxy refused", () => {
+    it("a failed build carries a line for each refused host in its error and its log, read before the network goes", async () => {
+      docker.refusals = [row("registry.npmjs.org"), row("registry.npmjs.org"), row("evil.example", 8443)];
+      docker.recipe = () => ({ code: 1, stderr: "npm ERR! 403\n" });
+      const record = await installer.install({ repo: REPO() });
+      expect(record.status).toBe("failed");
+      expect(record.error).toContain("Install recipe for node exited with code 1.");
+      expect(record.error).toContain("`registry.npmjs.org:443` was refused. The project's own code asked for this host; allow it (`hosts` on install, or `set_project_hosts`) only if you expect this project to need it.");
+      expect(record.error).not.toMatch(/hosts: \[/);
+      expect(record.error).toContain("`evil.example:8443`");
+      expect(record.errorLog).toContain("`registry.npmjs.org:443` was refused");
+      expect(registry.get("widget")!.error).toBe(record.error);
+      const order = calls().filter((c) => c === "projectRefusals" || c === "setNetwork");
+      expect(order).toEqual(["projectRefusals", "setNetwork"]);
+      expect(docker.network).toEqual([[WIDGET, "off"]]);
+    });
+
+    it("a build that throws (settleFailure) carries them too, read before the network goes; reconcileStale reads nothing", async () => {
+      docker.refusals = [row("registry.npmjs.org")];
+      docker.execError = (argv) => ((argv[2] ?? "").includes("soft_fail()") ? new Error("exec blew up") : undefined);
+      const record = await installer.install({ repo: REPO() });
+      expect(record.status).toBe("failed");
+      expect(record.error).toMatch(/^exec blew up `registry\.npmjs\.org:443` was refused\./);
+      expect(record.errorLog).toContain("`registry.npmjs.org:443` was refused");
+      expect(calls().filter((c) => c === "projectRefusals" || c === "setNetwork")).toEqual(["projectRefusals", "setNetwork"]);
+      docker.trace = [];
+      await installer.reconcileStale(Date.now() + 8 * 3600 * 1000 * 1000);
+      expect(calls()).not.toContain("projectRefusals");
+    });
+
+    it("a timed-out build carries them too", async () => {
+      docker.refusals = [row("registry.npmjs.org")];
+      docker.recipe = () => ({ code: 124, timedOut: true });
+      const record = await installer.install({ repo: REPO(), timeoutSec: 5 });
+      expect(record.error).toMatch(/^Install timed out after 5s\. `registry\.npmjs\.org:443` was refused\./);
+    });
+
+    it("a build that finished warns, once per host and port, at most five, and the project is ready", async () => {
+      docker.refusals = [row("a.example"), row("a.example"), row("b.example", 80), ...[1, 2, 3, 4, 5, 6].map((n) => row(`h${n}.example`))];
+      const record = await installer.install({ repo: REPO() });
+      expect(record.status).toBe("ready");
+      const w = record.warnings.filter((x) => x.startsWith("The build was refused"));
+      expect(w).toHaveLength(5);
+      expect(w[0]).toBe(
+        "The build was refused `a.example:443` but finished; the project may be incomplete. The project's own code asked for this host; allow it (`hosts` on install, or `set_project_hosts`) only if you expect this project to need it.",
+      );
+      expect(w[1]).toContain("`b.example:80`");
+      expect(onDisk("widget")!.warnings).toEqual(record.warnings);
+    });
+
+    it("the warnings are written whichever way the install ends (network on, off, and a failed replacement)", async () => {
+      docker.refusals = [row("a.example")];
+      for (const extra of [{ network: true }, {}, { network: true, replaceFails: true }]) {
+        containment.replaceError = "replaceFails" in extra ? new Error("x") : undefined;
+        const record = await installer.install({ repo: REPO(), network: extra.network, reinstall: true });
+        expect(record.warnings.some((x) => x.includes("`a.example:443`")), JSON.stringify(extra)).toBe(true);
+        expect(onDisk("widget")!.warnings.some((x) => x.includes("`a.example:443`"))).toBe(true);
+      }
+    });
+
+    it("a clean build has no refusal warning and no extra text", async () => {
+      const record = await installer.install({ repo: REPO() });
+      expect(record.warnings.some((x) => x.includes("refused"))).toBe(false);
+      docker.recipe = () => ({ code: 1, stderr: "boom\n" });
+      const failed = await installer.install({ repo: REPO(), reinstall: true });
+      expect(failed.error).toBe("Install recipe for node exited with code 1.");
+    });
+
+    it("a host with a backtick or a line break cannot break the quoting", async () => {
+      docker.refusals = [row("a`b\nc.example")];
+      docker.recipe = () => ({ code: 1 });
+      const record = await installer.install({ repo: REPO() });
+      expect(record.error).not.toMatch(/\n/);
+      expect(record.error).toContain("`a?b?c.example:443`");
+    });
+  });
+
+  describe("installChecked and check", () => {
+    it("installChecked builds through the same sequence", async () => {
+      const out = await installer.installChecked({ repo: REPO() });
+      expect(out.kind).toBe("installed");
+      expect(steps().filter((s) => /^(copyVolume|createContainer|contain|setNetwork)/.test(s)).map((s) => s.split(" ")[0])).toEqual(["copyVolume", "createContainer", "contain", "setNetwork"]);
+      expect(docker.createStarts).toEqual([false]);
+      expect(containment.seen[0]).toMatchObject({ status: "installing", primary: "node" });
+    });
+
+    it("check clones and scans and builds nothing: no sandbox, no containment", async () => {
+      const out = await installer.check({ repo: REPO() });
+      expect(out.kind).toBe("checked");
+      expect(calls()).not.toContain("createContainer");
+      expect(calls()).not.toContain("contain");
+      expect(calls()).not.toContain("replace");
+    });
+
+    it("a refused clone's check failure says the refusal first, so that the cut is of git's text", async () => {
+      const lines = ["The clone was refused `other.example`: submodules on other forges are not reachable under containment."];
+      docker.probeError = new CloneFailedError(`Could not clone https://github.com/acme/widget.git:\n${"fatal: x ".repeat(80)}`, lines);
+      const out = await installer.check({ repo: REPO() });
+      expect(out.kind).toBe("check-failed");
+      const reason = (out as { reason: string }).reason;
+      expect(reason.startsWith(lines[0]!)).toBe(true);
+      expect(reason.length).toBeLessThanOrEqual(300);
+      expect(reason).not.toMatch(/\n/);
+    });
+
+    it("a clone failure in an install is the tool's error and leaves no record", async () => {
+      docker.probeError = new CloneFailedError("Could not clone x:\nfatal", ["The clone was refused `other.example`: submodules on other forges are not reachable under containment."]);
+      const record = await installer.install({ repo: REPO() });
+      expect(record.status).toBe("failed");
+      expect(record.error).toContain("The clone was refused `other.example`");
+      expect(registry.get("widget")).toBeUndefined();
+    });
+  });
+});
+
+describe("a project's hosts (leg 9)", () => {
+  const REPO = () => parseRepoRef("acme/widget", cfg.hosts);
+  /** Another session: a separate Registry on the same file; its write is seen here only by re-reading the file. */
+  const other = () => new Registry(dir);
+  const addHosts = (...hosts: string[]) =>
+    other().update("widget", (cur) => (cur ? { ...cur, hosts: [...new Set([...(cur.hosts ?? []), ...hosts])].sort() } : undefined));
+  const seedReady = (over: Partial<ProjectRecord> = {}): ProjectRecord => {
+    const r: ProjectRecord = { ...seedRecord("widget", "acme/widget"), container: WIDGET, volume: WIDGET, ...over };
+    registry.put(r);
+    return structuredClone(r);
+  };
+  beforeEach(() => {
+    docker.repoFiles = { "package.json": pkg({}) };
+  });
+
+  describe("install_project's parameter", () => {
+    it("a first install records the entries normalized, de-duplicated and sorted, under every network mode", async () => {
+      const record = await install({ hosts: ["B.example.com", "a.example.com:8443", "b.example.com", "*.cdn.example.org"] });
+      expect(record.status).toBe("ready");
+      expect(record.hosts).toEqual(["*.cdn.example.org", "a.example.com:8443", "b.example.com"]);
+      expect(onDisk("widget")!.hosts).toEqual(["*.cdn.example.org", "a.example.com:8443", "b.example.com"]);
+    });
+
+    it("no parameter, no hosts: the record has no hosts key at all", async () => {
+      const record = await install();
+      expect("hosts" in record).toBe(false);
+      expect(onDisk("widget")).not.toHaveProperty("hosts");
+    });
+
+    it("a reinstall merges the parameter into what the record already has", async () => {
+      seedReady({ hosts: ["keep.example"] });
+      const record = await install({ reinstall: true, hosts: ["new.example", "keep.example"] });
+      expect(record.status).toBe("ready");
+      expect(record.hosts).toEqual(["keep.example", "new.example"]);
+      expect(onDisk("widget")!.hosts).toEqual(["keep.example", "new.example"]);
+    });
+
+    it("a reinstall under new names puts the merged hosts on the first write (the old names) as well as the record", async () => {
+      seedReady({ container: "mcpe-widget", volume: "mcpe-widget", hosts: ["keep.example"] });
+      docker.onAvailable = undefined;
+      const seen: Array<string[] | undefined> = [];
+      const real = docker.destroy.bind(docker);
+      docker.destroy = async (c, v) => {
+        seen.push(onDisk("widget")?.hosts);
+        return real(c, v);
+      };
+      const record = await install({ reinstall: true, hosts: ["new.example"] });
+      expect(seen[0]).toEqual(["keep.example", "new.example"]);
+      expect(record.hosts).toEqual(["keep.example", "new.example"]);
+    });
+
+    it("a bad entry throws before anything is written", async () => {
+      await expect(install({ hosts: ["10.0.0.1"] })).rejects.toThrow();
+      expect(onDisk("widget")).toBeUndefined();
+    });
+  });
+
+  describe("the merging writer: a set_project_hosts from another session is not lost", () => {
+    it("during an install (between the clone and the build)", async () => {
+      docker.afterProbe = () => {
+        addHosts("late.example");
+      };
+      const record = await install({ hosts: ["early.example"] });
+      expect(record.status).toBe("ready");
+      expect(record.hosts).toEqual(["early.example", "late.example"]);
+      expect(onDisk("widget")!.hosts).toEqual(["early.example", "late.example"]);
+    });
+
+    it("during an install that fails", async () => {
+      docker.afterProbe = () => {
+        addHosts("late.example");
+      };
+      docker.recipe = () => ({ code: 1 });
+      const record = await install({ hosts: ["early.example"] });
+      expect(record.status).toBe("failed");
+      expect(onDisk("widget")!.hosts).toEqual(["early.example", "late.example"]);
+    });
+
+    it("during a rediscovery", async () => {
+      const project = await install();
+      const exec = docker.exec.bind(docker);
+      let done = false;
+      docker.exec = async (t, argv, opts) => {
+        if (!done) {
+          done = true;
+          addHosts("late.example");
+        }
+        return exec(t, argv, opts);
+      };
+      const record = await installer.rediscover(project, []);
+      expect(record.hosts).toEqual(["late.example"]);
+      expect(onDisk("widget")!.hosts).toEqual(["late.example"]);
+    });
+
+    it("during a rediscovery the file's network is kept too (discovery never changes it)", async () => {
+      const project = await install();
+      expect(project.network).toBe(false);
+      const exec = docker.exec.bind(docker);
+      let done = false;
+      docker.exec = async (t, argv, opts) => {
+        if (!done) {
+          done = true;
+          other().update("widget", (cur) => (cur ? { ...cur, network: true } : undefined));
+        }
+        return exec(t, argv, opts);
+      };
+      const record = await installer.rediscover(project, []);
+      expect(record.network).toBe(true);
+      expect(onDisk("widget")!.network).toBe(true);
+    });
+
+    it("during a selection (reselect)", async () => {
+      const project = await install();
+      addHosts("late.example");
+      other().update("widget", (cur) => (cur ? { ...cur, network: true } : undefined));
+      const record = installer.reselect(project, { include: ["tool"], exclude: [] });
+      expect(record.hosts).toEqual(["late.example"]);
+      expect(record.network).toBe(true);
+      expect(onDisk("widget")).toMatchObject({ hosts: ["late.example"], network: true, selection: { include: ["tool"], exclude: [] } });
+    });
+
+    it("an uninstall during a rediscovery is not undone: nothing is written, and a line is logged", async () => {
+      const project = await install();
+      const lines: string[] = [];
+      registry = new Registry(dir, (l) => lines.push(l));
+      installer = new Installer(cfg, docker, registry, proxy, undefined, undefined, containment);
+      const exec = docker.exec.bind(docker);
+      let done = false;
+      docker.exec = async (t, argv, opts) => {
+        if (!done) {
+          done = true;
+          other().delete("widget");
+        }
+        return exec(t, argv, opts);
+      };
+      await installer.rediscover(project, []);
+      expect(onDisk("widget")).toBeUndefined();
+      expect(lines.join("\n")).toMatch(/widget has no record any more/);
+    });
+
+    it("a stale writer that spreads the whole record over `hosts` would lose it (the guard the merging writer is)", () => {
+      seedReady();
+      const held = registry.get("widget")!;
+      addHosts("late.example");
+      registry.put({ ...held }); // the old way: the held record, stale
+      expect(onDisk("widget")!.hosts).toBeUndefined();
+      addHosts("late.example");
+      registry.putKeeping({ ...held }, ["hosts"]);
+      expect(onDisk("widget")!.hosts).toEqual(["late.example"]);
+    });
+  });
+
+  describe("a failed reinstall", () => {
+    it("puts the old record back and keeps the file's hosts, but not what its own parameter added", async () => {
+      seedReady({ container: "mcpe-widget", volume: "mcpe-widget", hosts: ["keep.example"] });
+      const close = proxy.closeProject.bind(proxy);
+      vi.spyOn(proxy, "closeProject").mockImplementation(async (c: string) => {
+        addHosts("late.example");
+        return close(c);
+      });
+      docker.destroyFails = [1];
+      await expect(install({ reinstall: true, hosts: ["param.example", "keep.example"] })).rejects.toThrow(/Could not reinstall widget/);
+      expect(onDisk("widget")!.hosts).toEqual(["keep.example", "late.example"]);
+      expect(onDisk("widget")!.container).toBe("mcpe-widget");
+    });
+
+    it("does not bring back a project that was uninstalled meanwhile", async () => {
+      seedReady({ container: "mcpe-widget", volume: "mcpe-widget" });
+      const close = proxy.closeProject.bind(proxy);
+      vi.spyOn(proxy, "closeProject").mockImplementation(async (c: string) => {
+        other().delete("widget");
+        return close(c);
+      });
+      docker.destroyFails = [1];
+      await expect(install({ reinstall: true })).rejects.toThrow(/Could not reinstall/);
+      expect(onDisk("widget")).toBeUndefined();
+    });
   });
 });

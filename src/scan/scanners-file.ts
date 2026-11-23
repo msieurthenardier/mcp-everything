@@ -1,11 +1,12 @@
 import { ConfigError } from "../errors.js";
+import { HostEntryError, formatHostEntry, parseHostEntry } from "../network/hosts.js";
 import type { ScannerSpec } from "./types.js";
 
 const NAME = /^[a-z0-9][a-z0-9-]{0,31}$/;
 // The image-reference pattern install_project uses.
 const IMAGE = /^[a-z0-9][a-z0-9._/:@-]{0,200}$/i;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
-const KEYS = new Set(["name", "image", "command", "entrypoint", "network", "timeout_seconds", "env", "stage"]);
+const KEYS = new Set(["name", "image", "command", "entrypoint", "network", "timeout_seconds", "env", "stage", "hosts"]);
 const MAX_ENTRIES = 16;
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -84,6 +85,23 @@ export function parseScannersFile(text: string, source: string): ScannerSpec[] {
       }
     }
 
+    const rawHosts = get("hosts");
+    const hosts: string[] = [];
+    if (rawHosts !== undefined) {
+      if (!Array.isArray(rawHosts) || rawHosts.length < 1 || rawHosts.length > 64) {
+        throw new ConfigError(`${where}: "hosts" must be an array of 1 to 64 strings`);
+      }
+      for (const h of rawHosts) {
+        if (typeof h !== "string") throw new ConfigError(`${where}: "hosts" entries must be strings`);
+        try {
+          hosts.push(formatHostEntry(parseHostEntry(h, "scanner")));
+        } catch (e) {
+          if (!(e instanceof HostEntryError)) throw e;
+          throw new ConfigError(`${where}: "hosts" entry ${JSON.stringify(h.slice(0, 80))} ${e.message}`);
+        }
+      }
+    }
+
     const stage = get("stage");
     if (stage !== undefined && stage !== "source") throw new ConfigError(`${where}: "stage" may only be "source"`);
 
@@ -93,6 +111,7 @@ export function parseScannersFile(text: string, source: string): ScannerSpec[] {
       command: command as string[],
       ...(entrypoint !== undefined ? { entrypoint: entrypoint as string } : {}),
       network: network ?? false,
+      hosts,
       timeoutSec: timeout ?? 300,
       env: (env as string[] | undefined) ?? [],
     };

@@ -36,7 +36,11 @@ export class Registry {
   private projects = new Map<string, ProjectRecord>();
   private mtimeMs = -1;
 
-  constructor(private readonly dir: string) {
+  constructor(
+    private readonly dir: string,
+    /** Where `putKeeping` says it wrote nothing; the default says nothing. */
+    private readonly log: (line: string) => void = () => {},
+  ) {
     this.file = path.join(dir, REGISTRY_FILE);
   }
 
@@ -203,6 +207,41 @@ export class Registry {
 
   put(record: ProjectRecord): void {
     this.mutate((projects) => projects.set(record.slug, record));
+  }
+
+  /**
+   * Writes a record a caller held across long work without undoing what other writers changed meanwhile: the fields
+   * named in `keep` are taken from the file under the lock, the rest from `record`. `hosts` is written only by
+   * `set_project_hosts` and the opening of an install; `network` only by the network tools and the install's own
+   * steps, so discovery and publication keep the file's.
+   * - No record in the file (an uninstall deleted it): nothing is written, a line is logged, `undefined` is returned.
+   *   A held record never brings back a project that was removed.
+   * - The record stored is a copy (a later change to `record` cannot reach it), and the kept fields of `record` itself
+   *   are then set from what was stored, so the caller's view, and what it returns, is current.
+   */
+  putKeeping(record: ProjectRecord, keep: ReadonlyArray<"hosts" | "network">): ProjectRecord | undefined {
+    let stored = undefined as ProjectRecord | undefined;
+    this.update(record.slug, (cur) => {
+      if (!cur) return undefined;
+      const next = structuredClone(record);
+      if (keep.includes("hosts")) {
+        if (cur.hosts === undefined) delete next.hosts;
+        else next.hosts = [...cur.hosts];
+      }
+      if (keep.includes("network")) next.network = cur.network;
+      stored = next;
+      return next;
+    });
+    if (!stored) {
+      this.log(`registry: ${record.slug} has no record any more (uninstalled meanwhile); nothing was written`);
+      return undefined;
+    }
+    if (keep.includes("hosts")) {
+      if (stored.hosts === undefined) delete record.hosts;
+      else record.hosts = [...stored.hosts];
+    }
+    if (keep.includes("network")) record.network = stored.network;
+    return stored;
   }
 
   delete(slug: string): void {

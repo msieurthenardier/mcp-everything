@@ -80,7 +80,7 @@ describe("decide", () => {
 });
 
 describe("unreachableBlock", () => {
-  const spec: ScannerSpec = { name: "t", image: "i", command: ["c"], network: false, timeoutSec: 300, env: [] };
+  const spec: ScannerSpec = { name: "t", image: "i", command: ["c"], network: false, hosts: [], timeoutSec: 300, env: [] };
   it("speaks only for block at error with no scanners", () => {
     const s = unreachableBlock("error", []);
     expect(s).toMatch(/cannot block/);

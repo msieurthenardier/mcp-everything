@@ -5,7 +5,7 @@ import type { Readable } from "node:stream";
 import { Client, ProtocolError, SdkError, SdkErrorCode, type Transport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import type { Config } from "../config.js";
-import type { Docker, SandboxRef } from "../sandbox/docker.js";
+import { envFlags, type Docker, type SandboxRef } from "../sandbox/docker.js";
 import type { McpServerSpec } from "../types.js";
 import { cleanTerminalText } from "../util/text.js";
 import { VERSION } from "../version.js";
@@ -129,6 +129,9 @@ export function dockerConnector(cfg: Config): Connector {
         fs.writeFileSync(envFile, lines.join(""), { mode: 0o600 });
         args.push("--env-file", envFile);
       }
+      // The sandbox's own variables (leg 7: the proxy's) travel as `-e` flags after `--env-file`. Docker gives `-e`
+      // precedence over `--env-file` whatever the order; the order is kept only so that it reads that way.
+      args.push(...envFlags(sandbox.env));
       args.push(sandbox.id, "sh", "-c", LAUNCH_SCRIPT, pidFile, ...server.argv);
 
       const env: Record<string, string> = {};

@@ -1,30 +1,47 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { loadConfig } from "../src/config.js";
-import { TEST_INSTALLATION_ID } from "./helpers.js";
+import { record, TEST_INSTALLATION_ID } from "./helpers.js";
+import { Containment, proxyEnvironment } from "../src/network/containment.js";
+import { Registry } from "../src/registry.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { RunOptions } from "../src/util/exec.js";
+import { proxyConfig, proxyLaunchArgs } from "../src/network/proxy/config.js";
 import {
   classifySandbox,
+  CloneFailedError,
+  ContainmentUnavailableError,
   Docker,
   DockerUnavailableError,
+  envFlags,
   isStoppedExecFailure,
+  makeRef,
   MANIFESTS,
+  ONE_SHOT_ROLES,
   OWNER_SHOWN,
   parseProbeOutput,
+  parseProxyReport,
+  parseResolvConf,
+  projectNetworkName,
+  ProxyStartError,
   PROBE_SCRIPT,
+  RuntimeMismatchError,
+  RuntimeUnavailableError,
   WALK_SCRIPT,
   WALK_SEPARATOR,
   walkArguments,
   SandboxRefusedError,
   VolumeNotUsableError,
   watchdogPollSec,
+  type ContainmentHook,
+  type ContainmentHookMode,
   type ExecResult,
   type OneShotSpec,
   type SandboxClass,
+  type SandboxInspectFacts,
 } from "../src/sandbox/docker.js";
 
 type Reply = Partial<ExecResult>;
@@ -46,7 +63,23 @@ interface FakeContainer {
   running: boolean;
   labels: Labels;
   networks: string[];
+  /** HostConfig.Runtime as the inspect answers it; undefined omits the field, as an old daemon or a plain double does. */
+  runtime?: string | null;
+  /** State.ExitCode for the readiness inspect. */
+  exitCode?: number;
 }
+
+interface FakeNet {
+  id: string;
+  name: string;
+  labels: Record<string, string> | null;
+  internal: boolean;
+  ipv6: boolean;
+  ipam: Array<Record<string, string>> | null;
+  created: string;
+}
+/** What the proxy's `/status` says when it is ready, with no refusals. */
+const READY = { version: "1", ready: true, listening: { address: "172.30.0.2", ports: [3128] }, startedAt: "t", configHash: "h", refusals: [], resolverFailures: 0, total: 0 };
 
 /**
  * A scripted daemon. It answers by the whole command line, from a small world of
@@ -68,14 +101,41 @@ class ScriptedDocker extends Docker {
   runOutput = `${"f".repeat(64)}\n`;
   /** Consulted first; return undefined to fall through to the world. May have side effects. */
   script: Array<(args: string[]) => Reply | undefined> = [];
-  /** When set, only inspects, volume inspects and version requests are accepted; anything else is recorded in `violations` and throws. */
+  /** When set, only inspects, volume and network inspects, listings (`ps`), `info` and version requests are accepted; anything else is recorded in `violations` and throws. */
   strict = false;
   violations: string[][] = [];
+  /** What `docker info` answers: the runtimes it lists and its default. */
+  infoRuntimes: string[] = ["runc", "io.containerd.runc.v2", "runsc"];
+  infoDefault = "runc";
+  /** Contained networks the double has made, by name. */
+  networks = new Map<string, FakeNet>();
+  /** What the proxy's status one-liner prints (any JSON value), or a reply for the whole exec. */
+  statusBody: unknown = READY;
+  /** What `docker logs` says. */
+  logsReply: Reply = {};
+  /** What a container with the role `resolv-read` prints. */
+  resolvConf = "nameserver 192.0.2.53\n";
+  /** The subnet of the next network `network create` makes; a counter makes them differ. */
+  private subnetN = 0;
+
+  /** A network the double has made, by the name the call used (the id is derived from it). */
+  net(namePart: string): FakeNet {
+    const found = [...this.networks.values()].find((n) => n.name.includes(namePart));
+    if (!found) throw new Error(`no network with ${namePart} in its name`);
+    return found;
+  }
+  /** The proxy container (the one made with the role `oneshot-proxy`), if one exists. */
+  proxyContainer(): [string, FakeContainer] | undefined {
+    return [...this.containers.entries()].find(([, c]) => c.labels?.["mcp-everything.role"] === "oneshot-proxy");
+  }
 
   protected override async docker(args: string[], opts?: RunOptions) {
     this.argvs.push(args);
     this.optsList.push(opts);
-    if (this.strict && !(args[0] === "inspect" || args[0] === "version" || (args[0] === "volume" && args[1] === "inspect"))) {
+    if (
+      this.strict &&
+      !(args[0] === "inspect" || args[0] === "version" || args[0] === "info" || (args[0] === "volume" && args[1] === "inspect") || (args[0] === "network" && args[1] === "inspect") || args[0] === "ps")
+    ) {
       this.violations.push(args);
       throw new Error(`unexpected command in a read-only double: ${args.join(" ")}`);
     }
@@ -95,18 +155,35 @@ class ScriptedDocker extends Docker {
     switch (args[0]) {
       case "version":
         return { stdout: "27.0.0\n" };
+      case "info":
+        return { stdout: `${JSON.stringify({ runtimes: Object.fromEntries(this.infoRuntimes.map((r) => [r, {}])), default: this.infoDefault })}\n` };
       case "image":
         return { stdout: "[]" };
       case "exec":
+        // The proxy's status one-liner (`exec <id> node -e <script>`); every other exec is `exec [-i] ... timeout ...`.
+        if (args[2] === "node") return { stdout: JSON.stringify(this.statusBody) };
         return this.execReplies.shift() ?? {};
+      case "logs":
+        return this.logsReply;
       case "inspect": {
         const target = args[args.length - 1]!;
         const found = this.find(target);
         if (!found) return { code: 1, stderr: `Error response from daemon: No such container: ${target}\n` };
         const [, c] = found;
         const format = args[args.indexOf("--format") + 1]!;
+        // The networks of a container with their ids and aliases (a project proxy is on its network under `mcpe-proxy`).
+        if (format === "{{json .NetworkSettings.Networks}}") {
+          const isProxy = c.labels?.["mcp-everything.role"] === "project-proxy";
+          return {
+            stdout: `${JSON.stringify(Object.fromEntries(c.networks.map((n) => [n, { NetworkID: this.networks.get(n)?.id ?? "", Aliases: isProxy ? ["mcpe-proxy"] : [] }])))}\n`,
+          };
+        }
+        if (format.includes('"exitCode"')) return { stdout: `${JSON.stringify({ running: c.running, exitCode: c.exitCode ?? 0 })}\n` };
         const out: Record<string, unknown> = { id: c.id, running: c.running };
+        // Docker's own answer carries the name with a leading slash.
+        if (format.includes('"name"')) out.name = `/${found[0]}`;
         if (format.includes('"labels"')) out.labels = c.labels;
+        if (c.runtime !== undefined && format.includes('"runtime"')) out.runtime = c.runtime;
         out.networks = Object.fromEntries(c.networks.map((n) => [n, { IPAddress: "10.0.0.2" }]));
         return { stdout: `${JSON.stringify(out)}\n` };
       }
@@ -121,7 +198,8 @@ class ScriptedDocker extends Docker {
         });
         const id = idFor(name);
         this.created.push({ name, id, labels, args });
-        this.containers.set(name, { id, running: false, labels, networks: ["bridge"] });
+        const rt = args.indexOf("--runtime");
+        this.containers.set(name, { id, running: false, labels, networks: ["bridge"], ...(rt >= 0 ? { runtime: args[rt + 1]! } : {}) });
         return { stdout: `${id}\n` };
       }
       case "start": {
@@ -129,6 +207,7 @@ class ScriptedDocker extends Docker {
         const found = this.find(args[args.length - 1]!);
         if (!found) return { code: 1, stderr: "Error response from daemon: No such container\n" };
         found[1].running = true;
+        if (one && found[1].labels?.["mcp-everything.role"] === "resolv-read") return { stdout: this.resolvConf };
         return { stdout: one ? this.startOutput : `${args[1]}\n` };
       }
       case "rm": {
@@ -136,9 +215,59 @@ class ScriptedDocker extends Docker {
         if (found) this.containers.delete(found[0]);
         return {};
       }
+      case "ps": {
+        // `ps -a -q --no-trunc --filter label=k[=v] ...`: every container carrying all the labels.
+        const wants = args.flatMap((a, i) => (a === "--filter" ? [args[i + 1]!.replace(/^label=/, "")] : []));
+        const ids = [...this.containers.values()]
+          .filter((c) => wants.every((w) => { const [k, ...v] = w.split("="); return c.labels !== null && (v.length === 0 ? Object.hasOwn(c.labels, k!) : c.labels[k!] === v.join("=")); }))
+          .map((c) => c.id);
+        return { stdout: ids.map((i) => `${i}\n`).join("") };
+      }
       case "network": {
-        const found = this.find(args[args.length - 1]!);
-        if (found) found[1].networks = args[1] === "connect" ? ["bridge"] : [];
+        const last = args[args.length - 1]!;
+        if (args[1] === "create") {
+          const labels: Record<string, string> = {};
+          args.forEach((a, i) => {
+            if (a === "--label") {
+              const [k, ...v] = args[i + 1]!.split("=");
+              labels[k!] = v.join("=");
+            }
+          });
+          const id = idFor(`net:${last}`);
+          this.subnetN++;
+          this.networks.set(last, {
+            id, name: last, labels, internal: args.includes("--internal"), ipv6: false,
+            ipam: [{ Subnet: `172.30.${this.subnetN}.0/24` }], created: new Date().toISOString().replace("Z", "123456Z"),
+          });
+          return { stdout: `${id}\n` };
+        }
+        if (args[1] === "inspect") {
+          const n = [...this.networks.values()].find((x) => x.name === last || x.id === last);
+          if (!n) return { code: 1, stderr: `Error response from daemon: network ${last} not found\n` };
+          return { stdout: `${JSON.stringify({ id: n.id, name: n.name, internal: n.internal, ipv6: n.ipv6, ipam: n.ipam, labels: n.labels, created: n.created })}\n` };
+        }
+        if (args[1] === "rm") {
+          const n = [...this.networks.values()].find((x) => x.name === last || x.id === last);
+          if (!n) return { code: 1, stderr: `Error response from daemon: network ${last} not found\n` };
+          // Docker refuses a network a container is still on.
+          if ([...this.containers.values()].some((c) => c.networks.includes(n.name))) {
+            return { code: 1, stderr: `Error response from daemon: error while removing network: network ${n.name} id ${n.id} has active endpoints\n` };
+          }
+          this.networks.delete(n.name);
+          return {};
+        }
+        if (args[1] === "ls") return { stdout: [...this.networks.values()].map((n) => `${n.id}\n`).join("") };
+        // connect [--alias a]... <net> <container>; disconnect [-f] <net> <container>. Membership is per network, by name.
+        const found = this.find(last);
+        const netArg = args[args.length - 2]!;
+        const netName = [...this.networks.values()].find((x) => x.id === netArg)?.name ?? netArg;
+        if (!found) return { code: 1, stderr: `Error response from daemon: No such container: ${last}\n` };
+        if (args[1] === "connect") {
+          if (!found[1].networks.includes(netName)) found[1].networks = [...found[1].networks, netName];
+          return {};
+        }
+        if (!found[1].networks.includes(netName)) return { code: 1, stderr: `Error response from daemon: container ${found[1].id} is not connected to network ${netName}\n` };
+        found[1].networks = found[1].networks.filter((n) => n !== netName);
         return {};
       }
       case "volume": {
@@ -159,9 +288,9 @@ class ScriptedDocker extends Docker {
   }
 
   /** Put a container of the given class in the world, by name. */
-  put(name: string, cls: SandboxClass, opts: { running?: boolean; networks?: string[] } = {}): string {
+  put(name: string, cls: SandboxClass, opts: { running?: boolean; networks?: string[]; runtime?: string | null } = {}): string {
     const id = idFor(name);
-    this.containers.set(name, { id, running: opts.running ?? true, labels: LABELS[cls], networks: opts.networks ?? [] });
+    this.containers.set(name, { id, running: opts.running ?? true, labels: LABELS[cls], networks: opts.networks ?? [], ...(opts.runtime !== undefined ? { runtime: opts.runtime } : {}) });
     return id;
   }
   putVolume(name: string, cls: SandboxClass, role?: string): void {
@@ -188,9 +317,9 @@ const N = "mcpe-0123abcd-box";
 const V = "mcpe-0123abcd-box-vol";
 const STAGING = "mcpe-0123abcd-stage";
 const TARGET = "mcpe-0123abcd-target";
-const SCANNER = { name: "s", image: "scan:1", command: ["scan", "--sarif", "."], network: false, timeoutSec: 60, env: [] };
+const SCANNER = { name: "s", image: "scan:1", command: ["scan", "--sarif", "."], network: false, hosts: [], timeoutSec: 60, env: [] };
 const REPO = { forge: "github", host: "github.com", path: "o/r", cloneUrl: "https://github.com/o/r.git", id: "github:o/r", name: "r" } as const;
-const READ_ONLY = new Set(["inspect", "volume inspect", "version"]);
+const READ_ONLY = new Set(["inspect", "volume inspect", "network inspect", "ps", "version"]);
 
 describe("createContainer", () => {
   const runArgs = async (env: Record<string, string>) => {
@@ -371,40 +500,40 @@ describe("Docker.exec retry", () => {
   });
 });
 
-describe("setNetwork(container, false)", () => {
+describe('setNetwork(container, "off")', () => {
   const verbs = (d: ScriptedDocker) => d.argvs.map((a) => a.slice(0, 2).join(" "));
 
   it("returns without detaching, and without asking about the daemon, when the container is not there", async () => {
     const d = mk();
-    await d.setNetwork("gone", false);
+    await d.setNetwork("gone", "off");
     expect(d.verbs).toEqual(["inspect"]);
   });
 
   it("rejects, and detaches nothing, when the networks cannot be read because the daemon does not answer", async () => {
     const d = mk();
     d.script.push((a) => (a[0] === "inspect" ? { code: 1, stderr: "Cannot connect to the Docker daemon" } : undefined));
-    await expect(d.setNetwork("box", false)).rejects.toBeInstanceOf(DockerUnavailableError);
+    await expect(d.setNetwork("box", "off")).rejects.toBeInstanceOf(DockerUnavailableError);
     expect(verbs(d)).not.toContain("network disconnect");
   });
 
   it("rejects when the inspect times out", async () => {
     const d = mk();
     d.script.push((a) => (a[0] === "inspect" ? { code: null as unknown as number, timedOut: true } : undefined));
-    await expect(d.setNetwork("box", false)).rejects.toBeInstanceOf(DockerUnavailableError);
+    await expect(d.setNetwork("box", "off")).rejects.toBeInstanceOf(DockerUnavailableError);
     expect(d.verbs).toEqual(["inspect"]);
   });
 
   it("disconnects when the container has a network", async () => {
     const d = mk();
     const id = d.put("box", "mine", { networks: ["bridge"] });
-    await d.setNetwork("box", false);
+    await d.setNetwork("box", "off");
     expect(d.argvs.find((a) => a[0] === "network")).toEqual(["network", "disconnect", "bridge", id]);
   });
 
   it("does nothing more when the inspect succeeded and listed no network", async () => {
     const d = mk();
     d.put("box", "mine");
-    await d.setNetwork("box", false);
+    await d.setNetwork("box", "off");
     expect(verbs(d)).not.toContain("network disconnect");
     expect(verbs(d)).not.toContain("version --format");
   });
@@ -594,7 +723,8 @@ describe("resolving a container", () => {
   it("decides a volume by the same rule", async () => {
     const gone = mk();
     await gone.destroy("c", "v");
-    expect(gone.verbs).toEqual(["inspect", "volume inspect"]); // both absent: two inspects, nothing removed
+    // Both absent: the two inspects, the proxy listing and the network's inspect; nothing removed.
+    expect(gone.verbs).toEqual(["inspect", "volume inspect", "ps", "network inspect"]);
     for (const r of [
       { code: 1, stderr: "Cannot connect" },
       { code: null as unknown as number, timedOut: true },
@@ -631,10 +761,13 @@ const CASES: Record<string, MethodCase> = {
   state: { run: (d) => d.state(N), resource: "container", acts: null },
   ensureRunning: { run: (d) => d.ensureRunning(N), resource: "container", container: { running: false }, acts: "start" },
   acquire: { run: (d) => d.acquire(N), resource: "container", container: { running: false }, acts: "start" },
-  hasNetwork: { run: (d) => d.hasNetwork(N), resource: "container", acts: null },
-  setNetwork: { run: (d) => d.setNetwork(N, false), resource: "container", container: { networks: ["bridge"] }, acts: "network" },
+  networkState: { run: (d) => d.networkState(N), resource: "container", acts: null },
+  setNetwork: { run: (d) => d.setNetwork(N, "off"), resource: "container", container: { networks: ["bridge"] }, acts: "network" },
   removeContainer: { run: (d) => d.removeContainer(N), resource: "container", acts: "rm" },
   destroy: { run: (d) => d.destroy(N, V), resource: "container", acts: "rm" },
+  // Leg 7. `startForContainment` is the start containment makes without the hook; `inspectSandbox` reads the facts once more.
+  startForContainment: { run: (d) => d.startForContainment(N), resource: "container", container: { running: false }, acts: "start" },
+  inspectSandbox: { run: (d) => d.inspectSandbox(N), resource: "container", acts: null },
   probe: { run: (d) => d.probe(REPO, V, {}), resource: "volume", acts: null },
   createContainer: { run: (d) => d.createContainer({ name: N, volume: V, image: "img", project: "p" }), resource: "volume", acts: null },
   // Leg 6. The staging volume is read through a read-only mount; the target of a copy is a sandbox volume (no role).
@@ -659,7 +792,7 @@ function setup(d: ScriptedDocker, c: MethodCase, cls: SandboxClass, position = 0
   return d.put(N, cls, c.container);
 }
 const settle = (p: Promise<unknown>) => p.then(() => null, (e: unknown) => e);
-const EIGHT = ["exec", "state", "ensureRunning", "acquire", "hasNetwork", "setNetwork", "removeContainer", "destroy"];
+const EIGHT = ["exec", "state", "ensureRunning", "acquire", "networkState", "setNetwork", "removeContainer", "destroy"];
 
 describe("every method that takes a name resolves first", () => {
   describe.each(EIGHT)("%s", (method) => {
@@ -688,26 +821,26 @@ describe("every method that takes a name resolves first", () => {
       expect(await settle(c.run(d))).toBeNull();
       if (c.acts === "exec") expect(d.execs[0]![2]).toBe(id);
       if (c.acts === "start") expect(d.argvs.find((a) => a[0] === "start")).toEqual(["start", id]);
-      if (c.acts === "rm") expect(d.argvs.find((a) => a[0] === "rm")).toEqual(["rm", "-f", id]);
+      if (c.acts === "rm") expect(d.argvs.find((a) => a[0] === "rm")).toEqual(["rm", "-f", "-v", id]);
       if (c.acts === "network") expect(d.argvs.find((a) => a[0] === "network")).toEqual(["network", "disconnect", "bridge", id]);
     });
   });
 });
 
 describe("a sandbox that is not there, by name", () => {
-  it("state answers missing; ensureRunning and hasNetwork answer false; acquire returns nothing", async () => {
+  it('state answers missing; ensureRunning answers false; networkState answers "off"; acquire returns nothing', async () => {
     const d = mk();
     expect(await d.state(N)).toBe("missing");
     expect(await d.ensureRunning(N)).toBe(false);
-    expect(await d.hasNetwork(N)).toBe(false);
+    expect(await d.networkState(N)).toBe("off");
     expect(await d.acquire(N)).toBeUndefined();
     expect(d.verbs.every((v) => v === "inspect")).toBe(true);
   });
 
-  it("setNetwork(false) returns; setNetwork(true) and exec say it does not exist", async () => {
+  it('setNetwork("off") returns; setNetwork("open") and exec say it does not exist', async () => {
     const d = mk();
-    await expect(d.setNetwork(N, false)).resolves.toBeUndefined();
-    await expect(d.setNetwork(N, true)).rejects.toThrow(new RegExp(`${N}.*does not exist`));
+    await expect(d.setNetwork(N, "off")).resolves.toBeUndefined();
+    await expect(d.setNetwork(N, "open")).rejects.toThrow(new RegExp(`${N}.*does not exist`));
     await expect(d.exec(N, ["true"], OPTS)).rejects.toThrow(new RegExp(`${N}.*does not exist`));
     expect(d.count("exec")).toBe(0);
   });
@@ -773,10 +906,10 @@ describe("a reference", () => {
     expect(labelsRead(d)).toBe(false);
   });
 
-  it("state, ensureRunning and hasNetwork read by id, without labels", async () => {
+  it("state, ensureRunning and networkState read by id, without labels", async () => {
     const { d, id, ref } = setupRef("another", { running: false, networks: ["bridge"] });
     expect(await d.state(ref)).toBe("stopped");
-    expect(await d.hasNetwork(ref)).toBe(true);
+    expect(await d.networkState(ref)).toBe("open");
     expect(await d.ensureRunning(ref)).toBe(true);
     expect(d.argvs.filter((a) => a[0] === "inspect").map((a) => a.at(-1))).toEqual([id, id, id]);
     expect(d.argvs.find((a) => a[0] === "start")).toEqual(["start", id]);
@@ -785,12 +918,12 @@ describe("a reference", () => {
 
   it("setNetwork issues one inspect, by id, then names the id", async () => {
     const { d, id, ref } = setupRef("another", { networks: ["bridge"] });
-    await d.setNetwork(ref, false);
+    await d.setNetwork(ref, "off");
     expect(d.argvs.map((a) => a[0])).toEqual(["inspect", "network"]);
     expect(d.argvs[0]!.at(-1)).toBe(id);
     expect(d.argvs[1]).toEqual(["network", "disconnect", "bridge", id]);
     const on = setupRef("another");
-    await on.d.setNetwork(on.ref, true);
+    await on.d.setNetwork(on.ref, "open");
     expect(on.d.argvs[1]).toEqual(["network", "connect", "bridge", on.id]);
     expect(labelsRead(d) || labelsRead(on.d)).toBe(false);
   });
@@ -798,7 +931,7 @@ describe("a reference", () => {
   it("setNetwork by name issues one inspect in all", async () => {
     const d = mk();
     d.put(N, "mine");
-    await d.setNetwork(N, true);
+    await d.setNetwork(N, "open");
     expect(d.verbs).toEqual(["inspect", "network connect"]);
   });
 
@@ -806,12 +939,12 @@ describe("a reference", () => {
     const d = mk();
     const ref = { id: "a".repeat(64), name: N };
     expect(await d.state(ref)).toBe("missing");
-    for (const e of [await settle(d.ensureRunning(ref)), await settle(d.setNetwork(ref, true)), await settle(d.setNetwork(ref, false))]) {
+    for (const e of [await settle(d.ensureRunning(ref)), await settle(d.setNetwork(ref, "open")), await settle(d.setNetwork(ref, "off"))]) {
       expect(e).toBeInstanceOf(Error);
       expect(e).not.toBeInstanceOf(SandboxRefusedError);
       expect(e).not.toBeInstanceOf(DockerUnavailableError);
     }
-    expect(await d.hasNetwork(ref)).toBe(false);
+    expect(await d.networkState(ref)).toBe("off");
   });
 
   it("removeContainer by reference classifies the container by its id before removing it", async () => {
@@ -843,9 +976,10 @@ describe("destroy classifies both before it removes either", () => {
       expect(d.volumes.has(V)).toBe(true);
     } else {
       expect(e).toBeNull();
-      expect(d.argvs.find((a) => a[0] === "rm")).toEqual(["rm", "-f", id]);
+      expect(d.argvs.find((a) => a[0] === "rm")).toEqual(["rm", "-f", "-v", id]);
       expect(d.argvs.find((a) => a[0] === "volume" && a[1] === "rm")).toEqual(["volume", "rm", "-f", V]);
-      const lastInspect = Math.max(d.verbs.lastIndexOf("inspect"), d.verbs.lastIndexOf("volume inspect"));
+      // Every read, the proxy listing and the network's inspect included, comes before the first removal.
+      const lastInspect = Math.max(...["inspect", "volume inspect", "ps", "network inspect"].map((v) => d.verbs.lastIndexOf(v)));
       expect(lastInspect).toBeLessThan(d.verbs.indexOf("rm"));
     }
   });
@@ -871,8 +1005,10 @@ describe("destroy classifies both before it removes either", () => {
     const id = d.put(N, "mine");
     d.putVolume(V, "mine");
     await d.removeContainer(N);
-    expect(d.argvs.find((a) => a[0] === "rm")).toEqual(["rm", "-f", id]);
+    expect(d.argvs.find((a) => a[0] === "rm")).toEqual(["rm", "-f", "-v", id]);
     expect(d.volumes.has(V)).toBe(true);
+    // The named volume is left alone: `-v` reaches anonymous volumes only, and no `volume rm` is issued.
+    expect(d.argvs.filter((a) => a[0] === "volume" && a[1] === "rm")).toEqual([]);
   });
 
   it("reports a failed removal as today", async () => {
@@ -1018,7 +1154,7 @@ describe("the one-shot method", () => {
     if (r) d.script.push((a) => (a[0] === "start" ? r : undefined));
     const res = await d.once(SPEC);
     if (r) expect(res).toMatchObject(r);
-    expect(removed(d)).toEqual([["rm", "-f", d.created[0]!.id]]);
+    expect(removed(d)).toEqual([["rm", "-f", "-v", d.created[0]!.id]]);
     expect(d.containers.has(d.created[0]!.name)).toBe(false);
     expect(d.verbs.at(-1)).toBe("rm");
   });
@@ -1035,7 +1171,7 @@ describe("the one-shot method", () => {
     }
     const d = new StartThrows(loadConfig({}), TEST_INSTALLATION_ID);
     await expect(d.once(SPEC)).rejects.toThrow("spawn docker ENOENT");
-    expect(removed(d)).toEqual([["rm", "-f", d.created[0]!.id]]);
+    expect(removed(d)).toEqual([["rm", "-f", "-v", d.created[0]!.id]]);
   });
 
   it("treats 'No such container' from rm -f as success, and ignores any other rm failure", async () => {
@@ -1067,7 +1203,7 @@ describe("the one-shot method", () => {
     const create = d.argvs.find((a) => a[0] === "create")!;
     const name = create[create.indexOf("--name") + 1]!;
     expect(name).toMatch(NAME_SHAPE);
-    expect(d.argvs.filter((a) => a[0] === "rm")).toEqual([["rm", "-f", name]]);
+    expect(d.argvs.filter((a) => a[0] === "rm")).toEqual([["rm", "-f", "-v", name]]);
     expect(d.count("start")).toBe(0);
   });
 
@@ -1125,7 +1261,7 @@ describe("probe's container and volume labels", () => {
     d.script.push((a) => (a[0] === "start" ? { code: null as unknown as number, timedOut: true } : undefined));
     await expect(d.probe(REPO, V, { timeoutMs: 2000 })).rejects.toThrow(/^Could not clone https:\/\/github.com\/o\/r.git:\ntimed out after 2s$/);
     expect(d.containers.size).toBe(0);
-    expect(d.argvs.filter((a) => a[0] === "rm")).toEqual([["rm", "-f", d.created[0]!.id]]);
+    expect(d.argvs.filter((a) => a[0] === "rm")).toEqual([["rm", "-f", "-v", d.created[0]!.id]]);
   });
 
   it("still reports a failed clone's stderr and a clone with no commit", async () => {
@@ -1201,6 +1337,9 @@ describe("the guard cannot be skipped unnoticed", () => {
     "assertAvailable", "ensureImage", "sandboxName", "docker", "imagePath", "limits", "ask", "isNotThere", "unreadable",
     "inspectContainer", "inspectVolume", "containerFacts", "volumeFacts", "refuseUnless", "resolveContainer", "startId",
     "doesNotExist", "startIfStopped", "execOnce", "look", "rmContainer",
+    // Runtime leg: the check makes only its own trial container (through runOnce) and reads `docker info`; the comparison
+    // and the error mapping act on nothing they did not create or were not given (a facts object, a stderr text).
+    "assertRuntime", "checkRuntime", "refuseRuntimeMismatch", "runtimeRefusal",
     // Leg 6's private helpers of the guarded methods below (the name check, the volume creation, the role-aware volume check).
     "assertNameFree", "makeVolume", "requireVolumes",
     // Acts only on the one container it created itself, by the id `create` printed; the guarded table is for
@@ -1211,13 +1350,38 @@ describe("the guard cannot be skipped unnoticed", () => {
     "sweepCheckLeftovers",
     // Leg 7: only forms a name from the prefix, the installation id and random bytes; issues no Docker command.
     "stagingName",
+    // Leg 5 (contained networks). Every one acts only on an object this call made itself (a network, a proxy container or
+    // a one-shot, by the id or random name it was just given), on the proxy it just made (status, logs), or on nothing
+    // (the resolver cache, a text comparison); none takes a name a caller typed.
+    "createContainedNetwork", "readUpstreamResolvers", "invalidateResolvers", "readResolvers", "runBehindProxy", "runCreated",
+    "proxyStatus", "readRefusals", "lastLogLine", "startProxy", "awaitProxyReady", "dropNetwork", "dropContainer", "isNetworkNotThere",
+    // Leg 6 (project network primitives). Each acts only on objects it creates, or classifies itself by owner, role and
+    // name before it acts (a project's proxy or network, never a name a caller typed): the public ones are
+    // ensureProjectNetwork, attachProjectNetwork, createProjectProxy, startProjectProxy, removeProjectProxy,
+    // removeProjectNetwork and checkContainedNetwork (a pure judgement of an inspect); the private ones are their helpers.
+    "ensureProjectNetwork", "attachProjectNetwork", "createProjectProxy", "startProjectProxy", "removeProjectProxy",
+    "removeProjectNetwork", "checkContainedNetwork",
+    "createNetwork", "findContainedNetwork", "startAndAwait", "checkedProxy", "rmProxy", "rmNetwork", "networkLabels", "projectObjects",
+    "disconnectForce",
+    // Leg 7 (containment hook). The hook's own machinery acts on nothing in Docker: it holds a function, a cache and a
+    // clock, and calls the hook with facts it was given (`setContainment`, `invalidate`, `clock`, `hooked`, `hookCached`).
+    // `setNetworkNow` and `destroyNow` are the bodies of the guarded `setNetwork` and `destroy`, which call nothing else.
+    // `findProjectNetwork`, `projectProxyAttached` and `removeProjectProxyNamed` classify the project's network or proxy
+    // themselves, by owner, role and the sandbox's name (a read-only inspect for the first two).
+    "setContainment", "invalidate", "clock", "hooked", "hookCached", "setNetworkNow", "destroyNow",
+    "findProjectNetwork", "projectProxyAttached", "removeProjectProxyNamed",
   ];
   /**
    * Methods that report instead of refusing: they never throw and issue only read-only commands, which the
    * test below checks for each. A method that acts on a sandbox does not belong here, and the guarded table
    * above is where it is judged.
    */
-  const REPORTING = ["ownership"];
+  const STATE_REPORTERS = ["ownership"];
+  // listProjectProxies and projectProxyStatus report too, but they answer lists and status bodies, not a class: their
+  // own blocks ("project proxies") check what they ask and that they say nothing they were not told.
+  // Leg 8: projectRefusals reports too (the rows of a project's proxies' refusals; it lists and reads status, never throws).
+  // Leg 10: listOwnSandboxes reports too (this installation's sandboxes, from `ps` and one inspect each; it never throws for an absent one).
+  const REPORTING = [...STATE_REPORTERS, "listProjectProxies", "projectProxyStatus", "projectRefusals", "listOwnSandboxes"];
   const own = () =>
     Object.getOwnPropertyNames(Docker.prototype).filter((n) => n !== "constructor" && typeof Object.getOwnPropertyDescriptor(Docker.prototype, n)!.value === "function");
 
@@ -1233,10 +1397,10 @@ describe("the guard cannot be skipped unnoticed", () => {
     const REPORTS: Record<string, (d: ScriptedDocker) => Promise<unknown>> = { ownership: (d) => d.ownership(N) };
 
     it("has a case for every method of the list, and no case for a method outside it", () => {
-      expect(Object.keys(REPORTS).sort()).toEqual([...REPORTING].sort());
+      expect(Object.keys(REPORTS).sort()).toEqual([...STATE_REPORTERS].sort());
     });
 
-    it.each(REPORTING)("%s says the class of each kind of container, on a double that accepts only inspects", async (method) => {
+    it.each(STATE_REPORTERS)("%s says the class of each kind of container, on a double that accepts only inspects", async (method) => {
       for (const cls of ["mine", "before", "another", "not-ours"] as const) {
         const d = mk();
         d.strict = true;
@@ -1249,7 +1413,7 @@ describe("the guard cannot be skipped unnoticed", () => {
       }
     });
 
-    it.each(REPORTING)("%s says missing for a container that is not there, and unavailable (not missing) when Docker cannot say", async (method) => {
+    it.each(STATE_REPORTERS)("%s says missing for a container that is not there, and unavailable (not missing) when Docker cannot say", async (method) => {
       const gone = mk();
       gone.strict = true;
       expect(await REPORTS[method]!(gone)).toEqual({ state: "missing" });
@@ -1275,7 +1439,7 @@ describe("the guard cannot be skipped unnoticed", () => {
       expect(await REPORTS[method]!(new Throws(loadConfig({}), TEST_INSTALLATION_ID))).toEqual({ state: "unavailable" });
     });
 
-    it.each(REPORTING)("%s classifies with the function everything else uses: its answer for each label set is classifySandbox's", async (method) => {
+    it.each(STATE_REPORTERS)("%s classifies with the function everything else uses: its answer for each label set is classifySandbox's", async (method) => {
       const odd: Labels[] = [
         { "mcp-everything": "1", "mcp-everything.owner": "" },
         { "mcp-everything": "2" },
@@ -1327,16 +1491,21 @@ describe("the guard cannot be skipped unnoticed", () => {
         const ref = { id: idFor(`${N}-ref`), name: N };
         d.put(N, cls, { running: false, networks: ["bridge"] });
         d.containers.get(N)!.id = ref.id;
-        for (const f of [() => d.exec(ref, ["true"], OPTS), () => d.ensureRunning(ref), () => d.setNetwork(ref, false)]) await settle(f());
+        for (const f of [() => d.exec(ref, ["true"], OPTS), () => d.ensureRunning(ref), () => d.setNetwork(ref, "off")]) await settle(f());
         d.execReplies = [{ code: 1, stderr: DAEMON }];
         d.containers.get(N)!.running = false;
         await settle(d.exec(ref, ["true"], OPTS));
         for (const a of d.argvs) {
           let where: string | undefined;
-          if (a[0] === "exec") where = a[2] === "-w" ? a[4] : a[2];
-          else if (a[0] === "start") where = a.at(-1);
+          if (a[0] === "exec") {
+            // exec -i [-w <cwd>] [-e NAME=value]... <id> ...
+            let i = 2;
+            while (a[i] === "-w" || a[i] === "-e") i += 2;
+            where = a[i];
+          } else if (a[0] === "start") where = a.at(-1);
           else if (a[0] === "rm") where = a.at(-1);
-          else if (a[0] === "network") where = a.at(-1);
+          // Only the commands that act on a container: an inspect names a network by its (name-keyed) name.
+          else if (a[0] === "network" && ["connect", "disconnect", "rm"].includes(a[1]!)) where = a.at(-1);
           if (where === undefined) continue;
           seen.add(a[0]!);
           expect(where, `${cls} ${method}: ${a.join(" ")}`).toMatch(/^[0-9a-f]{64}$/);
@@ -2022,7 +2191,8 @@ describe("sweepCheckLeftovers", () => {
       }
     }
     const r = await new Throws(loadConfig({}), TEST_INSTALLATION_ID).sweepCheckLeftovers(0);
-    expect(r).toEqual({ removed: [], failures: 2 });
+    // Three listings now: containers, volumes and networks.
+    expect(r).toEqual({ removed: [], failures: 3 });
   });
 });
 
@@ -2034,5 +2204,2993 @@ describe("runScanner and copyVolume on volumes that are mine with their roles", 
     await d.runScanner(STAGING, SCANNER, { timeoutMs: 20_000 });
     await d.copyVolume(STAGING, TARGET);
     expect(d.count("create")).toBe(2);
+  });
+});
+
+describe("the required runtime", () => {
+  const RT = "runsc";
+  const named = () => mk({ MCPE_DOCKER_RUNTIME: RT });
+  const MESSAGE = (reason: string) =>
+    `MCPE_DOCKER_RUNTIME names ${RT}, but Docker cannot run containers with it (${reason}); install it and register it with Docker, or unset MCPE_DOCKER_RUNTIME.`;
+  const trialFails = (d: ScriptedDocker, r: Reply) => d.script.push((a) => (a[0] === "start" && a[1] === "-a" ? r : undefined));
+  const trialArgs = (d: ScriptedDocker) => d.created.find((c) => c.labels["mcp-everything.role"] === "runtime-check");
+
+  describe("assertRuntime", () => {
+    it("makes no Docker call and resolves when no runtime is named, and no path compares runtimes", async () => {
+      const d = mk();
+      d.put(N, "mine", { runtime: "runsc" });
+      await d.assertRuntime();
+      expect(d.argvs).toEqual([]);
+      await expect(d.acquire(N)).resolves.toMatchObject({ name: N });
+      await d.exec(N, ["true"], OPTS);
+      expect(await d.ensureRunning(N)).toBe(true);
+      expect(d.count("info")).toBe(0);
+    });
+
+    it("asks `docker info` first, then runs one trial container: role runtime-check, no network, the limits with the runtime, entrypoint true, no arguments", async () => {
+      const d = named();
+      await d.assertRuntime();
+      expect(d.argvs[0]).toEqual(["info", "--format", '{"runtimes":{{json .Runtimes}},"default":{{json .DefaultRuntime}}}']);
+      expect(d.verbs).toEqual(["info", "image inspect", "create", "start", "rm"]);
+      const t = trialArgs(d)!;
+      expect(t.args).toEqual(expect.arrayContaining(["--network", "none", "--runtime", RT, "--entrypoint", "true", "--cap-drop", "ALL"]));
+      expect(t.args.at(-1)).toBe(loadConfig({}).docker.probeImage);
+      expect(t.args[t.args.indexOf("--entrypoint") + 1]).toBe("true");
+      const start = d.argvs.findIndex((a) => a[0] === "start");
+      expect(d.optsList[start]).toMatchObject({ timeoutMs: 60_000 });
+    });
+
+    it("refuses when `docker info` lists no runtime of the name, with no trial", async () => {
+      const d = named();
+      d.infoRuntimes = ["runc", "nvidia"];
+      const e = await d.assertRuntime().catch((x: unknown) => x);
+      expect(e).toBeInstanceOf(RuntimeUnavailableError);
+      expect((e as Error).message).toBe(MESSAGE("Docker lists no runtime called runsc"));
+      expect(d.count("create")).toBe(0);
+    });
+
+    it("cleans the name in the message", async () => {
+      const d = mk({ MCPE_DOCKER_RUNTIME: "bad\nname" });
+      d.infoRuntimes = ["runc"];
+      await expect(d.assertRuntime()).rejects.toThrow(/names bad name,/);
+    });
+
+    it("refuses when the trial exits non-zero, with the first line of Docker's stderr (at most 200 characters)", async () => {
+      const d = named();
+      trialFails(d, { code: 127, stderr: `docker: Error response from daemon: OCI runtime create failed: ${"x".repeat(400)}\nsecond line\n` });
+      const e = (await d.assertRuntime().catch((x: unknown) => x)) as RuntimeUnavailableError;
+      expect(e).toBeInstanceOf(RuntimeUnavailableError);
+      expect(e.reason.length).toBeLessThanOrEqual(200);
+      expect(e.reason).toMatch(/^docker: Error response from daemon: OCI runtime create failed: x+/);
+      expect(e.message).not.toMatch(/second line/);
+    });
+
+    it("refuses when the trial exits non-zero with nothing on stderr, naming the exit code", async () => {
+      const d = named();
+      trialFails(d, { code: 3 });
+      await expect(d.assertRuntime()).rejects.toThrow(MESSAGE("a trial container exited with code 3"));
+    });
+
+    it("refuses when the trial times out", async () => {
+      const d = named();
+      trialFails(d, { code: null, timedOut: true });
+      await expect(d.assertRuntime()).rejects.toBeInstanceOf(RuntimeUnavailableError);
+      await expect(d.assertRuntime()).rejects.toThrow(/did not finish within 60 seconds/);
+    });
+
+    it("refuses, with the pull failure as the reason, when the probe image cannot be had", async () => {
+      const d = named();
+      d.script.push((a) => (a[0] === "image" ? { code: 1 } : a[0] === "pull" ? { code: 1, stderr: "no route to registry" } : undefined));
+      await expect(d.assertRuntime()).rejects.toThrow(/Failed to pull image .*no route to registry/);
+      expect(d.count("create")).toBe(0);
+    });
+
+    it("lets a Docker that cannot answer propagate as DockerUnavailableError, and caches nothing", async () => {
+      const d = named();
+      d.script.push((a) => (a[0] === "info" ? { code: 1, stderr: "Cannot connect to the Docker daemon" } : undefined));
+      await expect(d.assertRuntime()).rejects.toBeInstanceOf(DockerUnavailableError);
+      d.script.length = 0;
+      await expect(d.assertRuntime()).resolves.toBeUndefined();
+    });
+
+    it("caches a success for the process", async () => {
+      const d = named();
+      await d.assertRuntime();
+      await d.assertRuntime();
+      expect(d.count("info")).toBe(1);
+      expect(d.created.length).toBe(1);
+    });
+
+    it("does not cache a failure: the next call asks again", async () => {
+      const d = named();
+      d.infoRuntimes = ["runc"];
+      await expect(d.assertRuntime()).rejects.toBeInstanceOf(RuntimeUnavailableError);
+      d.infoRuntimes = ["runc", RT];
+      await expect(d.assertRuntime()).resolves.toBeUndefined();
+      expect(d.count("info")).toBe(2);
+    });
+
+    it("shares one in-flight check between simultaneous callers: one info, one trial", async () => {
+      const d = named();
+      await Promise.all([d.assertRuntime(), d.assertRuntime(), d.assertRuntime()]);
+      expect(d.count("info")).toBe(1);
+      expect(d.created.length).toBe(1);
+    });
+
+    it("gives every simultaneous caller the same refusal", async () => {
+      const d = named();
+      d.infoRuntimes = ["runc"];
+      const r = await Promise.allSettled([d.assertRuntime(), d.assertRuntime()]);
+      expect(r.map((x) => x.status)).toEqual(["rejected", "rejected"]);
+      expect(d.count("info")).toBe(1);
+    });
+  });
+
+  describe("where it is called", () => {
+    it("runOnce for a clone-like role checks first; the trial itself does not recurse", async () => {
+      const d = named();
+      d.putVolume(STAGING, "mine", "staging");
+      d.putVolume(TARGET, "mine");
+      await d.copyVolume(STAGING, TARGET);
+      expect(d.count("info")).toBe(1);
+      expect(d.created.map((c) => c.labels["mcp-everything.role"])).toEqual(["runtime-check", "copy"]);
+      expect(d.verbs.indexOf("info")).toBeLessThan(d.verbs.indexOf("create"));
+    });
+
+    it("a refused check creates no container for the one-shot", async () => {
+      const d = named();
+      d.infoRuntimes = ["runc"];
+      d.putVolume(STAGING, "mine", "staging");
+      d.putVolume(TARGET, "mine");
+      await expect(d.copyVolume(STAGING, TARGET)).rejects.toBeInstanceOf(RuntimeUnavailableError);
+      expect(d.count("create")).toBe(0);
+    });
+
+    it("createContainer checks before its volume checks, and refuses without running", async () => {
+      const d = named();
+      d.infoRuntimes = ["runc"];
+      await expect(d.createContainer({ name: "n", volume: "v", image: "img", project: "p" })).rejects.toBeInstanceOf(RuntimeUnavailableError);
+      expect(d.verbs).toEqual(["info"]);
+    });
+
+    it("only assertRuntime's trial uses the runtime-check role", () => {
+      const src = fs.readFileSync(path.join(__dirname, "../src/sandbox/docker.ts"), "utf8");
+      expect(src.match(/role: "runtime-check"/g)).toHaveLength(1);
+      expect(src.slice(src.indexOf("private async checkRuntime"))).toContain('role: "runtime-check"');
+      expect(src).toContain('spec.role !== "runtime-check"');
+    });
+
+    it("a trial container left behind by a killed process is swept like a clone", async () => {
+      const d = mk();
+      const id = "7".repeat(64);
+      const old = new Date(Date.now() - 2 * 3600_000).toISOString();
+      d.script.push((a) => {
+        if (a[0] === "ps") return { stdout: `${id}\n` };
+        if (a[0] === "volume" && a[1] === "ls") return { stdout: "" };
+        // A one-shot has no project label (the sweep never takes anything that has one), so these are not LABELS.mine.
+        if (a[0] === "inspect") return { stdout: JSON.stringify({ id, labels: { "mcp-everything": "1", "mcp-everything.owner": TEST_INSTALLATION_ID, "mcp-everything.role": "runtime-check" }, created: old }) };
+        return undefined;
+      });
+      const r = await d.sweepCheckLeftovers(3600);
+      expect(r).toEqual({ removed: [id], failures: 0 });
+    });
+  });
+
+  describe("Docker's own refusal of an unknown runtime", () => {
+    const unknown = (r: string) => `docker: Error response from daemon: unknown or invalid runtime name: ${r}.\n`;
+    const copyFails = (d: ScriptedDocker, stderr: string) =>
+      d.script.push((a) => (a[0] === "create" && a.includes("mcp-everything.role=copy") ? { code: 125, stderr } : undefined));
+    const copy = (d: ScriptedDocker) => {
+      d.putVolume(STAGING, "mine", "staging");
+      d.putVolume(TARGET, "mine");
+      return d.copyVolume(STAGING, TARGET);
+    };
+
+    it("is mapped on create, and the cached success is cleared so the next call checks again", async () => {
+      const d = named();
+      await d.assertRuntime();
+      copyFails(d, unknown(RT));
+      const e = (await copy(d).catch((x: unknown) => x)) as RuntimeUnavailableError;
+      expect(e).toBeInstanceOf(RuntimeUnavailableError);
+      expect(e.message).toBe(MESSAGE(e.reason));
+      expect(e.reason).toMatch(/unknown or invalid runtime name: runsc/);
+      d.script.length = 0;
+      await d.assertRuntime();
+      expect(d.count("info")).toBe(2);
+    });
+
+    it("is not mapped when the line names another runtime, or says something else (a bad entrypoint is not a runtime refusal)", async () => {
+      for (const stderr of [unknown("other"), "docker: Error response from daemon: OCI runtime create failed: runc create failed: exec: \"x\": executable file not found\n"]) {
+        const d = named();
+        copyFails(d, stderr);
+        const e = (await copy(d).catch((x: unknown) => x)) as Error;
+        expect(e).not.toBeInstanceOf(RuntimeUnavailableError);
+        expect(e.message).toMatch(/^Could not create the copy container/);
+        await d.assertRuntime();
+        expect(d.count("info")).toBe(1);
+      }
+    });
+
+    it("is mapped on `docker run` in createContainer", async () => {
+      const d = named();
+      d.putVolume("v", "mine");
+      d.script.push((a) => (a[0] === "run" ? { code: 125, stderr: unknown(RT) } : undefined));
+      await expect(d.createContainer({ name: "n", volume: "v", image: "img", project: "p" })).rejects.toBeInstanceOf(RuntimeUnavailableError);
+      d.script.length = 0;
+      await d.assertRuntime();
+      expect(d.count("info")).toBe(2);
+    });
+
+    it("is not mapped when no runtime is named", async () => {
+      const d = mk();
+      copyFails(d, unknown(RT));
+      await expect(copy(d)).rejects.toThrow(/^Could not create the copy container/);
+    });
+  });
+
+  describe("an existing sandbox under another runtime", () => {
+    const MISMATCH = (actual: string) =>
+      `Sandbox ${N} was created before MCPE_DOCKER_RUNTIME=${RT} was set; Docker reports its runtime as ${actual}. Reinstall the project to run it under ${RT}.`;
+
+    it("acquire refuses a runc sandbox when runsc is named, running or stopped, and starts nothing", async () => {
+      for (const running of [true, false]) {
+        const d = named();
+        d.put(N, "mine", { running, runtime: "runc" });
+        await expect(d.acquire(N)).rejects.toThrow(MISMATCH("runc"));
+        await expect(d.acquire(N)).rejects.toBeInstanceOf(RuntimeMismatchError);
+        expect(d.count("start")).toBe(0);
+      }
+    });
+
+    it("acquire accepts a sandbox under the named runtime and starts a stopped one", async () => {
+      const d = named();
+      d.put(N, "mine", { running: false, runtime: RT });
+      await expect(d.acquire(N)).resolves.toMatchObject({ name: N });
+      expect(d.count("start")).toBe(1);
+    });
+
+    it("reads the runtime in both inspect formats", async () => {
+      const d = named();
+      d.put(N, "mine", { runtime: RT });
+      await d.acquire(N);
+      await d.exec(N, ["true"], OPTS);
+      const formats = d.argvs.filter((a) => a[0] === "inspect").map((a) => a[a.indexOf("--format") + 1]!);
+      expect(formats.length).toBeGreaterThan(0);
+      for (const f of formats) expect(f).toContain('"runtime":{{json .HostConfig.Runtime}}');
+      const base = loadConfig({});
+      expect(base.docker.runtime).toBeUndefined();
+    });
+
+    it("exec by name refuses before execing", async () => {
+      const d = named();
+      d.put(N, "mine", { runtime: "runc" });
+      await expect(d.exec(N, ["true"], OPTS)).rejects.toBeInstanceOf(RuntimeMismatchError);
+      expect(d.execs).toEqual([]);
+    });
+
+    it("ensureRunning refuses by name and by reference, and starts nothing", async () => {
+      const d = named();
+      const id = d.put(N, "mine", { running: false, runtime: "runc" });
+      await expect(d.ensureRunning(N)).rejects.toBeInstanceOf(RuntimeMismatchError);
+      await expect(d.ensureRunning({ id, name: N })).rejects.toBeInstanceOf(RuntimeMismatchError);
+      expect(d.count("start")).toBe(0);
+    });
+
+    it("the idle-timeout restart of an exec on a reference meets the mismatch and throws it, not the exec's failure", async () => {
+      const d = named();
+      const id = d.put(N, "mine", { running: false, runtime: "runc" });
+      d.execReplies = [{ code: 1, stderr: DAEMON }];
+      await expect(d.exec({ id, name: N }, ["true"], OPTS)).rejects.toBeInstanceOf(RuntimeMismatchError);
+      expect(d.count("start")).toBe(0);
+    });
+
+    it("a missing, null or empty runtime counts as the daemon's default: runc until info answers, then DefaultRuntime", async () => {
+      for (const runtime of [undefined, null, ""]) {
+        const d = mk({ MCPE_DOCKER_RUNTIME: "runc" });
+        d.put(N, "mine", { runtime });
+        await expect(d.acquire(N), String(runtime)).resolves.toMatchObject({ name: N });
+      }
+      const d = named();
+      d.infoDefault = RT;
+      await d.assertRuntime();
+      d.put(N, "mine");
+      await expect(d.acquire(N)).resolves.toMatchObject({ name: N });
+      const e = named();
+      e.put(N, "mine");
+      await expect(e.acquire(N)).rejects.toThrow(MISMATCH("runc"));
+    });
+
+    it("an operator naming the shim is refused on a sandbox Docker reports as runc", async () => {
+      const d = mk({ MCPE_DOCKER_RUNTIME: "io.containerd.runc.v2" });
+      d.put(N, "mine", { runtime: "runc" });
+      await expect(d.acquire(N)).rejects.toThrow(/Docker reports its runtime as runc/);
+    });
+
+    it("destroy, removeContainer, ownership, state, networkState and setNetwork do not compare", async () => {
+      const d = named();
+      d.put(N, "mine", { runtime: "runc", networks: ["bridge"] });
+      d.putVolume(V, "mine");
+      expect(await d.ownership(N)).toEqual({ state: "mine" });
+      expect(await d.state(N)).toBe("running");
+      expect(await d.networkState(N)).toBe("open");
+      await d.setNetwork(N, "off");
+      expect(await d.networkState(N)).toBe("off");
+      await d.removeContainer(N);
+      d.put(N, "mine", { runtime: "runc" });
+      await d.destroy(N, V);
+      expect(d.containers.has(N)).toBe(false);
+      expect(d.volumes.has(V)).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Contained networks and the one-shot proxy (flight 02, leg 5)
+// ---------------------------------------------------------------------------
+const ID = TEST_INSTALLATION_ID;
+const OWNER_L = "mcp-everything.owner";
+const ROLE_L = "mcp-everything.role";
+const PROJECT_L = "mcp-everything.project";
+const sub = (a: string[], flag: string) => a.flatMap((x, i) => (x === flag ? [a[i + 1]!] : []));
+const lastLine = (e: unknown) => (e as Error).message;
+
+/** A `network inspect` answer, with fields overridden. */
+const netJson = (id: string, over: Record<string, unknown> = {}) =>
+  JSON.stringify({ id, internal: true, ipv6: false, ipam: [{ Subnet: "172.30.9.0/24" }], labels: { [OWNER_L]: ID, [ROLE_L]: "oneshot-net" }, created: "x", ...over });
+const inspectNet = (over: Record<string, unknown>) => (a: string[]) => (a[0] === "network" && a[1] === "inspect" ? { stdout: netJson(a.at(-1)!, over) } : undefined);
+
+describe("the network wording of 'not there'", () => {
+  it.each(["Error response from daemon: network abc not found", "Error: No such network: abc", "Error response from daemon: network mcpe-x-oneshot-net-1234 not found"])(
+    "a network that is gone (%s) is skipped by the sweep, not counted",
+    async (stderr) => {
+      const d = mk();
+      const id = "a".repeat(64);
+      d.script.push((a) => (a[0] === "network" && a[1] === "ls" ? { stdout: `${id}\n` } : a[0] === "network" && a[1] === "inspect" ? { code: 1, stderr } : undefined));
+      expect(await d.sweepCheckLeftovers(0)).toEqual({ removed: [], failures: 0 });
+    },
+  );
+
+  it("containers and volumes keep the narrower pattern: the network wording is 'could not be asked' for a container", async () => {
+    const d = mk();
+    d.script.push((a) => (a[0] === "inspect" ? { code: 1, stderr: "Error response from daemon: network abc not found" } : undefined));
+    expect(await d.ownership(N)).toEqual({ state: "unavailable" });
+    d.script.length = 0;
+    d.script.push((a) => (a[0] === "inspect" ? { code: 1, stderr: "Error response from daemon: No such container: x" } : undefined));
+    expect(await d.ownership(N)).toEqual({ state: "missing" });
+  });
+});
+
+describe("createContainedNetwork", () => {
+  it("creates with the isolated, internal, no-IPv6 flags and the owner and role labels, then inspects by id", async () => {
+    const d = mk();
+    const n = await d.createContainedNetwork({ role: "oneshot-net" });
+    const create = d.argvs.find((a) => a[0] === "network" && a[1] === "create")!;
+    const name = create.at(-1)!;
+    expect(name).toMatch(new RegExp(`^mcpe-${ID}-oneshot-net-[0-9a-f]{8}$`));
+    expect(create.slice(0, -1)).toEqual([
+      "network", "create", "--internal", "-o", "com.docker.network.bridge.gateway_mode_ipv4=isolated", "--ipv6=false",
+      "--label", `${OWNER_L}=${ID}`, "--label", `${ROLE_L}=oneshot-net`,
+    ]);
+    const inspect = d.argvs.find((a) => a[0] === "network" && a[1] === "inspect")!;
+    expect(inspect.slice(0, 3)).toEqual(["network", "inspect", "--format"]);
+    for (const f of ["json .Id", "json .Internal", "json .EnableIPv6", "json .IPAM.Config", "json .Labels", "json .Created"]) expect(inspect[3]).toContain(f);
+    expect(inspect[4]).toBe(n.id);
+    expect(n).toEqual({ id: idFor(`net:${name}`), name, subnet: "172.30.1.0/24" });
+    expect(d.networks.size).toBe(1);
+  });
+
+  it("uses a name it is given and adds the project label when it has one (leg 6)", async () => {
+    const d = mk();
+    const n = await d.createContainedNetwork({ role: "project-net", name: "mcpe-0123abcd-gron-net", project: "gron" });
+    const create = d.argvs.find((a) => a[0] === "network" && a[1] === "create")!;
+    expect(n.name).toBe("mcpe-0123abcd-gron-net");
+    expect(create.at(-1)).toBe("mcpe-0123abcd-gron-net");
+    expect(sub(create, "--label")).toEqual([`${OWNER_L}=${ID}`, `${ROLE_L}=project-net`, `${PROJECT_L}=gron`]);
+  });
+
+  it("times out: removes by the random name, tolerantly, and throws", async () => {
+    const d = mk();
+    d.script.push((a) => (a[0] === "network" && a[1] === "create" ? { code: null as unknown as number, timedOut: true } : undefined));
+    d.script.push((a) => (a[0] === "network" && a[1] === "rm" ? { code: 1, stderr: "Error: whatever" } : undefined));
+    const e = await settle(d.createContainedNetwork({ role: "oneshot-net" }));
+    expect(e).toBeInstanceOf(DockerUnavailableError);
+    const name = d.argvs.find((a) => a[1] === "create")!.at(-1)!;
+    expect(d.argvs.filter((a) => a[0] === "network" && a[1] === "rm")).toEqual([["network", "rm", name]]);
+    expect(d.count("network inspect")).toBe(0);
+  });
+
+  it("fails with the cleaned last line of a non-zero exit, and removes nothing", async () => {
+    const d = mk();
+    d.script.push((a) => (a[0] === "network" && a[1] === "create" ? { code: 1, stderr: "warning\nError response from daemon: \u001b[31mboom\u001b[0m happened\n" } : undefined));
+    const e = await settle(d.createContainedNetwork({ role: "oneshot-net" }));
+    expect(e).toBeInstanceOf(ContainmentUnavailableError);
+    expect(lastLine(e)).toBe("Could not create the contained network: Error response from daemon: boom happened");
+    expect(d.count("network rm") + d.count("network inspect")).toBe(0);
+  });
+
+  it("maps an exhausted address pool to ContainmentUnavailableError naming default-address-pools (DD15)", async () => {
+    const d = mk();
+    d.script.push((a) => (a[0] === "network" && a[1] === "create" ? { code: 1, stderr: "Error response from daemon: all predefined address pools have been fully subnetted\n" } : undefined));
+    const e = await settle(d.createContainedNetwork({ role: "oneshot-net" }));
+    expect(e).toBeInstanceOf(ContainmentUnavailableError);
+    expect(lastLine(e)).toContain("default-address-pools");
+  });
+
+  it.each([["nothing", ""], ["a short id", "abc123\n"], ["capitals", `${"A".repeat(64)}\n`], ["two ids", `${"a".repeat(64)}\n${"b".repeat(64)}\n`]])(
+    "removes by the random name and throws when create printed %s",
+    async (_n, out) => {
+      const d = mk();
+      d.script.push((a) => (a[0] === "network" && a[1] === "create" ? { stdout: out } : undefined));
+      const e = await settle(d.createContainedNetwork({ role: "oneshot-net" }));
+      expect(e).toBeInstanceOf(DockerUnavailableError);
+      const name = d.argvs.find((a) => a[1] === "create")!.at(-1)!;
+      expect(d.argvs.filter((a) => a[0] === "network" && a[1] === "rm")).toEqual([["network", "rm", name]]);
+    },
+  );
+
+  it.each([
+    ["fails", { code: 1, stderr: "Cannot connect to the Docker daemon" }],
+    ["times out", { code: null as unknown as number, timedOut: true }],
+    ["answers nonsense", { stdout: "not json" }],
+    ["answers a number", { stdout: "5" }],
+  ])("removes by id and throws DockerUnavailableError when the inspect %s", async (_n, r) => {
+    const d = mk();
+    d.script.push((a) => (a[0] === "network" && a[1] === "inspect" ? r : undefined));
+    const e = await settle(d.createContainedNetwork({ role: "oneshot-net" }));
+    expect(e).toBeInstanceOf(DockerUnavailableError);
+    const rm = d.argvs.filter((a) => a[0] === "network" && a[1] === "rm");
+    expect(rm).toHaveLength(1);
+    expect(rm[0]!.at(-1)).toMatch(/^[0-9a-f]{64}$/);
+    expect(d.networks.size).toBe(0);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ["not internal", { internal: false }],
+    ["an answer about another network", { id: "b".repeat(64) }],
+    ["IPv6 on", { ipv6: true }],
+    ["a gateway", { ipam: [{ Subnet: "172.30.9.0/24", Gateway: "172.30.9.1" }] }],
+    ["a gateway in a second entry", { ipam: [{ Subnet: "172.30.9.0/24" }, { Gateway: "172.30.9.1" }] }],
+    ["two IPv4 subnets", { ipam: [{ Subnet: "172.30.9.0/24" }, { Subnet: "172.31.9.0/24" }] }],
+    ["no subnet", { ipam: [] }],
+    ["null IPAM", { ipam: null }],
+    ["an IPv6 subnet only", { ipam: [{ Subnet: "fd00::/64" }] }],
+    ["another owner's label", { labels: { [OWNER_L]: OTHER_ID } }],
+    ["no owner label", { labels: {} }],
+    ["null labels", { labels: null }],
+  ])("removes the network by id and throws ContainmentUnavailableError that says what was wrong: %s", async (_n, over) => {
+    const d = mk();
+    d.script.push(inspectNet(over));
+    const e = await settle(d.createContainedNetwork({ role: "oneshot-net" }));
+    expect(e).toBeInstanceOf(ContainmentUnavailableError);
+    const msg = lastLine(e);
+    expect(msg).toContain("not contained");
+    expect(msg).toContain("a Docker version whose bridge driver supports gateway_mode_ipv4=isolated");
+    // No version number from memory.
+    expect(msg).not.toMatch(/\b\d+\.\d+/);
+    const created = d.argvs.find((a) => a[1] === "create")!.at(-1)!;
+    expect(d.argvs.filter((a) => a[0] === "network" && a[1] === "rm")).toEqual([["network", "rm", idFor(`net:${created}`)]]);
+    expect(d.networks.size).toBe(0);
+  });
+
+  it("never falls back to bridge: no failure leaves a `bridge` network command or flag", async () => {
+    const d = mk();
+    d.script.push(inspectNet({ internal: false }));
+    await settle(d.createContainedNetwork({ role: "oneshot-net" }));
+    for (const a of d.argvs) expect(a).not.toContain("bridge");
+  });
+
+  it("accepts a gateway key that is empty", async () => {
+    const d = mk();
+    d.script.push(inspectNet({ ipam: [{ Subnet: "172.30.9.0/24", Gateway: "" }] }));
+    expect((await d.createContainedNetwork({ role: "oneshot-net" })).subnet).toBe("172.30.9.0/24");
+  });
+});
+
+describe("upstream resolvers", () => {
+  it.each<[string, string[]]>([
+    ["nameserver 10.0.0.2\n", ["10.0.0.2"]],
+    ["nameserver 127.0.0.11\nnameserver 8.8.8.8\n", ["8.8.8.8"]],
+    ["nameserver fd00::1\nnameserver 10.0.0.2\n", ["10.0.0.2", "fd00::1"]],
+    ["nameserver ::1\nnameserver 127.0.0.53\nnameserver 0.0.0.0\n", []],
+    ["nameserver fe80::1%eth0\nnameserver 1.1.1.1\n", ["1.1.1.1"]],
+    ["# nameserver 1.2.3.4\nsearch x\noptions ndots:0\nnameserver not-an-ip\nnameserver 999.1.1.1\n", []],
+    ["nameserver 1.1.1.1 # note\nnameserver 1.1.1.1\r\nnameserver\t9.9.9.9\r\n", ["1.1.1.1", "9.9.9.9"]],
+    ["", []],
+  ])("parses %j", (text, expected) => {
+    expect(parseResolvConf(text)).toEqual(expected);
+  });
+
+  it("reads them from a one-shot on bridge with the probe image, entrypoint cat and /etc/resolv.conf", async () => {
+    const d = mk();
+    d.resolvConf = "nameserver 127.0.0.11\nnameserver 192.0.2.7\nnameserver 2001:db8::7\n";
+    expect(await d.readUpstreamResolvers()).toEqual(["192.0.2.7", "2001:db8::7"]);
+    const c = d.created[0]!;
+    expect(c.labels[ROLE_L]).toBe("resolv-read");
+    expect(c.name).toMatch(new RegExp(`^mcpe-${ID}-resolv-read-[0-9a-f]{8}$`));
+    expect(sub(c.args, "--network")).toEqual(["bridge"]);
+    expect(c.args.slice(c.args.indexOf("--entrypoint"), c.args.indexOf("--entrypoint") + 2)).toEqual(["--entrypoint", "cat"]);
+    expect(c.args.slice(-2)).toEqual([loadConfig({}).docker.probeImage, "/etc/resolv.conf"]);
+    expect(d.containers.size).toBe(0);
+  });
+
+  it("throws ContainmentUnavailableError for no usable server, and does not cache the failure", async () => {
+    const d = mk();
+    d.resolvConf = "nameserver 127.0.0.11\n";
+    const e = await settle(d.readUpstreamResolvers());
+    expect(e).toBeInstanceOf(ContainmentUnavailableError);
+    expect(lastLine(e)).toContain("no usable upstream DNS server");
+    d.resolvConf = "nameserver 192.0.2.9\n";
+    expect(await d.readUpstreamResolvers()).toEqual(["192.0.2.9"]);
+    expect(d.created).toHaveLength(2);
+  });
+
+  it("says Docker could not be asked when the read fails or times out", async () => {
+    for (const r of [{ code: 1, stderr: "cat: can't open\n" }, { code: null as unknown as number, timedOut: true }]) {
+      const d = mk();
+      d.script.push((a) => (a[0] === "start" ? r : undefined));
+      expect(await settle(d.readUpstreamResolvers())).toBeInstanceOf(DockerUnavailableError);
+    }
+  });
+
+  it("caches per instance, shares one in-flight read, and invalidateResolvers clears it", async () => {
+    const d = mk();
+    const [a, b] = await Promise.all([d.readUpstreamResolvers(), d.readUpstreamResolvers()]);
+    expect(a).toEqual(b);
+    expect(d.created).toHaveLength(1);
+    a.push("1.2.3.4");
+    expect(await d.readUpstreamResolvers()).toEqual(["192.0.2.53"]);
+    expect(d.created).toHaveLength(1);
+    d.invalidateResolvers();
+    d.resolvConf = "nameserver 192.0.2.54\n";
+    expect(await d.readUpstreamResolvers()).toEqual(["192.0.2.54"]);
+    expect(d.created).toHaveLength(2);
+    // another instance has its own cache
+    const other = mk();
+    await other.readUpstreamResolvers();
+    expect(other.created).toHaveLength(1);
+  });
+});
+
+describe("the roles of one-shot containers", () => {
+  it("OneShotRole and ONE_SHOT_ROLES list the same container roles, and the new ones are in", () => {
+    expect([...ONE_SHOT_ROLES].sort()).toEqual(["clone", "copy", "oneshot-proxy", "resolv-read", "runtime-check", "scan"]);
+  });
+  it.each([...ONE_SHOT_ROLES])("runOnce accepts the role %s and names and labels by it", async (role) => {
+    const d = mkOnce();
+    await d.once({ ...SPEC, role });
+    expect(d.created[0]!.labels[ROLE_L]).toBe(role);
+    expect(d.created[0]!.name).toMatch(new RegExp(`^mcpe-${ID}-${role}-[0-9a-f]{8}$`));
+  });
+  it("the source's type is derived from the list, so a role cannot be in one and not the other", () => {
+    const src = fs.readFileSync(path.join(__dirname, "../src/sandbox/docker.ts"), "utf8");
+    expect(src).toContain("export type OneShotRole = (typeof ONE_SHOT_ROLES)[number];");
+  });
+});
+
+/** A double whose proxy gives up quickly, so that "out of budget" does not take ten seconds. */
+class EgressDocker extends OneShotDocker {
+  protected override proxyReadiness = { budgetMs: 250, pollMs: 5 };
+}
+const mkEgress = (env: Record<string, string> = {}) => new EgressDocker(loadConfig(env), TEST_INSTALLATION_ID);
+/** The contained network a finished call made (it is gone from the double by then): its name, id and subnet, from the commands that were issued. */
+const netOf = (d: EgressDocker) => {
+  const create = d.argvs.find((a) => a[0] === "network" && a[1] === "create")!;
+  const name = create.at(-1)!;
+  const proxyCreate = d.argvs.find(isProxyCreate);
+  const cidr = proxyCreate ? (JSON.parse(proxyCreate.at(-1)!) as { listenCidr: string }).listenCidr : "";
+  return { name, id: idFor(`net:${name}`), cidr };
+};
+/** Throws, as a missing binary does, on the commands `on` picks. */
+class ThrowsOn extends EgressDocker {
+  on: (a: string[]) => boolean = () => false;
+  protected override async docker(args: string[], opts?: RunOptions) {
+    if (this.on(args)) {
+      this.argvs.push(args);
+      throw new Error("spawn docker ENOENT");
+    }
+    return super.docker(args, opts);
+  }
+}
+const ALLOW = [{ host: "github.com", wildcard: false, ports: [443, 80], literal: false }];
+const EGRESS: OneShotSpec = { role: "clone", image: "img:1", egress: { allow: ALLOW }, args: ["git", "ls-remote"], timeoutMs: 1234, maxBytes: 5678 };
+const isProxyCreate = (a: string[]) => a[0] === "create" && a.includes("--read-only");
+const isOneShotCreate = (a: string[]) => a[0] === "create" && !a.includes("--read-only") && a.includes("img:1");
+const roleOf = (d: EgressDocker, id: string | undefined) => [...d.containers.values()].find((c) => c.id === id)?.labels?.[ROLE_L];
+/** The attached start of the call's own (clone) one-shot; the resolver read's start is attached too, with the role resolv-read. */
+const isOneShotStart = (d: EgressDocker, a: string[]) => a[0] === "start" && a[1] === "-a" && roleOf(d, a.at(-1)) === "clone";
+const ROW = { kind: "connect", host: "example.com", port: 443, reason: "not-allowed", count: 2, firstAt: "2026-01-01T00:00:00.000Z", lastAt: "2026-01-01T00:00:05.000Z" };
+/** A script entry that fails the one-shot's own `start -a` (not the resolver read's: that one has the role resolv-read). */
+const failRun = (d: EgressDocker, reply: Reply) => d.script.push((a) => (isOneShotStart(d, a) ? reply : undefined));
+const clean = (d: EgressDocker) => {
+  expect([...d.containers.keys()]).toEqual([]);
+  expect([...d.networks.keys()]).toEqual([]);
+};
+
+describe("a one-shot behind its proxy", () => {
+  it("does everything in the order of the design: images, resolvers, network, proxy (create, join, start, ready), one-shot, teardown", async () => {
+    const d = mkEgress();
+    d.startOutput = "ok\n";
+    const r = await d.once(EGRESS);
+    expect(r).toEqual({ code: 0, stdout: "ok\n", stderr: "", timedOut: false, truncated: false });
+    expect("proxy" in r).toBe(false);
+    expect(d.verbs).toEqual([
+      "image inspect", "image inspect", // the proxy image and the one-shot's
+      "image inspect", "create", "start", "rm", // the probe image, the resolver read
+      "network create", "network inspect",
+      "create", "network connect", "start", "inspect", "exec", // the proxy: created, joined before it starts, started, ready
+      "create", "start", "rm", // the one-shot
+      "rm", "network rm", // teardown: proxy, network
+    ]);
+    const images = d.argvs.filter((a) => a[0] === "image").map((a) => a.at(-1));
+    expect(images).toEqual([loadConfig({}).docker.proxyImage, "img:1", loadConfig({}).docker.probeImage]);
+    clean(d);
+  });
+
+  it("creates the proxy hardened: bridge, limits, no capabilities, node user, read-only, a small tmpfs, no ports", async () => {
+    const d = mkEgress();
+    const cfg = loadConfig({});
+    await d.once(EGRESS);
+    const pc = d.argvs.find(isProxyCreate)!;
+    const name = sub(pc, "--name")[0]!;
+    expect(name).toMatch(new RegExp(`^mcpe-${ID}-oneshot-proxy-[0-9a-f]{8}$`));
+    expect(pc[0]).toBe("create");
+    expect(pc).not.toContain("--rm");
+    expect(sub(pc, "--label")).toEqual(["mcp-everything=1", `${OWNER_L}=${ID}`, `${ROLE_L}=oneshot-proxy`]);
+    for (const f of ["--memory", "--cpus", "--pids-limit", "--security-opt"]) expect(pc).toContain(f);
+    expect(sub(pc, "--security-opt")).toEqual(["no-new-privileges"]);
+    expect(sub(pc, "--cap-drop")).toEqual(["ALL"]);
+    expect(pc).not.toContain("--cap-add");
+    expect(sub(pc, "--user")).toEqual(["node"]);
+    expect(pc).toContain("--read-only");
+    expect(sub(pc, "--tmpfs")).toEqual(["/tmp:size=8m"]);
+    expect(sub(pc, "--network")).toEqual(["bridge"]);
+    for (const bad of ["-p", "--publish", "-P", "--privileged", "host"]) expect(pc).not.toContain(bad);
+    expect(sub(pc, "--entrypoint")).toEqual(["node"]);
+    const net = netOf(d);
+    expect(net.cidr).toBe("172.30.1.0/24");
+    const launch = proxyLaunchArgs(proxyConfig({ allow: ALLOW, listenCidr: net.cidr, resolvers: ["192.0.2.53"], limits: { bindWaitMs: 3000 } }));
+    // The image, then the program's three arguments, exactly: an argv array and never a shell.
+    expect(pc.slice(pc.indexOf(cfg.docker.proxyImage))).toEqual([cfg.docker.proxyImage, ...launch]);
+    expect(launch[0]).toBe("-e");
+    const conf = JSON.parse(launch[2]!) as Record<string, unknown>;
+    expect(conf).toMatchObject({ listenCidr: "172.30.1.0/24", port: 3128, controlPort: 3129, version: "1", resolvers: ["192.0.2.53"], limits: { bindWaitMs: 3000 } });
+    expect(conf.allow).toEqual([{ host: "github.com", wildcard: false, ports: [443, 80], literal: false, local: false }]);
+    expect(pc.join(" ")).not.toContain("sh -c");
+  });
+
+  it("passes local through to every entry of the proxy's configuration", async () => {
+    const d = mkEgress();
+    await d.once({ ...EGRESS, egress: { allow: ALLOW, local: true } });
+    const conf = JSON.parse(d.argvs.find(isProxyCreate)!.at(-1)!) as { allow: Array<{ local: boolean }> };
+    expect(conf.allow.map((e) => e.local)).toEqual([true]);
+  });
+
+  it("joins the contained network under the alias before it starts, and starts it by id", async () => {
+    const d = mkEgress();
+    await d.once(EGRESS);
+    const proxyId = d.created.find((c) => c.labels[ROLE_L] === "oneshot-proxy")!.id;
+    const net = netOf(d);
+    const connect = d.argvs.findIndex((a) => a[0] === "network" && a[1] === "connect");
+    const start = d.argvs.findIndex((a) => a[0] === "start" && a[1] === proxyId);
+    expect(d.argvs[connect]).toEqual(["network", "connect", "--alias", "mcpe-proxy", net.id, proxyId]);
+    expect(d.argvs[start]).toEqual(["start", proxyId]);
+    expect(connect).toBeLessThan(start);
+  });
+
+  it("runs the one-shot on the contained network with the proxy variables, and nothing else changes in its create", async () => {
+    const d = mkEgress();
+    await d.once({ ...EGRESS, mounts: ["vol:/workspace"], entrypoint: "sh" });
+    const c = d.argvs.find(isOneShotCreate)!;
+    const net = netOf(d);
+    expect(sub(c, "--network")).toEqual([net.name]);
+    expect(sub(c, "-e")).toEqual([
+      "HTTP_PROXY=http://mcpe-proxy:3128", "HTTPS_PROXY=http://mcpe-proxy:3128", "http_proxy=http://mcpe-proxy:3128", "https_proxy=http://mcpe-proxy:3128",
+      "NO_PROXY=", "NODE_USE_ENV_PROXY=1",
+    ]);
+    expect(c.slice(0, 3)).toEqual(["create", "--rm", "--name"]);
+    expect(sub(c, "-v")).toEqual(["vol:/workspace"]);
+    expect(c.slice(-4)).toEqual(["sh", "img:1", "git", "ls-remote"]);
+    const start = d.argvs.find((a) => a[0] === "start" && a[1] === "-a" && a.at(-1) === d.created.find((x) => x.args === c)!.id)!;
+    expect(d.optsList[d.argvs.indexOf(start)]).toEqual({ timeoutMs: 1234, maxBytes: 5678 });
+  });
+
+  it("is an error to give a network with egress, or neither; the existing path is not touched", async () => {
+    const d = mkEgress();
+    await expect(d.once({ ...EGRESS, network: "bridge" })).rejects.toThrow(/makes its own network/);
+    await expect(d.once({ role: "scan", image: "img:1", args: [], timeoutMs: 1, maxBytes: 1 })).rejects.toThrow(/needs a network/);
+    expect(d.argvs).toEqual([]);
+  });
+
+  it("without egress issues exactly the calls it always did (no network, image or exec command)", async () => {
+    const d = mkOnce();
+    await d.once(SPEC);
+    expect(d.verbs).toEqual(["create", "start", "rm"]);
+  });
+
+  it("checks the runtime first, before any pull or object", async () => {
+    const d = mkEgress({ MCPE_DOCKER_RUNTIME: "runsc" });
+    d.infoRuntimes = ["runc"];
+    await expect(d.once(EGRESS)).rejects.toBeInstanceOf(RuntimeUnavailableError);
+    expect(d.verbs).toEqual(["info"]);
+  });
+
+  it("pulls both images before anything exists: a failed pull leaves nothing and creates nothing", async () => {
+    const d = mkEgress();
+    d.script.push((a) => (a[0] === "image" && a.at(-1) === "img:1" ? { code: 1 } : undefined));
+    d.script.push((a) => (a[0] === "pull" ? { code: 1, stderr: "denied" } : undefined));
+    await expect(d.once(EGRESS)).rejects.toThrow(/Failed to pull image img:1/);
+    expect(d.count("create") + d.count("network create")).toBe(0);
+  });
+
+  it("carries the proxy's refusal for a runtime that Docker will not run (create and start) as RuntimeUnavailableError, not ProxyStartError", async () => {
+    for (const verb of ["create", "start"] as const) {
+      const d = mkEgress({ MCPE_DOCKER_RUNTIME: "runsc" });
+      d.script.push((a) =>
+        (verb === "create" ? isProxyCreate(a) : a[0] === "start" && a[1] !== "-a" && d.proxyContainer()?.[1].id === a[1])
+          ? { code: 125, stderr: "docker: Error response from daemon: unknown or invalid runtime name: runsc\n" }
+          : undefined,
+      );
+      const e = await settle(d.once(EGRESS));
+      expect(e, verb).toBeInstanceOf(RuntimeUnavailableError);
+      clean(d);
+    }
+  });
+});
+
+describe("a one-shot behind its proxy: teardown on every path", () => {
+  const tail = (d: EgressDocker, n: number) => d.verbs.slice(-n);
+
+  it("network create fails: no proxy, nothing to remove", async () => {
+    const d = mkEgress();
+    d.script.push((a) => (a[0] === "network" && a[1] === "create" ? { code: 1, stderr: "boom" } : undefined));
+    expect(await settle(d.once(EGRESS))).toBeInstanceOf(ContainmentUnavailableError);
+    expect(d.count("network rm") + d.count("rm") - 1 /* the resolver read's own */).toBe(0);
+    expect(d.argvs.some(isProxyCreate)).toBe(false);
+    clean(d);
+  });
+
+  it("network create times out: removed by name", async () => {
+    const d = mkEgress();
+    d.script.push((a) => (a[0] === "network" && a[1] === "create" ? { code: null as unknown as number, timedOut: true } : undefined));
+    expect(await settle(d.once(EGRESS))).toBeInstanceOf(DockerUnavailableError);
+    expect(d.argvs.at(-1)).toEqual(["network", "rm", d.argvs.find((a) => a[1] === "create")!.at(-1)]);
+    expect(d.argvs.some(isProxyCreate)).toBe(false);
+  });
+
+  it("the id is not 64 hex: the network is removed by name and no proxy is made", async () => {
+    const d = mkEgress();
+    d.script.push((a) => (a[0] === "network" && a[1] === "create" ? { stdout: "xyz\n" } : undefined));
+    expect(await settle(d.once(EGRESS))).toBeInstanceOf(DockerUnavailableError);
+    expect(d.argvs.at(-1)).toEqual(["network", "rm", d.argvs.find((a) => a[1] === "create")!.at(-1)]);
+    expect(d.argvs.some(isProxyCreate)).toBe(false);
+    clean(d);
+  });
+
+  it("the check fails: the network is removed by id and no proxy is made", async () => {
+    const d = mkEgress();
+    d.script.push(inspectNet({ ipam: [{ Subnet: "172.30.9.0/24", Gateway: "172.30.9.1" }] }));
+    expect(await settle(d.once(EGRESS))).toBeInstanceOf(ContainmentUnavailableError);
+    expect(tail(d, 2)).toEqual(["network inspect", "network rm"]);
+    expect(d.argvs.some(isProxyCreate)).toBe(false);
+    clean(d);
+  });
+
+  it("the inspect fails: the network is removed by id", async () => {
+    const d = mkEgress();
+    d.script.push((a) => (a[0] === "network" && a[1] === "inspect" ? { code: 1, stderr: "daemon gone" } : undefined));
+    expect(await settle(d.once(EGRESS))).toBeInstanceOf(DockerUnavailableError);
+    expect(tail(d, 2)).toEqual(["network inspect", "network rm"]);
+    clean(d);
+  });
+
+  it.each([
+    ["fails", { code: 125, stderr: "docker: Error response from daemon: no space left\n" }],
+    ["times out", { code: null as unknown as number, timedOut: true }],
+  ])("the proxy create %s: removed by its name, then the network", async (_n, r) => {
+    const d = mkEgress();
+    d.script.push((a) => (isProxyCreate(a) ? r : undefined));
+    const e = await settle(d.once(EGRESS));
+    expect(e).toBeInstanceOf(ProxyStartError);
+    const name = sub(d.argvs.find(isProxyCreate)!, "--name")[0]!;
+    expect(d.argvs.at(-2)).toEqual(["rm", "-f", "-v", name]);
+    expect(tail(d, 2)).toEqual(["rm", "network rm"]);
+    clean(d);
+  });
+
+  it("network connect fails: the proxy is removed by id, then the network", async () => {
+    const d = mkEgress();
+    d.script.push((a) => (a[0] === "network" && a[1] === "connect" ? { code: 1, stderr: "Error response from daemon: boom\n" } : undefined));
+    const e = await settle(d.once(EGRESS));
+    expect(e).toBeInstanceOf(ProxyStartError);
+    expect(d.count("start") - 1 /* the resolver read */).toBe(0);
+    expect(d.argvs.at(-2)).toEqual(["rm", "-f", "-v", d.created.find((c) => c.labels[ROLE_L] === "oneshot-proxy")!.id]);
+    expect(tail(d, 2)).toEqual(["rm", "network rm"]);
+    clean(d);
+  });
+
+  it("the proxy start fails: ProxyStartError with Docker's cleaned last line (an image without node), then teardown", async () => {
+    const d = mkEgress();
+    d.script.push((a) => (a[0] === "start" && a[1] !== "-a" && d.proxyContainer()?.[1].id === a[1] ? { code: 127, stderr: "Error response from daemon: \u001b[1mOCI runtime create failed\u001b[0m: exec: \"node\": executable file not found in $PATH: unknown\n" } : undefined));
+    const e = await settle(d.once(EGRESS));
+    expect(e).toBeInstanceOf(ProxyStartError);
+    expect(lastLine(e)).toBe('the network proxy did not start: Error response from daemon: OCI runtime create failed: exec: "node": executable file not found in $PATH: unknown');
+    expect(d.count("exec")).toBe(0);
+    expect(tail(d, 2)).toEqual(["rm", "network rm"]);
+    clean(d);
+  });
+
+  /** After `start`, the proxy is not running. */
+  const exits = (d: EgressDocker, code: number) =>
+    d.script.push((a) => {
+      if (a[0] === "start" && a[1] !== "-a" && d.proxyContainer()?.[1].id === a[1]) {
+        const c = d.proxyContainer()![1];
+        c.running = false;
+        c.exitCode = code;
+        return { stdout: `${a[1]}\n` };
+      }
+      return undefined;
+    });
+
+  it("readiness: a proxy that exited fails at once with the last line of its log, then teardown", async () => {
+    const d = mkEgress();
+    exits(d, 1);
+    d.logsReply = { stderr: "proxy: listenCidr has no interface\nsecond\u001b[31m last\u001b[0m line\n" };
+    const e = await settle(d.once(EGRESS));
+    expect(e).toBeInstanceOf(ProxyStartError);
+    expect(lastLine(e)).toBe("the network proxy did not start: second last line");
+    expect(d.count("exec")).toBe(0);
+    expect(tail(d, 2)).toEqual(["rm", "network rm"]);
+    clean(d);
+  });
+
+  it("readiness: with an unreadable log, says exited with code N", async () => {
+    const d = mkEgress();
+    exits(d, 70);
+    d.logsReply = { code: 1, stderr: "Error: no such container" };
+    expect(lastLine(await settle(d.once(EGRESS)))).toBe("the network proxy did not start: exited with code 70");
+    const e2 = mkEgress();
+    exits(e2, 3);
+    e2.logsReply = { stdout: "\n\n" };
+    expect(lastLine(await settle(e2.once(EGRESS)))).toBe("the network proxy did not start: exited with code 3");
+  });
+
+  it.each<[string, unknown]>([
+    ["not ready", { ...READY, ready: false }],
+    ["a 200 without ready", { version: "1", refusals: [] }],
+    ["another version", { ...READY, version: "2" }],
+    ["not an object", "ready"],
+    ["null", null],
+  ])("readiness: out of budget (%s) is ProxyStartError, then teardown", async (_n, body) => {
+    const d = mkEgress();
+    d.statusBody = body;
+    const t = Date.now();
+    const e = await settle(d.once(EGRESS));
+    expect(e).toBeInstanceOf(ProxyStartError);
+    expect(lastLine(e)).toBe("the network proxy did not start: it was not ready within 0.25 s");
+    expect(Date.now() - t).toBeGreaterThanOrEqual(240);
+    expect(d.count("exec")).toBeGreaterThan(1);
+    expect(tail(d, 2)).toEqual(["rm", "network rm"]);
+    clean(d);
+  });
+
+  it("readiness: an exec that fails or answers nonsense is not ready, and the status exec is bounded (3 s, 64 KiB)", async () => {
+    const d = mkEgress();
+    let n = 0;
+    d.script.push((a) => (a[0] === "exec" && a[2] === "node" ? (++n < 3 ? { code: 1, stderr: "not yet" } : n === 3 ? { stdout: "<html>" } : undefined) : undefined));
+    await d.once(EGRESS);
+    expect(d.count("exec")).toBe(4);
+    const i = d.argvs.findIndex((a) => a[0] === "exec");
+    expect(d.optsList[i]).toEqual({ timeoutMs: 3000, maxBytes: 65536 });
+    expect(d.argvs[i]!.slice(0, 2)).toEqual(["exec", d.created.find((c) => c.labels[ROLE_L] === "oneshot-proxy")!.id]);
+    expect(d.argvs[i]!.slice(2, 4)).toEqual(["node", "-e"]);
+    expect(d.argvs[i]![4]).toContain("process.exit");
+    expect(d.argvs[i]![4]).toContain("timeout:2000");
+    expect(d.argvs[i]![4]).toContain("3129");
+  });
+
+  it("the one-shot's create fails after readiness: the proxy and the network go, and no refusals are read", async () => {
+    const d = mkEgress();
+    d.script.push((a) => (isOneShotCreate(a) ? { code: 125, stderr: "no space left\n" } : undefined));
+    await expect(d.once(EGRESS)).rejects.toThrow(/Could not create the clone container: no space left/);
+    expect(d.count("exec")).toBe(1);
+    expect(tail(d, 2)).toEqual(["rm", "network rm"]);
+    clean(d);
+  });
+
+  it("the one-shot times out: it is removed first, the refusals are read, then the proxy and the network go", async () => {
+    const d = mkEgress();
+    failRun(d, { code: null as unknown as number, timedOut: true });
+    d.statusBody = { ...READY, refusals: [ROW], total: 2, resolverFailures: 1 };
+    const r = await d.once(EGRESS);
+    expect(r.timedOut).toBe(true);
+    expect(r.proxy).toEqual({ rows: [ROW], total: 2, resolverFailures: 1 });
+    expect(tail(d, 4)).toEqual(["rm", "exec", "rm", "network rm"]);
+    const oneShot = d.created.find((c) => c.labels[ROLE_L] === "clone")!;
+    const proxy = d.created.find((c) => c.labels[ROLE_L] === "oneshot-proxy")!;
+    const netName = d.argvs.find((a) => a[0] === "network" && a[1] === "create")!.at(-1)!;
+    expect(d.argvs.slice(-4)).toEqual([
+      ["rm", "-f", "-v", oneShot.id],
+      d.argvs.at(-3)!,
+      ["rm", "-f", "-v", proxy.id],
+      ["network", "rm", idFor(`net:${netName}`)],
+    ]);
+    expect(d.argvs.at(-3)![1]).toBe(proxy.id);
+    const execIdx = d.argvs.length - 3;
+    expect(d.optsList[execIdx]).toEqual({ timeoutMs: 3000, maxBytes: 65536 });
+    clean(d);
+  });
+
+  it("a non-zero exit is reported with the refusals; a zero exit is not, and reads nothing", async () => {
+    const d = mkEgress();
+    failRun(d, { code: 3, stderr: "fatal: unable to access\n" });
+    d.statusBody = { ...READY, refusals: [ROW, { ...ROW, host: null, port: null, kind: "http", reason: "method", count: 1 }], total: 3, resolverFailures: 0 };
+    const r = await d.once(EGRESS);
+    expect(r).toMatchObject({ code: 3, stderr: "fatal: unable to access\n" });
+    expect(r.proxy).toMatchObject({ total: 3, resolverFailures: 0 });
+    expect((r.proxy as { rows: unknown[] }).rows).toHaveLength(2);
+    const ok = mkEgress();
+    const okRes = await ok.once(EGRESS);
+    expect(okRes.proxy).toBeUndefined();
+    expect(ok.count("exec")).toBe(1);
+  });
+
+  it("an unreadable status, a failed exec or a timed-out exec is { unavailable: true }, and never throws out of teardown", async () => {
+    for (const reply of [{ stdout: "<html>" }, { code: 1, stderr: "x" }, { code: null as unknown as number, timedOut: true }, { stdout: "{}" }, { stdout: "x".repeat(10), truncated: true }]) {
+      const d = mkEgress();
+      failRun(d, { code: 1 });
+      let n = 0;
+      d.script.push((a) => (a[0] === "exec" && a[2] === "node" && ++n > 1 ? reply : undefined));
+      const r = await d.once(EGRESS);
+      expect(r.proxy).toEqual({ unavailable: true });
+      clean(d);
+    }
+    const t = new ThrowsOn(loadConfig({}), TEST_INSTALLATION_ID);
+    failRun(t, { code: 1 });
+    let n = 0;
+    t.on = (a) => a[0] === "exec" && ++n > 1;
+    expect((await t.once(EGRESS)).proxy).toEqual({ unavailable: true });
+  });
+
+  it("a throw from the run itself still reads the refusals and tears down, and the throw is the outcome (the refusals ride on it)", async () => {
+    const d = new ThrowsOn(loadConfig({}), TEST_INSTALLATION_ID);
+    d.on = (a) => isOneShotStart(d, a);
+    d.statusBody = { ...READY, refusals: [ROW], total: 1 };
+    const e = (await settle(d.once(EGRESS))) as Error & { proxy?: unknown };
+    expect(e.message).toBe("spawn docker ENOENT");
+    expect(e.proxy).toEqual({ rows: [ROW], total: 1, resolverFailures: 0 });
+    expect(tail(d, 4)).toEqual(["rm", "exec", "rm", "network rm"]);
+    clean(d);
+  });
+
+  it("a throw anywhere (here: network connect) tears down the proxy and the network", async () => {
+    const d = new ThrowsOn(loadConfig({}), TEST_INSTALLATION_ID);
+    d.on = (a) => a[0] === "network" && a[1] === "connect";
+    await expect(d.once(EGRESS)).rejects.toThrow("spawn docker ENOENT");
+    expect(tail(d, 2)).toEqual(["rm", "network rm"]);
+    clean(d);
+  });
+
+  it("a removal that fails or throws never masks the original error, and each removal is still tried", async () => {
+    const d = new ThrowsOn(loadConfig({}), TEST_INSTALLATION_ID);
+    d.script.push((a) => (a[0] === "network" && a[1] === "connect" ? { code: 1, stderr: "Error response from daemon: original failure\n" } : undefined));
+    d.on = (a) => (a[0] === "rm" && a[1] === "-f" && d.proxyContainer() !== undefined && a.at(-1) === d.proxyContainer()![1].id) || (a[0] === "network" && a[1] === "rm");
+    const e = await settle(d.once(EGRESS));
+    expect(e).toBeInstanceOf(ProxyStartError);
+    expect(lastLine(e)).toContain("original failure");
+    expect(tail(d, 2)).toEqual(["rm", "network rm"]);
+  });
+
+  it("removes the network after the proxy, never before (the proxy's endpoint would block it)", async () => {
+    const d = mkEgress();
+    await d.once(EGRESS);
+    const proxy = d.created.find((c) => c.labels[ROLE_L] === "oneshot-proxy")!;
+    const proxyRm = d.argvs.findIndex((a) => a[0] === "rm" && a.at(-1) === proxy.id);
+    const netRm = d.argvs.findIndex((a) => a[0] === "network" && a[1] === "rm");
+    const oneRm = d.argvs.findIndex((a) => a[0] === "rm" && a.at(-1) === d.created.find((c) => c.labels[ROLE_L] === "clone")!.id);
+    expect(oneRm).toBeGreaterThan(-1);
+    expect(oneRm).toBeLessThan(proxyRm);
+    expect(proxyRm).toBeLessThan(netRm);
+  });
+});
+
+describe("parseProxyReport (the status is not trusted)", () => {
+  const rows = (v: unknown) => (parseProxyReport({ refusals: v, total: 1, resolverFailures: 0 }) as { rows: unknown[] }).rows;
+
+  it("keeps a valid row as it is, with host and port null allowed", () => {
+    expect(parseProxyReport({ ...READY, refusals: [ROW, { ...ROW, host: null, port: null, kind: "forward", reason: "cap" }], total: 5, resolverFailures: 2 })).toEqual({
+      rows: [ROW, { ...ROW, host: null, port: null, kind: "forward", reason: "cap" }],
+      total: 5,
+      resolverFailures: 2,
+    });
+  });
+  it("cleans terminal escapes out of host and times", () => {
+    const [r] = rows([{ ...ROW, host: "ev\u001b[31mil\u001b]0;title\u0007.example", firstAt: "\u001b[1m2026", lastAt: "a\u0000b" }]) as Array<{ host: string; firstAt: string; lastAt: string }>;
+    expect(r!.host).toBe("evil.example");
+    expect(r!.firstAt).toBe("2026");
+    expect(r!.lastAt).toBe("ab");
+  });
+  it("keeps at most 50 rows, however many it is given", () => {
+    expect(rows(Array.from({ length: 100_000 }, () => ROW))).toHaveLength(50);
+    expect(rows([...Array.from({ length: 1000 }, () => ({ bad: 1 })), ROW])).toEqual([]);
+  });
+  it.each<[string, Record<string, unknown>]>([
+    ["unknown kind", { kind: "tunnel" }],
+    ["unknown reason", { reason: "because" }],
+    ["inherited-looking reason", { reason: "__proto__" }],
+    ["host a number", { host: 5 }],
+    ["host too long", { host: "a".repeat(254) }],
+    ["port zero", { port: 0 }],
+    ["port too big", { port: 65536 }],
+    ["port a string", { port: "443" }],
+    ["port fractional", { port: 44.5 }],
+    ["count zero", { count: 0 }],
+    ["count negative", { count: -1 }],
+    ["count a string", { count: "2" }],
+    ["count fractional", { count: 1.5 }],
+    ["firstAt a number", { firstAt: 5 }],
+    ["lastAt missing", { lastAt: undefined }],
+  ])("drops a row with %s", (_n, over) => {
+    expect(rows([{ ...ROW, ...over }])).toEqual([]);
+  });
+  it("drops rows that are not objects, and keeps the valid ones around them", () => {
+    expect(rows([null, 5, "x", [ROW], ROW, undefined])).toEqual([ROW]);
+  });
+  it("keeps a host of exactly 253 characters", () => {
+    expect(rows([{ ...ROW, host: "a".repeat(253) }])).toHaveLength(1);
+  });
+  it.each<[string, unknown]>([
+    ["null", null],
+    ["a string", "x"],
+    ["an array", []],
+    ["no refusals", { total: 0, resolverFailures: 0 }],
+    ["refusals an object", { refusals: {}, total: 0, resolverFailures: 0 }],
+    ["total negative", { refusals: [], total: -1, resolverFailures: 0 }],
+    ["total a string", { refusals: [], total: "0", resolverFailures: 0 }],
+    ["total fractional", { refusals: [], total: 0.5, resolverFailures: 0 }],
+    ["resolverFailures missing", { refusals: [], total: 0 }],
+    ["resolverFailures NaN", { refusals: [], total: 0, resolverFailures: Number.NaN }],
+  ])("is unavailable for %s", (_n, v) => {
+    expect(parseProxyReport(v)).toEqual({ unavailable: true });
+  });
+  it("does not trust a hostile object's prototype or getters", () => {
+    const o = JSON.parse('{"refusals":[{"__proto__":{"kind":"connect"},"host":"a"}],"total":1,"resolverFailures":0}') as unknown;
+    expect(parseProxyReport(o)).toEqual({ rows: [], total: 1, resolverFailures: 0 });
+  });
+});
+
+describe("the sweep of one-shot networks and proxies", () => {
+  const HOUR = 3600_000;
+  const iso = (agoMs: number, frac = "") => new Date(Date.now() - agoMs).toISOString().replace(/\.\d{3}Z$/, (m) => `${frac || m.slice(0, 4)}Z`);
+  const fid = (n: number) => String(n).repeat(64).slice(0, 64);
+  const mine = { "mcp-everything": "1", [OWNER_L]: ID };
+  const role = (r: string, extra: Record<string, string> = mine) => ({ ...extra, [ROLE_L]: r });
+  interface Item { id: string; labels: Record<string, string> | null; created: string }
+
+  function world(cs: Item[], vs: Array<{ name: string; labels: Record<string, string>; created: string }>, ns: Item[], rmReply?: (id: string) => { code?: number; stderr?: string } | undefined) {
+    const d = mk();
+    d.script.push((a) => {
+      if (a[0] === "ps") return { stdout: cs.map((c) => `${c.id}\n`).join("") };
+      if (a[0] === "volume" && a[1] === "ls") return { stdout: vs.map((v) => `${v.name}\n`).join("") };
+      if (a[0] === "network" && a[1] === "ls") return { stdout: ns.map((n) => `${n.id}\n`).join("") };
+      if (a[0] === "inspect") {
+        const c = cs.find((x) => x.id === a.at(-1));
+        return c ? { stdout: JSON.stringify({ id: c.id, labels: c.labels, created: c.created }) } : { code: 1, stderr: "Error response from daemon: No such container: x" };
+      }
+      if (a[0] === "volume" && a[1] === "inspect") {
+        const v = vs.find((x) => x.name === a.at(-1));
+        return v ? { stdout: JSON.stringify({ labels: v.labels, created: v.created }) } : { code: 1, stderr: "Error: No such volume: x" };
+      }
+      if (a[0] === "network" && a[1] === "inspect") {
+        const n = ns.find((x) => x.id === a.at(-1));
+        return n ? { stdout: JSON.stringify({ id: n.id, labels: n.labels, created: n.created }) } : { code: 1, stderr: `Error response from daemon: network ${a.at(-1)} not found` };
+      }
+      if (a[0] === "network" && a[1] === "rm") return rmReply?.(a.at(-1)!) ?? {};
+      return undefined;
+    });
+    return d;
+  }
+
+  it("lists networks by this installation's owner label and the role oneshot-net, with full ids, after containers and volumes", async () => {
+    const d = world([], [], []);
+    await d.sweepCheckLeftovers(60);
+    expect(d.argvs).toContainEqual(["network", "ls", "--no-trunc", "--filter", `label=${OWNER_L}=${ID}`, "--filter", `label=${ROLE_L}=oneshot-net`, "--format", "{{.ID}}"]);
+    expect(d.verbs).toEqual(["ps", "volume ls", "network ls"]);
+  });
+
+  it("removes an aged one-shot network and proxy of this installation, containers and volumes first then networks, by full id", async () => {
+    const d = world(
+      [{ id: fid(1), labels: role("oneshot-proxy"), created: iso(2 * HOUR) }, { id: fid(2), labels: role("resolv-read"), created: iso(2 * HOUR) }],
+      [{ name: "stg", labels: role("staging"), created: iso(2 * HOUR, "") }],
+      [{ id: fid(3), labels: role("oneshot-net"), created: iso(2 * HOUR) }],
+    );
+    const r = await d.sweepCheckLeftovers(3600);
+    expect(r).toEqual({ removed: [fid(1), fid(2), "stg", fid(3)], failures: 0 });
+    expect(d.argvs.filter((a) => a[0] === "rm" || (a[0] === "network" && a[1] === "rm") || (a[0] === "volume" && a[1] === "rm"))).toEqual([
+      ["rm", "-f", fid(1)], ["rm", "-f", fid(2)], ["volume", "rm", "-f", "stg"], ["network", "rm", fid(3)],
+    ]);
+    expect(d.argvs).toContainEqual(["network", "inspect", "--format", '{"id":{{json .Id}},"labels":{{json .Labels}},"created":{{json .Created}}}', fid(3)]);
+  });
+
+  it("parses a creation time with a nine-digit fraction", async () => {
+    const d = world([], [], [{ id: fid(4), labels: role("oneshot-net"), created: `${new Date(Date.now() - 2 * HOUR).toISOString().slice(0, 19)}.123456789Z` }]);
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [fid(4)], failures: 0 });
+  });
+
+  it("leaves a young network and proxy", async () => {
+    const d = world([{ id: fid(1), labels: role("oneshot-proxy"), created: iso(10_000) }], [], [{ id: fid(3), labels: role("oneshot-net"), created: iso(10_000) }]);
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [], failures: 0 });
+    expect(d.count("rm") + d.count("network rm")).toBe(0);
+  });
+
+  it("never takes anything that carries the project label at all, whatever its role: containers, volumes, networks (even an empty value)", async () => {
+    const proj = (r: string, v = "gron") => role(r, { ...mine, [PROJECT_L]: v });
+    const old = iso(5 * HOUR);
+    const d = world(
+      [
+        { id: fid(1), labels: proj("project-proxy"), created: old },
+        { id: fid(2), labels: proj("oneshot-proxy"), created: old },
+        { id: fid(3), labels: proj("clone", ""), created: old },
+        { id: fid(4), labels: proj("resolv-read"), created: old },
+      ],
+      [{ name: "pv", labels: proj("staging"), created: old }, { name: "pe", labels: proj("staging", ""), created: old }],
+      [
+        { id: fid(5), labels: proj("project-net"), created: old },
+        { id: fid(6), labels: proj("oneshot-net"), created: old },
+        { id: fid(7), labels: proj("oneshot-net", ""), created: old },
+      ],
+    );
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [], failures: 0 });
+    expect(d.count("rm") + d.count("volume rm") + d.count("network rm")).toBe(0);
+  });
+
+  it("a project whose slug is `oneshot` has a sandbox that looks like a one-shot by name, and survives (labels only)", async () => {
+    const name = `mcpe-${ID}-oneshot`;
+    const d = world(
+      [{ id: fid(1), labels: { ...mine, [PROJECT_L]: "github:o/oneshot" }, created: iso(5 * HOUR) }],
+      [{ name: `${name}-vol`, labels: { ...mine, [PROJECT_L]: "github:o/oneshot" }, created: iso(5 * HOUR) }],
+      [{ id: fid(2), labels: { ...mine, [PROJECT_L]: "oneshot" }, created: iso(5 * HOUR) }],
+    );
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [], failures: 0 });
+    expect(d.count("rm") + d.count("volume rm") + d.count("network rm")).toBe(0);
+  });
+
+  it("leaves another installation's network and proxy, and an unlisted role", async () => {
+    const other = { "mcp-everything": "1", [OWNER_L]: OTHER_ID };
+    const old = iso(5 * HOUR);
+    const d = world(
+      [{ id: fid(1), labels: role("oneshot-proxy", other), created: old }],
+      [],
+      [{ id: fid(2), labels: role("oneshot-net", other), created: old }, { id: fid(3), labels: role("sandbox-net"), created: old }, { id: fid(4), labels: mine, created: old }],
+    );
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [], failures: 0 });
+    expect(d.count("rm") + d.count("network rm")).toBe(0);
+  });
+
+  it("skips a network with null labels (not a failure), and counts an unreadable creation time as one", async () => {
+    const d = world([], [], [{ id: fid(1), labels: null, created: iso(5 * HOUR) }, { id: fid(2), labels: role("oneshot-net"), created: "not a date" }]);
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [], failures: 1 });
+    expect(d.count("network rm")).toBe(0);
+  });
+
+  it("an already-gone network is not a failure, at inspect or at removal", async () => {
+    const old = iso(5 * HOUR);
+    const d = world([], [], [{ id: fid(1), labels: role("oneshot-net"), created: old }, { id: fid(2), labels: role("oneshot-net"), created: old }], (id) =>
+      id === fid(2) ? { code: 1, stderr: `Error response from daemon: network ${id} not found` } : undefined,
+    );
+    // fid(1) removed; fid(2) gone at removal. A third, gone at inspect, is simply not in the world.
+    d.script.unshift((a) => (a[0] === "network" && a[1] === "ls" ? { stdout: `${fid(1)}\n${fid(2)}\n${fid(9)}\n` } : undefined));
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [fid(1)], failures: 0 });
+  });
+
+  it("skips a network that still has endpoints without counting a failure, and counts any other removal failure", async () => {
+    const old = iso(5 * HOUR);
+    const d = world([], [], [{ id: fid(1), labels: role("oneshot-net"), created: old }, { id: fid(2), labels: role("oneshot-net"), created: old }, { id: fid(3), labels: role("oneshot-net"), created: old }], (id) =>
+      id === fid(1) ? { code: 1, stderr: "Error response from daemon: error while removing network: network x id y has active endpoints" } : id === fid(2) ? { code: 1, stderr: "Error: boom" } : undefined,
+    );
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [fid(3)], failures: 1 });
+  });
+
+  it("counts a failed network listing and keeps what it already removed", async () => {
+    const d = world([{ id: fid(1), labels: role("oneshot-proxy"), created: iso(5 * HOUR) }], [], []);
+    d.script.unshift((a) => (a[0] === "network" && a[1] === "ls" ? { code: 1, stderr: "boom" } : undefined));
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [fid(1)], failures: 1 });
+  });
+
+  it("refuses a listed id that is not a full id, and one whose inspect answers another id", async () => {
+    const d = world([], [], [{ id: fid(1), labels: role("oneshot-net"), created: iso(5 * HOUR) }]);
+    d.script.unshift((a) => (a[0] === "network" && a[1] === "ls" ? { stdout: `abc123\n${fid(1)}\n` } : a[0] === "network" && a[1] === "inspect" ? { stdout: JSON.stringify({ id: fid(2), labels: role("oneshot-net"), created: iso(5 * HOUR) }) } : undefined));
+    expect(await d.sweepCheckLeftovers(3600)).toEqual({ removed: [], failures: 2 });
+    expect(d.count("network rm")).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Project network primitives (flight 02, leg 6)
+// ---------------------------------------------------------------------------
+
+const PS = "mcpe-0123abcd-widget";
+const PV = "mcpe-0123abcd-widget";
+const PNET = projectNetworkName(PS);
+const PROJ = LABELS.mine!["mcp-everything.project"]!;
+const SANDBOX_L = "mcp-everything.sandbox";
+const netLabels = (over: Record<string, string> = {}): Record<string, string> => ({ [OWNER_L]: ID, [ROLE_L]: "project-net", [PROJECT_L]: PROJ, [SANDBOX_L]: PS, ...over });
+const putNet = (d: ScriptedDocker, over: Partial<FakeNet> = {}): FakeNet => {
+  const n: FakeNet = { id: idFor(`net:${PNET}`), name: PNET, labels: netLabels(), internal: true, ipv6: false, ipam: [{ Subnet: "172.30.50.0/24" }], created: "x", ...over };
+  d.networks.set(n.name, n);
+  return n;
+};
+const proxyName = (i = 1, sandbox = PS) => `${sandbox}-proxy-${String(i).repeat(8)}`;
+const proxyLabels = (sandbox = PS, over: Record<string, string> = {}): Record<string, string> => ({
+  "mcp-everything": "1", [OWNER_L]: ID, [ROLE_L]: "project-proxy", [PROJECT_L]: PROJ, [SANDBOX_L]: sandbox, ...over,
+});
+const putProxy = (d: ScriptedDocker, name = proxyName(), labels: Labels = proxyLabels(), opts: { running?: boolean; networks?: string[] } = {}) => {
+  const id = idFor(name);
+  d.containers.set(name, { id, running: opts.running ?? true, labels, networks: opts.networks ?? ["bridge", PNET] });
+  return { id, name };
+};
+/** Every command that removes something, in order. */
+const removals = (d: ScriptedDocker) => d.argvs.filter((a) => a[0] === "rm" || (["volume", "network"].includes(a[0]!) && a[1] === "rm"));
+const FORWARDS = [{ host: "db.lan", port: 5432 }, { host: "host.docker.internal", port: 80 }];
+const PCONFIG = proxyConfig({ allow: ALLOW, listenCidr: "172.30.50.0/24", resolvers: ["192.0.2.53"], forwards: FORWARDS });
+const CONF_LABELS = { "mcp-everything.config": "abc123" };
+
+describe("the one-shot volume fix: rm -f -v", () => {
+  it("removes every one-shot, and its proxy, with -v; no command removes a volume by name", async () => {
+    const plain = mkOnce();
+    await plain.once(SPEC);
+    const behind = mkEgress();
+    await behind.once(EGRESS);
+    for (const d of [plain, behind]) {
+      const rms = d.argvs.filter((a) => a[0] === "rm");
+      expect(rms.length).toBeGreaterThan(0);
+      for (const a of rms) expect(a.slice(0, 3), a.join(" ")).toEqual(["rm", "-f", "-v"]);
+      expect(d.count("volume rm")).toBe(0);
+    }
+  });
+
+  it("removes by name with -v when the create timed out (no id exists yet)", async () => {
+    const d = mkOnce();
+    d.script.push((a) => (a[0] === "create" ? { code: null as unknown as number, timedOut: true } : undefined));
+    await expect(d.once(SPEC)).rejects.toThrow(/docker create timed out/);
+    const rm = d.argvs.find((a) => a[0] === "rm")!;
+    expect(rm.slice(0, 3)).toEqual(["rm", "-f", "-v"]);
+    expect(rm[3]).toMatch(NAME_SHAPE);
+  });
+});
+
+describe("inspect facts carry the name", () => {
+  it("asks for the name in both inspect formats, and the leading slash is dropped", async () => {
+    const d = mk();
+    d.put(PS, "mine");
+    await d.ownership(PS);
+    await d.state({ id: idFor(PS), name: PS });
+    for (const a of d.argvs) expect(a[a.indexOf("--format") + 1]).toContain('"name":{{json .Name}}');
+    const proxies = mk();
+    putProxy(proxies);
+    expect((await proxies.listProjectProxies(PS)).map((p) => p.name)).toEqual([proxyName()]);
+  });
+
+  it("tolerates an answer with no name (a scripted daemon)", async () => {
+    const d = mk();
+    d.script.push((a) => (a[0] === "inspect" ? { stdout: JSON.stringify({ id: idFor(PS), running: true, labels: LABELS.mine, networks: {} }) } : undefined));
+    expect(await d.ownership(PS)).toEqual({ state: "mine" });
+    expect(await d.networkState(PS)).toBe("off");
+  });
+});
+
+describe("projectNetworkName", () => {
+  it("is the sandbox's name and -net", () => {
+    expect(projectNetworkName("mcpe-0123abcd-widget")).toBe("mcpe-0123abcd-widget-net");
+  });
+});
+
+describe("ensureProjectNetwork", () => {
+  it("makes the network when it is not there: contained, owner, role, project and sandbox labels, a fixed name", async () => {
+    const d = mkEgress();
+    const net = await d.ensureProjectNetwork(PS, PROJ);
+    expect(net).toEqual({ id: idFor(`net:${PNET}`), name: PNET, subnet: "172.30.1.0/24", created: true });
+    expect(d.verbs).toEqual(["network inspect", "network create", "network inspect"]);
+    const create = d.argvs[1]!;
+    expect(create.at(-1)).toBe(PNET);
+    expect(create).toContain("--internal");
+    expect(sub(create, "--label")).toEqual([`${OWNER_L}=${ID}`, `${ROLE_L}=project-net`, `${PROJECT_L}=${PROJ}`, `${SANDBOX_L}=${PS}`]);
+  });
+
+  it("adopts a network that is there, with this owner, role, project and sandbox: nothing is created or removed", async () => {
+    const d = mkEgress();
+    const n = putNet(d);
+    expect(await d.ensureProjectNetwork(PS, PROJ)).toEqual({ id: n.id, name: PNET, subnet: "172.30.50.0/24", created: false });
+    expect(d.verbs).toEqual(["network inspect"]);
+  });
+
+  it.each<[string, Partial<FakeNet>, string]>([
+    ["another installation's", { labels: netLabels({ [OWNER_L]: OTHER_ID }) }, "another"],
+    ["without labels", { labels: null }, "not-ours"],
+    ["without an owner label", { labels: { [ROLE_L]: "project-net" } }, "not-ours"],
+    ["this installation's but another project's", { labels: netLabels({ [PROJECT_L]: "github:o/other" }) }, "not-ours"],
+    ["this installation's but another role", { labels: netLabels({ [ROLE_L]: "oneshot-net" }) }, "not-ours"],
+    ["this installation's but another sandbox's", { labels: netLabels({ [SANDBOX_L]: "mcpe-0123abcd-other" }) }, "not-ours"],
+  ])("refuses a network that is %s, and creates and removes nothing", async (_n, over, reason) => {
+    const d = mkEgress();
+    putNet(d, over);
+    const e = await settle(d.ensureProjectNetwork(PS, PROJ));
+    expect(e).toBeInstanceOf(SandboxRefusedError);
+    expect((e as SandboxRefusedError).reason).toBe(reason);
+    expect((e as SandboxRefusedError).sandboxes.map((f) => [f.kind, f.sandbox])).toEqual([["network", PNET]]);
+    expect(d.count("network create") + d.count("network rm")).toBe(0);
+  });
+
+  it.each<[string, Partial<FakeNet>, RegExp]>([
+    ["not internal", { internal: false }, /not internal/],
+    ["with IPv6", { ipv6: true }, /IPv6/],
+    ["with a gateway", { ipam: [{ Subnet: "172.30.50.0/24", Gateway: "172.30.50.1" }] }, /gateway/],
+    ["with two subnets", { ipam: [{ Subnet: "172.30.50.0/24" }, { Subnet: "172.31.0.0/16" }] }, /exactly one IPv4 subnet/],
+  ])("does not adopt a network of ours that is %s, and leaves it alone", async (_n, over, why) => {
+    const d = mkEgress();
+    putNet(d, over);
+    const e = await settle(d.ensureProjectNetwork(PS, PROJ));
+    expect(e).toBeInstanceOf(ContainmentUnavailableError);
+    expect((e as Error).message).toMatch(why);
+    expect(d.count("network create") + d.count("network rm")).toBe(0);
+  });
+
+  it("adopts the network of a creator it lost the race to ('already exists'), and never removes it", async () => {
+    const d = mkEgress();
+    putNet(d);
+    let first = true;
+    d.script.push((a) => {
+      if (a[0] === "network" && a[1] === "inspect" && a.at(-1) === PNET && first) {
+        first = false;
+        return { code: 1, stderr: `Error response from daemon: network ${PNET} not found` };
+      }
+      if (a[0] === "network" && a[1] === "create") return { code: 1, stderr: `Error response from daemon: network with name ${PNET} already exists` };
+      return undefined;
+    });
+    expect(await d.ensureProjectNetwork(PS, PROJ)).toMatchObject({ name: PNET, created: false });
+    expect(d.count("network rm")).toBe(0);
+  });
+
+  it("refuses the network of a creator it lost the race to when it is someone else's, and removes nothing", async () => {
+    const d = mkEgress();
+    putNet(d, { labels: netLabels({ [OWNER_L]: OTHER_ID }) });
+    let first = true;
+    d.script.push((a) => {
+      if (a[0] === "network" && a[1] === "inspect" && a.at(-1) === PNET && first) {
+        first = false;
+        return { code: 1, stderr: `Error response from daemon: network ${PNET} not found` };
+      }
+      if (a[0] === "network" && a[1] === "create") return { code: 1, stderr: "already exists" };
+      return undefined;
+    });
+    expect(await settle(d.ensureProjectNetwork(PS, PROJ))).toBeInstanceOf(SandboxRefusedError);
+    expect(d.count("network rm")).toBe(0);
+  });
+
+  it("a failed create that left nothing behind throws the create's own error (pools used up)", async () => {
+    const d = mkEgress();
+    d.script.push((a) => (a[0] === "network" && a[1] === "create" ? { code: 1, stderr: "all predefined address pools have been fully subnetted" } : undefined));
+    await expect(d.ensureProjectNetwork(PS, PROJ)).rejects.toThrow(/default-address-pools/);
+    expect(d.count("network rm")).toBe(0);
+  });
+
+  it("a create that timed out re-inspects by name: adopts what is ours, and never removes by name", async () => {
+    const adopt = mkEgress();
+    putNet(adopt);
+    let first = true;
+    adopt.script.push((a) => {
+      if (a[0] === "network" && a[1] === "inspect" && a.at(-1) === PNET && first) {
+        first = false;
+        return { code: 1, stderr: `network ${PNET} not found` };
+      }
+      if (a[0] === "network" && a[1] === "create") return { code: null as unknown as number, timedOut: true };
+      return undefined;
+    });
+    expect(await adopt.ensureProjectNetwork(PS, PROJ)).toMatchObject({ created: false });
+    expect(adopt.count("network rm")).toBe(0);
+
+    const nothing = mkEgress();
+    nothing.script.push((a) => (a[0] === "network" && a[1] === "create" ? { code: null as unknown as number, timedOut: true } : undefined));
+    await expect(nothing.ensureProjectNetwork(PS, PROJ)).rejects.toThrow(/timed out/);
+    expect(nothing.count("network rm")).toBe(0);
+  });
+
+  it("a network it made that fails the check is removed by its id, never by the fixed name", async () => {
+    const d = mkEgress();
+    const id = idFor(`net:${PNET}`);
+    d.script.push((a) => (a[0] === "network" && a[1] === "inspect" && a.at(-1) === id ? { stdout: netJson(id, { internal: false, labels: netLabels() }) } : undefined));
+    await expect(d.ensureProjectNetwork(PS, PROJ)).rejects.toBeInstanceOf(ContainmentUnavailableError);
+    expect(d.argvs.filter((a) => a[0] === "network" && a[1] === "rm")).toEqual([["network", "rm", id]]);
+  });
+
+  it("a created network whose answer is about another network, or has no usable id, is removed by id (or not at all, for a fixed name without an id)", async () => {
+    const noId = mkEgress();
+    noId.script.push((a) => (a[0] === "network" && a[1] === "create" ? { stdout: "nope\n" } : undefined));
+    await expect(noId.ensureProjectNetwork(PS, PROJ)).rejects.toThrow(/no usable id/);
+    expect(noId.count("network rm")).toBe(0);
+  });
+});
+
+describe("attachProjectNetwork", () => {
+  it("disconnects with -f first, then connects, both by id (T14)", async () => {
+    const d = mkEgress();
+    const net = putNet(d);
+    const id = d.put(PS, "mine", { networks: ["bridge"], running: false });
+    await d.attachProjectNetwork(makeRef(id, PS), net);
+    // The disconnect names the network (a stale entry of a removed network is keyed by name), the connect its id.
+    expect(d.argvs).toEqual([["network", "disconnect", "-f", PNET, id], ["network", "connect", net.id, id]]);
+    expect(d.containers.get(PS)!.networks).toEqual(["bridge", PNET]);
+  });
+
+  it("ignores a failed disconnect, and throws a failed connect", async () => {
+    const d = mkEgress();
+    const net = putNet(d);
+    const id = d.put(PS, "mine", { networks: [] });
+    await d.attachProjectNetwork(makeRef(id, PS), net); // the disconnect fails ("not connected"), the connect goes on
+    expect(d.containers.get(PS)!.networks).toEqual([PNET]);
+    d.script.push((a) => (a[1] === "connect" ? { code: 1, stderr: "boom" } : undefined));
+    await expect(d.attachProjectNetwork(makeRef(id, PS), net)).rejects.toThrow(/Failed to attach .* project network: boom/);
+  });
+});
+
+describe("createProjectProxy", () => {
+  const make = async (over: (d: EgressDocker) => void = () => {}) => {
+    const d = mkEgress();
+    const net = putNet(d);
+    over(d);
+    return { d, net };
+  };
+
+  it("makes a hardened proxy: the name, the labels, the host gateway, the aliases before start, readiness, no --rm and no restart policy", async () => {
+    const { d, net } = await make();
+    const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+    expect(p.name).toMatch(new RegExp(`^${PS}-proxy-[0-9a-f]{8}$`));
+    expect(p.id).toBe(idFor(p.name));
+    expect(d.verbs).toEqual(["image inspect", "network inspect", "create", "network connect", "start", "inspect", "exec"]);
+    const create = d.argvs.find((a) => a[0] === "create")!;
+    expect(create[create.indexOf("--name") + 1]).toBe(p.name);
+    expect(sub(create, "--label")).toEqual([
+      "mcp-everything=1", `${OWNER_L}=${ID}`, `${ROLE_L}=project-proxy`, `${PROJECT_L}=${PROJ}`, `${SANDBOX_L}=${PS}`, "mcp-everything.config=abc123",
+    ]);
+    expect(sub(create, "--network")).toEqual(["bridge"]);
+    expect(sub(create, "--add-host")).toEqual(["host.docker.internal:host-gateway"]);
+    expect(sub(create, "--user")).toEqual(["node"]);
+    expect(sub(create, "--cap-drop")).toEqual(["ALL"]);
+    expect(sub(create, "--tmpfs")).toEqual(["/tmp:size=8m"]);
+    expect(create).toContain("--read-only");
+    expect(create).not.toContain("--rm");
+    expect(create.join(" ")).not.toMatch(/--restart/);
+    expect(create).not.toContain("-p");
+    expect(create.slice(-3)).toEqual(proxyLaunchArgs(PCONFIG));
+    const connect = d.argvs.find((a) => a[0] === "network" && a[1] === "connect")!;
+    expect(connect).toEqual(["network", "connect", "--alias", "mcpe-proxy", "--alias", "db.lan", "--alias", "host.docker.internal", net.id, p.id]);
+    expect(d.verbs.indexOf("network connect")).toBeLessThan(d.verbs.indexOf("start"));
+    expect(d.containers.get(p.name)!.running).toBe(true);
+    expect(d.containers.get(p.name)!.networks).toEqual(["bridge", PNET]);
+    expect(d.count("rm")).toBe(0);
+  });
+
+  it("refuses a forward target named mcpe-proxy, and creates nothing", async () => {
+    const { d } = await make();
+    const cfg = proxyConfig({ allow: ALLOW, listenCidr: "172.30.50.0/24", resolvers: ["192.0.2.53"], forwards: [{ host: "mcpe-proxy", port: 80 }] });
+    await expect(d.createProjectProxy(PS, PROJ, cfg, {})).rejects.toThrow(/mcpe-proxy/);
+    expect(d.count("create")).toBe(0);
+    expect(d.count("network connect")).toBe(0);
+  });
+
+  it.each([["mcp-everything.owner"], ["mcp-everything.role"], ["mcp-everything.project"], ["mcp-everything.sandbox"], ["mcp-everything"], ["com.example.x"], ["mcp-everything.A"]])(
+    "refuses a caller's label named %s",
+    async (key) => {
+      const { d } = await make();
+      await expect(d.createProjectProxy(PS, PROJ, PCONFIG, { [key]: "x" })).rejects.toThrow(/label/);
+      expect(d.count("create")).toBe(0);
+    },
+  );
+
+  it("refuses a caller's label value with a line break", async () => {
+    const { d } = await make();
+    await expect(d.createProjectProxy(PS, PROJ, PCONFIG, { "mcp-everything.config": "a\nb" })).rejects.toThrow(/line breaks/);
+  });
+
+  it("needs the project network: it is never made here", async () => {
+    const d = mkEgress();
+    await expect(d.createProjectProxy(PS, PROJ, PCONFIG, {})).rejects.toBeInstanceOf(ProxyStartError);
+    expect(d.count("create") + d.count("network create")).toBe(0);
+    putNet(d, { labels: netLabels({ [OWNER_L]: OTHER_ID }) });
+    expect(await settle(d.createProjectProxy(PS, PROJ, PCONFIG, {}))).toBeInstanceOf(SandboxRefusedError);
+    expect(d.count("create")).toBe(0);
+  });
+
+  it.each<[string, (d: EgressDocker) => void, RegExp]>([
+    ["the create fails", (d) => d.script.push((a) => (a[0] === "create" ? { code: 1, stderr: "no space left" } : undefined)), /no space left/],
+    ["the create times out", (d) => d.script.push((a) => (a[0] === "create" ? { code: null as unknown as number, timedOut: true } : undefined)), /create timed out/],
+    ["the join fails", (d) => d.script.push((a) => (a[0] === "network" && a[1] === "connect" ? { code: 1, stderr: "boom" } : undefined)), /could not be joined/],
+    ["the start fails", (d) => d.script.push((a) => (a[0] === "start" ? { code: 1, stderr: "cannot start" } : undefined)), /cannot start/],
+    ["the proxy is not ready in time", (d) => { d.statusBody = { ...READY, ready: false }; }, /not ready within|./],
+    ["the proxy reports another program version", (d) => { d.statusBody = { ...READY, version: "0" }; }, /not ready within|./],
+  ])("%s: what it made is removed (by name, then id, with -v), the network stays, and it throws ProxyStartError", async (_n, over, why) => {
+    const { d } = await make(over);
+    const e = await settle(d.createProjectProxy(PS, PROJ, PCONFIG, {}));
+    expect(e).toBeInstanceOf(ProxyStartError);
+    expect((e as Error).message).toMatch(why);
+    expect([...d.containers.keys()]).toEqual([]);
+    expect(d.networks.has(PNET)).toBe(true);
+    const rms = d.argvs.filter((a) => a[0] === "rm");
+    expect(rms).toHaveLength(1);
+    expect(rms[0]!.slice(0, 3)).toEqual(["rm", "-f", "-v"]);
+    expect(d.count("network rm")).toBe(0);
+  });
+
+  it("passes a runtime that Docker refuses through as the runtime error", async () => {
+    const d = mkEgress({ MCPE_DOCKER_RUNTIME: "runsc" });
+    putNet(d);
+    d.script.push((a) => (a[0] === "create" && a.includes("--read-only") ? { code: 125, stderr: "docker: Error response from daemon: unknown or invalid runtime name: runsc." } : undefined));
+    expect(await settle(d.createProjectProxy(PS, PROJ, PCONFIG, {}))).toBeInstanceOf(RuntimeUnavailableError);
+  });
+});
+
+describe("startProjectProxy and projectProxyStatus", () => {
+  it("starts a stopped project proxy and accepts any version of it", async () => {
+    const d = mkEgress();
+    putNet(d);
+    const p = putProxy(d, proxyName(), proxyLabels(), { running: false });
+    d.statusBody = { ...READY, version: "99" };
+    await d.startProjectProxy(p.id);
+    expect(d.argvs.find((a) => a[0] === "start")).toEqual(["start", p.id]);
+    expect(d.containers.get(p.name)!.running).toBe(true);
+  });
+
+  it("does not start anything that is not this installation's project proxy", async () => {
+    const d = mkEgress();
+    const bad = [
+      putProxy(d, proxyName(1), proxyLabels(PS, { [OWNER_L]: OTHER_ID }), { running: false }),
+      putProxy(d, proxyName(2), proxyLabels(PS, { [ROLE_L]: "oneshot-proxy" }), { running: false }),
+      putProxy(d, proxyName(3), null, { running: false }),
+    ];
+    for (const p of bad) expect(await settle(d.startProjectProxy(p.id))).toBeInstanceOf(SandboxRefusedError);
+    expect(d.count("start")).toBe(0);
+    await expect(d.startProjectProxy("a".repeat(64))).rejects.toBeInstanceOf(ProxyStartError);
+  });
+
+  it("says ProxyStartError when the proxy never becomes ready, and leaves it where it is", async () => {
+    const d = mkEgress();
+    const p = putProxy(d, proxyName(), proxyLabels(), { running: false });
+    d.statusBody = { ready: false };
+    await expect(d.startProjectProxy(p.id)).rejects.toBeInstanceOf(ProxyStartError);
+    expect(d.count("rm")).toBe(0);
+  });
+
+  it("projectProxyStatus returns the status body, and undefined (never a throw) when it cannot be had", async () => {
+    const d = mkEgress();
+    const p = putProxy(d);
+    expect(await d.projectProxyStatus(p.id)).toEqual(READY);
+    expect(await d.projectProxyStatus("not-an-id")).toBeUndefined();
+    d.script.push((a) => (a[0] === "exec" ? { code: 1 } : undefined));
+    expect(await d.projectProxyStatus(p.id)).toBeUndefined();
+    class Throws extends ScriptedDocker {
+      protected override async docker(): Promise<never> {
+        throw new Error("spawn docker ENOENT");
+      }
+    }
+    expect(await new Throws(loadConfig({}), TEST_INSTALLATION_ID).projectProxyStatus(p.id)).toBeUndefined();
+  });
+});
+
+describe("listProjectProxies", () => {
+  it("lists by label filters, then keeps what the inspect says is this sandbox's: the name, the sandbox label and a project label", async () => {
+    const d = mkEgress();
+    const a = putProxy(d, proxyName(1));
+    const b = putProxy(d, proxyName(2), proxyLabels(), { running: false });
+    putProxy(d, proxyName(1, "mcpe-0123abcd-twin"), proxyLabels("mcpe-0123abcd-twin")); // a twin: same repository, another sandbox
+    putProxy(d, `${PS}-proxy-XYZ`); // a name that is not the shape
+    putProxy(d, proxyName(3), proxyLabels(PS, { [SANDBOX_L]: "mcpe-0123abcd-other" })); // another sandbox label
+    const noProject = proxyLabels();
+    delete noProject[PROJECT_L];
+    putProxy(d, proxyName(4), noProject);
+    putProxy(d, proxyName(5), proxyLabels(PS, { [OWNER_L]: OTHER_ID })); // another installation's (filtered out by the listing)
+    const listed = await d.listProjectProxies(PS);
+    expect(listed.map((p) => p.name).sort()).toEqual([a.name, b.name].sort());
+    expect(listed.find((p) => p.name === b.name)).toEqual({ id: b.id, name: b.name, running: false, labels: proxyLabels() });
+    expect(d.argvs[0]).toEqual(["ps", "-a", "-q", "--no-trunc", "--filter", `label=${OWNER_L}=${ID}`, "--filter", `label=${ROLE_L}=project-proxy`]);
+  });
+
+  it("needs no container: it works once the sandbox is gone, and asks only read-only questions", async () => {
+    const d = mkEgress();
+    d.strict = true;
+    putProxy(d);
+    expect(await d.listProjectProxies(PS)).toHaveLength(1);
+    expect(d.violations).toEqual([]);
+    expect(d.verbs).toEqual(["ps", "inspect"]);
+  });
+
+  it("throws DockerUnavailableError when Docker cannot be asked", async () => {
+    for (const r of [{ code: 1, stderr: "Cannot connect" }, { code: null as unknown as number, timedOut: true }, { stdout: "x", truncated: true }, { stdout: "abc\n" }] as Reply[]) {
+      const d = mkEgress();
+      d.script.push((a) => (a[0] === "ps" ? r : undefined));
+      await expect(d.listProjectProxies(PS)).rejects.toBeInstanceOf(DockerUnavailableError);
+    }
+  });
+});
+
+describe("listOwnSandboxes (leg 10)", () => {
+  const sandboxLabels = (over: Record<string, string> = {}): Record<string, string> => ({ "mcp-everything": "1", [OWNER_L]: ID, [PROJECT_L]: PROJ, ...over });
+  const put = (d: ScriptedDocker, name: string, labels: Labels, opts: { running?: boolean; networks?: string[] } = {}) => {
+    d.containers.set(name, { id: idFor(name), running: opts.running ?? true, labels, networks: opts.networks ?? ["bridge"] });
+  };
+
+  it("lists by owner and project label, keeps this installation's sandboxes with no role, and answers their facts", async () => {
+    const d = mkEgress();
+    put(d, "mcpe-0123abcd-a", sandboxLabels(), { running: false, networks: ["bridge"] });
+    put(d, "mcpe-0123abcd-b", sandboxLabels({ [PROJECT_L]: "github:o/b" }), { networks: ["mcpe-0123abcd-b-net"] });
+    put(d, "mcpe-0123abcd-proxy", sandboxLabels({ [ROLE_L]: "project-proxy" })); // a role: a proxy
+    put(d, "mcpe-0123abcd-oneshot", sandboxLabels({ [ROLE_L]: "clone" })); // a role: a one-shot
+    put(d, "mcpe-theirs", sandboxLabels({ [OWNER_L]: OTHER_ID })); // another installation's
+    put(d, "mcpe-before", { "mcp-everything": "1", [PROJECT_L]: PROJ }); // from before ownership: no owner label
+    put(d, "mcpe-noproject", { "mcp-everything": "1", [OWNER_L]: ID }); // no project label
+    put(d, "stranger", { "com.example": "x" });
+    const listed = await d.listOwnSandboxes();
+    expect(listed.map((s) => s.name).sort()).toEqual(["mcpe-0123abcd-a", "mcpe-0123abcd-b"]);
+    const a = listed.find((s) => s.name === "mcpe-0123abcd-a")!;
+    expect(a).toEqual({ id: idFor("mcpe-0123abcd-a"), name: "mcpe-0123abcd-a", running: false, labels: sandboxLabels(), networks: ["bridge"], runtime: undefined });
+    expect(d.argvs[0]).toEqual(["ps", "-a", "-q", "--no-trunc", "--filter", `label=${OWNER_L}=${ID}`, "--filter", `label=${PROJECT_L}`]);
+  });
+
+  it("asks only read-only questions (a double that accepts only inspects and listings)", async () => {
+    const d = mkEgress();
+    d.strict = true;
+    put(d, "mcpe-0123abcd-a", sandboxLabels());
+    expect(await d.listOwnSandboxes()).toHaveLength(1);
+    expect(d.violations).toEqual([]);
+    expect(d.verbs).toEqual(["ps", "inspect"]);
+  });
+
+  it("is empty when there is none, and throws DockerUnavailableError when Docker cannot be asked", async () => {
+    expect(await mkEgress().listOwnSandboxes()).toEqual([]);
+    for (const r of [{ code: 1, stderr: "Cannot connect" }, { code: null as unknown as number, timedOut: true }, { stdout: "x", truncated: true }, { stdout: "abc\n" }] as Reply[]) {
+      const d = mkEgress();
+      d.script.push((a) => (a[0] === "ps" ? r : undefined));
+      await expect(d.listOwnSandboxes()).rejects.toBeInstanceOf(DockerUnavailableError);
+    }
+  });
+});
+
+describe("removeProjectProxy and removeProjectNetwork", () => {
+  it("removes a project proxy by id with -v", async () => {
+    const d = mkEgress();
+    const p = putProxy(d);
+    await d.removeProjectProxy(p.id);
+    expect(removals(d)).toEqual([["rm", "-f", "-v", p.id]]);
+  });
+
+  it("refuses what is not this installation's project proxy, and removes nothing", async () => {
+    const d = mkEgress();
+    for (const [labels, cls] of [
+      [proxyLabels(PS, { [OWNER_L]: OTHER_ID }), "another"],
+      [proxyLabels(PS, { [ROLE_L]: "oneshot-proxy" }), "not-ours"],
+      [LABELS.mine, "not-ours"],
+      [null, "not-ours"],
+    ] as const) {
+      const p = putProxy(d, proxyName(Math.floor(Math.random() * 9) + 1, `mcpe-0123abcd-w${cls}${String(Math.random()).slice(2, 6)}`), labels);
+      const e = await settle(d.removeProjectProxy(p.id));
+      expect(e).toBeInstanceOf(SandboxRefusedError);
+      expect((e as SandboxRefusedError).reason).toBe(cls);
+      expect((e as SandboxRefusedError).sandboxes[0]!.kind).toBe("proxy");
+    }
+    expect(removals(d)).toEqual([]);
+  });
+
+  it("treats a proxy that is gone as removed, and takes only a full id", async () => {
+    const d = mkEgress();
+    await d.removeProjectProxy("a".repeat(64));
+    expect(removals(d)).toEqual([]);
+    await expect(d.removeProjectProxy(proxyName())).rejects.toThrow(/full id/);
+  });
+
+  it("removes a project network by id", async () => {
+    const d = mkEgress();
+    const n = putNet(d);
+    await d.removeProjectNetwork(n.id);
+    expect(removals(d)).toEqual([["network", "rm", n.id]]);
+    expect(d.networks.size).toBe(0);
+  });
+
+  it("refuses a network that is not this installation's project network, and removes nothing", async () => {
+    for (const over of [{ labels: netLabels({ [OWNER_L]: OTHER_ID }) }, { labels: null }, { labels: netLabels({ [ROLE_L]: "oneshot-net" }) }] as Array<Partial<FakeNet>>) {
+      const d = mkEgress();
+      const n = putNet(d, over);
+      expect(await settle(d.removeProjectNetwork(n.id))).toBeInstanceOf(SandboxRefusedError);
+      expect(removals(d)).toEqual([]);
+    }
+  });
+
+  it("counts 'not found' as success, at the inspect and at the removal, and throws any other failure", async () => {
+    const d = mkEgress();
+    await d.removeProjectNetwork("a".repeat(64));
+    expect(removals(d)).toEqual([]);
+    const racing = mkEgress();
+    const n = putNet(racing);
+    racing.script.push((a) => (a[1] === "rm" ? { code: 1, stderr: `Error response from daemon: network ${n.id} not found` } : undefined));
+    await racing.removeProjectNetwork(n);
+    const busy = mkEgress();
+    const m = putNet(busy);
+    busy.script.push((a) => (a[1] === "rm" ? { code: 1, stderr: "has active endpoints" } : undefined));
+    await expect(busy.removeProjectNetwork(m.id)).rejects.toThrow(/Failed to remove network/);
+    await expect(d.removeProjectNetwork(PNET)).rejects.toThrow(/full id/);
+  });
+});
+
+describe("networkState", () => {
+  it.each<[string, string[] | "gone", string]>([
+    ["a missing container", "gone", "off"],
+    ["no networks", [], "off"],
+    ["its own network only", [PNET], "contained"],
+    ["bridge only", ["bridge"], "open"],
+    ["bridge and its own network", ["bridge", PNET], "open"],
+    ["another network only", ["other_default"], "open"],
+    ["its own network and another", [PNET, "other_default"], "open"],
+    ["another sandbox's -net", ["mcpe-0123abcd-other-net"], "open"],
+  ])("%s is %s", async (_n, networks, want) => {
+    const d = mkEgress();
+    if (networks !== "gone") d.put(PS, "mine", { networks });
+    expect(await d.networkState(PS)).toBe(want);
+    expect(d.verbs).toEqual(["inspect"]);
+  });
+
+  it("by reference it reads one inspect by id, without labels, and judges by the reference's name", async () => {
+    const d = mkEgress();
+    const id = d.put(PS, "another", { networks: [PNET] });
+    expect(await d.networkState({ id, name: PS })).toBe("contained");
+    expect(await d.networkState({ id, name: "mcpe-0123abcd-other" })).toBe("open");
+    expect(d.argvs.every((a) => !a.join(" ").includes("Config.Labels"))).toBe(true);
+  });
+});
+
+describe('setNetwork: "off"', () => {
+  it("on bridge alone makes exactly today's call, without -f; on nothing it makes none", async () => {
+    const d = mkEgress();
+    const id = d.put(PS, "mine", { networks: ["bridge"] });
+    await d.setNetwork(PS, "off");
+    expect(d.argvs).toEqual([d.argvs[0]!, ["network", "disconnect", "bridge", id]]);
+    const none = mkEgress();
+    none.put(PS, "mine");
+    await none.setNetwork(PS, "off");
+    expect(none.verbs).toEqual(["inspect"]);
+  });
+
+  it("with its -net listed: disconnects it (-f), then removes the project's proxies, then the -net", async () => {
+    const d = mkEgress();
+    const net = putNet(d);
+    const id = d.put(PS, "mine", { networks: [PNET] });
+    const px = putProxy(d);
+    putProxy(d, proxyName(1, "mcpe-0123abcd-twin"), proxyLabels("mcpe-0123abcd-twin"), { networks: ["bridge", "mcpe-0123abcd-twin-net"] });
+    await d.setNetwork(PS, "off");
+    expect(d.argvs.filter((a) => a[0] === "network" && a[1] !== "inspect")).toEqual([["network", "disconnect", "-f", PNET, id], ["network", "rm", net.id]]);
+    expect(removals(d)).toEqual([["rm", "-f", "-v", px.id], ["network", "rm", net.id]]);
+    expect(d.verbs.indexOf("network disconnect")).toBeLessThan(d.verbs.indexOf("rm"));
+    expect(d.containers.get(PS)!.networks).toEqual([]);
+    expect(d.networks.size).toBe(0);
+    expect([...d.containers.keys()].sort()).toEqual([PS, proxyName(1, "mcpe-0123abcd-twin")].sort());
+  });
+
+  it("with a -net that Docker no longer has (a stopped sandbox keeps its name): only the disconnect", async () => {
+    const d = mkEgress();
+    const id = d.put(PS, "mine", { networks: [PNET], running: false });
+    await d.setNetwork(PS, "off");
+    expect(d.verbs).toEqual(["inspect", "ps", "network inspect", "network disconnect"]);
+    expect(d.argvs.at(-1)).toEqual(["network", "disconnect", "-f", PNET, id]);
+  });
+
+  it("ignores 'not found' and 'not connected' on a disconnect, and throws any other failure", async () => {
+    for (const stderr of ["Error response from daemon: network x not found", "Error response from daemon: container y is not connected to network x", "No such container: z"]) {
+      const d = mkEgress();
+      putNet(d);
+      d.put(PS, "mine", { networks: [PNET] });
+      // Docker answers with the error, and the container is off the network all the same (it was never on it, or the network is gone).
+      d.script.push((a) => {
+        if (a[1] !== "disconnect") return undefined;
+        d.containers.get(PS)!.networks = [];
+        return { code: 1, stderr };
+      });
+      await d.setNetwork(PS, "off");
+      expect(d.networks.size).toBe(0);
+    }
+    const bad = mkEgress();
+    putNet(bad);
+    bad.put(PS, "mine", { networks: [PNET] });
+    bad.script.push((a) => (a[1] === "disconnect" ? { code: 1, stderr: "permission denied" } : undefined));
+    await expect(bad.setNetwork(PS, "off")).rejects.toThrow(/Failed to disable network for .*: permission denied/);
+    expect(removals(bad)).toEqual([]);
+  });
+
+  it("refuses, before any change, when the -net is not this installation's", async () => {
+    const d = mkEgress();
+    putNet(d, { labels: null });
+    d.put(PS, "mine", { networks: [PNET] });
+    const e = await settle(d.setNetwork(PS, "off"));
+    expect(e).toBeInstanceOf(SandboxRefusedError);
+    expect(d.count("network disconnect")).toBe(0);
+    expect(removals(d)).toEqual([]);
+  });
+
+  it("another network it is on (no -net) is disconnected with -f and nothing is removed", async () => {
+    const d = mkEgress();
+    const id = d.put(PS, "mine", { networks: ["bridge", "other_default"] });
+    await d.setNetwork(PS, "off");
+    expect(d.argvs.filter((a) => a[1] === "disconnect")).toEqual([["network", "disconnect", "-f", "bridge", id], ["network", "disconnect", "-f", "other_default", id]]);
+    expect(d.count("ps")).toBe(0);
+    expect(removals(d)).toEqual([]);
+  });
+});
+
+describe('setNetwork: "open"', () => {
+  it("on bridge, alone or with others, does nothing; on nothing or a foreign network only, connects bridge", async () => {
+    for (const networks of [["bridge"], ["bridge", PNET], ["bridge", "other_default"]]) {
+      const d = mkEgress();
+      d.put(PS, "mine", { networks });
+      await d.setNetwork(PS, "open");
+      expect(d.verbs).toEqual(["inspect"]);
+    }
+    for (const networks of [[], ["other_default"]]) {
+      const d = mkEgress();
+      const id = d.put(PS, "mine", { networks });
+      await d.setNetwork(PS, "open");
+      expect(d.argvs.at(-1)).toEqual(["network", "connect", "bridge", id]);
+      expect(d.containers.get(PS)!.networks).toEqual([...networks, "bridge"]);
+      expect(d.count("network disconnect") + removals(d).length).toBe(0);
+    }
+  });
+
+  it("on its -net: removes the proxies, disconnects -f, removes the -net, then connects bridge, in that order", async () => {
+    const d = mkEgress();
+    const net = putNet(d);
+    const id = d.put(PS, "mine", { networks: [PNET] });
+    const px = putProxy(d);
+    await d.setNetwork(PS, "open");
+    expect(d.argvs.filter((a) => a[0] === "rm" || (a[0] === "network" && a[1] !== "inspect"))).toEqual([
+      ["rm", "-f", "-v", px.id],
+      ["network", "disconnect", "-f", PNET, id],
+      ["network", "rm", net.id],
+      ["network", "connect", "bridge", id],
+    ]);
+    expect(d.containers.get(PS)!.networks).toEqual(["bridge"]);
+  });
+
+  it("throws before connecting bridge when a proxy cannot be removed, and removes nothing else", async () => {
+    const d = mkEgress();
+    putNet(d);
+    d.put(PS, "mine", { networks: [PNET] });
+    putProxy(d);
+    d.script.push((a) => (a[0] === "rm" ? { code: 1, stderr: "device busy" } : undefined));
+    await expect(d.setNetwork(PS, "open")).rejects.toThrow(/Failed to remove proxy/);
+    expect(d.count("network connect")).toBe(0);
+    expect(d.count("network rm")).toBe(0);
+    expect(d.containers.get(PS)!.networks).toEqual([PNET]);
+  });
+
+  it("refuses, before any change, a -net that is not this installation's", async () => {
+    const d = mkEgress();
+    putNet(d, { labels: netLabels({ [OWNER_L]: OTHER_ID }) });
+    d.put(PS, "mine", { networks: [PNET] });
+    expect(await settle(d.setNetwork(PS, "open"))).toBeInstanceOf(SandboxRefusedError);
+    expect(d.count("network connect") + d.count("network disconnect") + removals(d).length).toBe(0);
+  });
+});
+
+describe('setNetwork: "contained"', () => {
+  it("attaches the -net before it disconnects bridge, and ends on the -net only", async () => {
+    const d = mkEgress();
+    const net = putNet(d);
+    const id = d.put(PS, "mine", { networks: ["bridge"] });
+    await d.setNetwork(PS, "contained");
+    expect(d.argvs.filter((a) => a[0] === "network" && a[1] !== "inspect")).toEqual([
+      ["network", "disconnect", "-f", PNET, id],
+      ["network", "connect", net.id, id],
+      ["network", "disconnect", "bridge", id],
+    ]);
+    expect(d.containers.get(PS)!.networks).toEqual([PNET]);
+    expect(await d.networkState(PS)).toBe("contained");
+  });
+
+  it("from nothing it only attaches; it never makes the network or a proxy", async () => {
+    const d = mkEgress();
+    putNet(d);
+    d.put(PS, "mine", { networks: [] });
+    await d.setNetwork(PS, "contained");
+    expect(d.containers.get(PS)!.networks).toEqual([PNET]);
+    expect(d.count("network create") + d.count("create") + d.count("run")).toBe(0);
+  });
+
+  it("throws when the network is not there, and changes nothing", async () => {
+    const d = mkEgress();
+    d.put(PS, "mine", { networks: ["bridge"] });
+    await expect(d.setNetwork(PS, "contained")).rejects.toThrow(/does not exist/);
+    expect(d.count("network connect") + d.count("network disconnect") + d.count("network create")).toBe(0);
+  });
+
+  it("refuses a network that is someone else's or another project's, and changes nothing", async () => {
+    for (const labels of [netLabels({ [OWNER_L]: OTHER_ID }), netLabels({ [PROJECT_L]: "github:o/other" }), netLabels({ [SANDBOX_L]: "mcpe-0123abcd-other" })]) {
+      const d = mkEgress();
+      putNet(d, { labels });
+      d.put(PS, "mine", { networks: ["bridge"] });
+      expect(await settle(d.setNetwork(PS, "contained"))).toBeInstanceOf(SandboxRefusedError);
+      expect(d.count("network connect") + d.count("network disconnect")).toBe(0);
+    }
+  });
+
+  it("leaves bridge on when the attach fails", async () => {
+    const d = mkEgress();
+    putNet(d);
+    const id = d.put(PS, "mine", { networks: ["bridge"] });
+    d.script.push((a) => (a[1] === "connect" ? { code: 1, stderr: "boom" } : undefined));
+    await expect(d.setNetwork(PS, "contained")).rejects.toThrow(/Failed to attach/);
+    expect(d.argvs).not.toContainEqual(["network", "disconnect", "bridge", id]);
+    expect(d.containers.get(PS)!.networks).toEqual(["bridge"]);
+  });
+
+  it("by reference it checks the network by name without a project, and rejects an unknown mode", async () => {
+    const d = mkEgress();
+    putNet(d);
+    const id = d.put(PS, "another", { networks: [] });
+    await d.setNetwork({ id, name: PS }, "contained");
+    expect(d.containers.get(PS)!.networks).toEqual([PNET]);
+    await expect(d.setNetwork(PS, "maybe" as never)).rejects.toThrow(/Unknown network mode/);
+  });
+
+  it("T14 in the double: a stopped sandbox whose -net was removed and made again attaches and ends on it", async () => {
+    const d = mkEgress();
+    const id = d.put(PS, "mine", { networks: [PNET], running: false });
+    expect(await d.networkState(PS)).toBe("contained"); // by its list only
+    const net = await d.ensureProjectNetwork(PS, PROJ);
+    await d.attachProjectNetwork(makeRef(id, PS), net);
+    expect(d.containers.get(PS)!.networks).toEqual([PNET]);
+    expect(d.argvs.filter((a) => a[1] === "disconnect")[0]).toEqual(["network", "disconnect", "-f", PNET, id]);
+  });
+});
+
+describe("destroy of a project with a proxy and a network", () => {
+  const world = () => {
+    const d = mkEgress();
+    const net = putNet(d);
+    const id = d.put(PS, "mine", { networks: [PNET] });
+    const px = putProxy(d);
+    d.putVolume(PV, "mine");
+    return { d, net, id, px };
+  };
+  const READS = ["inspect", "volume inspect", "ps", "network inspect"];
+
+  it("removes the container, then the proxies, then the network, then the volume, after every read", async () => {
+    const { d, net, id, px } = world();
+    putProxy(d, proxyName(1, "mcpe-0123abcd-twin"), proxyLabels("mcpe-0123abcd-twin"), { networks: ["bridge", "mcpe-0123abcd-twin-net"] });
+    await d.destroy(PS, PV);
+    expect(removals(d)).toEqual([["rm", "-f", "-v", id], ["rm", "-f", "-v", px.id], ["network", "rm", net.id], ["volume", "rm", "-f", PV]]);
+    const firstRemoval = d.argvs.findIndex((a) => a[0] === "rm");
+    const lastRead = Math.max(...READS.map((v) => d.verbs.lastIndexOf(v)));
+    expect(lastRead).toBeLessThan(firstRemoval);
+    expect(d.containers.has(proxyName(1, "mcpe-0123abcd-twin"))).toBe(true); // a twin is never touched
+    expect(d.networks.size).toBe(0);
+  });
+
+  it("finds the proxies and the network after the container is gone", async () => {
+    const d = mkEgress();
+    const net = putNet(d);
+    const px = putProxy(d);
+    d.putVolume(PV, "mine");
+    await d.destroy(PS, PV);
+    expect(removals(d)).toEqual([["rm", "-f", "-v", px.id], ["network", "rm", net.id], ["volume", "rm", "-f", PV]]);
+  });
+
+  it("a sandbox from before ownership (no project label) is destroyed the same way", async () => {
+    const d = mkEgress();
+    const net = putNet(d);
+    const id = d.put(PS, "before", { networks: [PNET] });
+    const px = putProxy(d);
+    await d.destroy(PS, PV);
+    expect(removals(d)).toEqual([["rm", "-f", "-v", id], ["rm", "-f", "-v", px.id], ["network", "rm", net.id]]);
+  });
+
+  it.each<[string, Labels]>([
+    ["another installation's", netLabels({ [OWNER_L]: OTHER_ID })],
+    ["without labels", null],
+    ["of another role", netLabels({ [ROLE_L]: "oneshot-net" })],
+  ])("a network named <sandbox>-net that is %s refuses the whole destroy: nothing is removed", async (_n, labels) => {
+    const { d } = world();
+    d.networks.get(PNET)!.labels = labels as Record<string, string> | null;
+    const e = await settle(d.destroy(PS, PV));
+    expect(e).toBeInstanceOf(SandboxRefusedError);
+    const r = e as SandboxRefusedError;
+    expect(r.sandboxes.map((f) => [f.kind, f.sandbox])).toEqual([["container", PS], ["volume", PV], ["proxy", proxyName()], ["network", PNET]]);
+    expect(r.message).toContain(`network "${PNET}"`);
+    expect(removals(d)).toEqual([]);
+    expect(d.containers.has(PS)).toBe(true);
+    expect(d.volumes.has(PV)).toBe(true);
+  });
+
+  it("the refusal names the new kinds, and the left-in-place text can name them", async () => {
+    const { d } = world();
+    d.networks.get(PNET)!.labels = netLabels({ [OWNER_L]: OTHER_ID });
+    const e = (await settle(d.destroy(PS, PV))) as SandboxRefusedError;
+    expect(e.kind).toBe("network");
+    expect(e.reason).toBe("another");
+    expect(e.message).toContain("is another installation's");
+  });
+
+  it("a proxy or a network that cannot be asked about leaves everything alone", async () => {
+    for (const verb of ["ps", "network"]) {
+      const { d } = world();
+      d.script.push((a) => (a[0] === verb && (verb === "ps" || a[1] === "inspect") ? { code: 1, stderr: "Cannot connect" } : undefined));
+      await expect(d.destroy(PS, PV)).rejects.toBeInstanceOf(DockerUnavailableError);
+      expect(removals(d)).toEqual([]);
+    }
+  });
+
+  it("the order matters: with a proxy still on the network the double (like Docker) refuses its removal", async () => {
+    const { d, net } = world();
+    const e = await settle(d.removeProjectNetwork(net.id));
+    expect((e as Error).message).toMatch(/Failed to remove network.*active endpoints/);
+    expect(d.networks.has(PNET)).toBe(true);
+  });
+
+  it("removeContainer keeps the project's proxies and network (the installer builds more than once)", async () => {
+    const { d, px, id } = world();
+    await d.removeContainer(PS);
+    expect(removals(d)).toEqual([["rm", "-f", "-v", id]]);
+    expect(d.count("ps")).toBe(0);
+    expect(d.count("network rm")).toBe(0);
+    expect(d.containers.has(px.name)).toBe(true);
+    expect(d.networks.has(PNET)).toBe(true);
+  });
+});
+
+describe("the environment of an exec", () => {
+  const stoppedBox = () => {
+    const d = mk();
+    const id = d.put(N, "mine", { running: false });
+    return { d, id };
+  };
+
+  it("adds -e NAME=value before the container id, the caller's then the reference's", async () => {
+    const d = mk();
+    const id = d.put(N, "mine");
+    await d.exec(makeRef(id, N, { HTTP_PROXY: "http://mcpe-proxy:3128" }), ["true"], { ...OPTS, cwd: "/w", env: { A: "1" } });
+    expect(d.execs[0]).toEqual(["exec", "-i", "-w", "/w", "-e", "A=1", "-e", "HTTP_PROXY=http://mcpe-proxy:3128", id, "timeout", "-k", "5", "10", "true"]);
+    await d.exec(makeRef(id, N), ["true"], OPTS);
+    expect(d.execs[1]).toEqual(["exec", "-i", id, "timeout", "-k", "5", "10", "true"]);
+  });
+
+  it("the reference's environment wins over the caller's, and a caller cannot remove it", async () => {
+    const d = mk();
+    const id = d.put(N, "mine");
+    await d.exec(makeRef(id, N, { HTTP_PROXY: "http://mcpe-proxy:3128" }), ["true"], { ...OPTS, env: { HTTP_PROXY: "http://evil:1", NO_PROXY: "*" } });
+    const e = d.execs[0]!.flatMap((x, i, a) => (a[i - 1] === "-e" ? [x] : []));
+    expect(e).toEqual(["HTTP_PROXY=http://mcpe-proxy:3128", "NO_PROXY=*"]);
+  });
+
+  it("an exec by name carries only the caller's variables", async () => {
+    const d = mk();
+    d.put(N, "mine");
+    await d.exec(N, ["true"], { ...OPTS, env: { A: "1" } });
+    expect(d.execs[0]!.slice(0, 4)).toEqual(["exec", "-i", "-e", "A=1"]);
+  });
+
+  it("the retry after a stopped sandbox is started carries the same environment", async () => {
+    const { d, id } = stoppedBox();
+    d.execReplies = [{ code: 1, stderr: DAEMON }, { code: 0 }];
+    await d.exec(makeRef(id, N, { P: "1" }), ["true"], { ...OPTS, env: { A: "2" } });
+    expect(d.execs).toHaveLength(2);
+    expect(d.execs[1]).toEqual(d.execs[0]);
+    expect(d.execs[0]!.slice(2, 6)).toEqual(["-e", "A=2", "-e", "P=1"]);
+  });
+
+  it.each([["a name that is not an identifier", { "1A": "x" }], ["a name with a dash", { "A-B": "x" }], ["an empty name", { "": "x" }], ["a name with =", { "A=B": "x" }],
+    ["a value with a line break", { A: "x\ny" }], ["a value with CR", { A: "x\ry" }], ["a value with NUL", { A: "x\u0000y" }]])(
+    "refuses %s, and runs nothing",
+    async (_n, env) => {
+      const d = mk();
+      const id = d.put(N, "mine");
+      await expect(d.exec(makeRef(id, N), ["true"], { ...OPTS, env })).rejects.toThrow(/environment variable/i);
+      await expect(d.exec(makeRef(id, N, env), ["true"], OPTS)).rejects.toThrow(/environment variable/i);
+      expect(d.count("exec")).toBe(0);
+    },
+  );
+
+  it("a reference's environment is a frozen copy", () => {
+    const env = { A: "1" };
+    const ref = makeRef("a".repeat(64), N, env);
+    env.A = "2";
+    expect(ref.env).toEqual({ A: "1" });
+    expect(Object.isFrozen(ref)).toBe(true);
+    expect(Object.isFrozen(ref.env)).toBe(true);
+    expect("env" in makeRef("a".repeat(64), N)).toBe(false);
+  });
+
+  it("envFlags makes the pairs in order and nothing for no environment", () => {
+    expect(envFlags(undefined)).toEqual([]);
+    expect(envFlags({ A_1: "x y", _b: "=" })).toEqual(["-e", "A_1=x y", "-e", "_b=="]);
+  });
+});
+
+/** The double with a clock the test moves, for the hook's cache. */
+class TimedDocker extends ScriptedDocker {
+  t = 1_000_000;
+  protected override clock(): number {
+    return this.t;
+  }
+}
+
+describe("the containment hook (leg 7)", () => {
+  const PROXY_ENV = { HTTP_PROXY: "http://mcpe-proxy:3128", NODE_USE_ENV_PROXY: "1" };
+  const timed = (env: Record<string, string> = {}) => new TimedDocker(loadConfig(env), TEST_INSTALLATION_ID);
+
+  /** A hook that records what it is given and answers what the test says (or throws). */
+  function spy(answer: Record<string, string> | null = PROXY_ENV) {
+    const s = {
+      calls: [] as Array<{ facts: SandboxInspectFacts; mode: ContainmentHookMode }>,
+      answer,
+      error: undefined as Error | undefined,
+      gate: undefined as Promise<void> | undefined,
+      hook: undefined as unknown as ContainmentHook,
+    };
+    s.hook = async (facts, mode) => {
+      s.calls.push({ facts, mode });
+      if (s.gate) await s.gate;
+      if (s.error) throw s.error;
+      return s.answer ?? undefined;
+    };
+    return s;
+  }
+  const inspects = (d: ScriptedDocker) => d.argvs.filter((a) => a[0] === "inspect");
+  const execEnv = (a: string[]) => a.flatMap((x, i) => (x === "-e" ? [a[i + 1]!] : []));
+
+  describe("with no hook installed", () => {
+    it("a reference's exec is one command with no inspect, and a name's is one inspect and one exec", async () => {
+      const d = mk();
+      const id = d.put(N, "mine");
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      expect(d.verbs).toEqual(["exec"]);
+      const e = mk();
+      e.put(N, "mine");
+      await e.exec(N, ["true"], OPTS);
+      expect(e.verbs).toEqual(["inspect", "exec"]);
+    });
+
+    it("acquire gives a reference with no environment", async () => {
+      const d = mk();
+      d.put(N, "mine");
+      expect("env" in (await d.acquire(N))!).toBe(false);
+    });
+  });
+
+  describe("acquire", () => {
+    it("makes one full inspect, gives the hook its facts, and only then starts", async () => {
+      const d = mk();
+      d.put(N, "mine", { running: false, networks: ["bridge"], runtime: "runc" });
+      const s = spy();
+      d.setContainment(s.hook);
+      const ref = await d.acquire(N);
+      expect(s.calls).toHaveLength(1);
+      expect(s.calls[0]).toEqual({
+        mode: "full",
+        facts: { id: idFor(N), name: N, running: false, labels: LABELS.mine, networks: ["bridge"], runtime: "runc" },
+      });
+      expect(d.verbs).toEqual(["inspect", "start"]);
+      expect(inspects(d)).toHaveLength(1);
+      expect(inspects(d)[0]![inspects(d)[0]!.indexOf("--format") + 1]).toContain('"labels"');
+      expect(ref!.env).toEqual(PROXY_ENV);
+      expect(Object.isFrozen(ref!.env)).toBe(true);
+    });
+
+    it("a hook that refuses stops the start", async () => {
+      const d = mk();
+      d.put(N, "mine", { running: false });
+      const s = spy();
+      s.error = new Error("refused by the hook");
+      d.setContainment(s.hook);
+      await expect(d.acquire(N)).rejects.toThrow(/refused by the hook/);
+      expect(d.count("start")).toBe(0);
+    });
+
+    it("a hook's answer of nothing gives a reference without an environment", async () => {
+      const d = mk();
+      d.put(N, "mine");
+      d.setContainment(spy(null).hook);
+      expect("env" in (await d.acquire(N))!).toBe(false);
+    });
+
+    it("applies the runtime comparison before the hook", async () => {
+      const d = mk({ MCPE_DOCKER_RUNTIME: "runsc" });
+      d.put(N, "mine", { runtime: "runc" });
+      const s = spy();
+      d.setContainment(s.hook);
+      await expect(d.acquire(N)).rejects.toBeInstanceOf(RuntimeMismatchError);
+      expect(s.calls).toEqual([]);
+    });
+  });
+
+  describe("ensureRunning", () => {
+    it("by name: one inspect, the hook, then the start", async () => {
+      const d = mk();
+      d.put(N, "mine", { running: false });
+      const s = spy();
+      d.setContainment(s.hook);
+      expect(await d.ensureRunning(N)).toBe(true);
+      expect(s.calls.map((c) => c.mode)).toEqual(["full"]);
+      expect(d.verbs).toEqual(["inspect", "start"]);
+    });
+
+    it("by reference: the labels are read (one full inspect) so that the hook has its facts", async () => {
+      const d = mk();
+      const id = d.put(N, "mine", { running: false });
+      const s = spy();
+      d.setContainment(s.hook);
+      expect(await d.ensureRunning(makeRef(id, N))).toBe(true);
+      expect(s.calls).toHaveLength(1);
+      expect(s.calls[0]!.facts.labels).toEqual(LABELS.mine);
+      expect(d.verbs).toEqual(["inspect", "start"]);
+      expect(inspects(d)[0]![inspects(d)[0]!.indexOf("--format") + 1]).toContain('"labels"');
+    });
+
+    it("a hook that refuses stops the start", async () => {
+      const d = mk();
+      const id = d.put(N, "mine", { running: false });
+      const s = spy();
+      s.error = new Error("no");
+      d.setContainment(s.hook);
+      await expect(d.ensureRunning(makeRef(id, N))).rejects.toThrow("no");
+      expect(d.count("start")).toBe(0);
+    });
+
+    it("without a hook a reference's inspect does not read labels", async () => {
+      const d = mk();
+      const id = d.put(N, "mine", { running: false });
+      await d.ensureRunning(makeRef(id, N));
+      expect(inspects(d)[0]![inspects(d)[0]!.indexOf("--format") + 1]).not.toContain('"labels"');
+    });
+  });
+
+  describe("exec", () => {
+    it("by name: one inspect, the hook in full mode, then the exec with the environment as -e flags", async () => {
+      const d = mk();
+      d.put(N, "mine");
+      const s = spy();
+      d.setContainment(s.hook);
+      await d.exec(N, ["true"], OPTS);
+      expect(s.calls.map((c) => c.mode)).toEqual(["full"]);
+      expect(d.verbs).toEqual(["inspect", "exec"]);
+      expect(execEnv(d.execs[0]!)).toEqual(expect.arrayContaining(["HTTP_PROXY=http://mcpe-proxy:3128", "NODE_USE_ENV_PROXY=1"]));
+    });
+
+    it("with restart: false asks in observe mode, by name and by reference, and compares no runtime", async () => {
+      const d = mk({ MCPE_DOCKER_RUNTIME: "runsc" });
+      const id = d.put(N, "mine", { runtime: "runc" });
+      const s = spy();
+      d.setContainment(s.hook);
+      await d.exec(makeRef(id, N), ["true"], { ...OPTS, restart: false });
+      expect(s.calls.map((c) => c.mode)).toEqual(["observe"]);
+      // By name the existing guard still compares (that is today's behavior and stays).
+      await expect(d.exec(N, ["true"], { ...OPTS, restart: false })).rejects.toBeInstanceOf(RuntimeMismatchError);
+    });
+
+    it("a hook that refuses stops the exec, by name and by reference", async () => {
+      const d = mk();
+      const id = d.put(N, "mine");
+      const s = spy();
+      s.error = new Error("not contained yet");
+      d.setContainment(s.hook);
+      await expect(d.exec(N, ["true"], OPTS)).rejects.toThrow(/not contained yet/);
+      await expect(d.exec(makeRef(id, N), ["true"], OPTS)).rejects.toThrow(/not contained yet/);
+      expect(d.execs).toEqual([]);
+    });
+
+    it("by reference, on a cache miss: one full inspect, the hook, then the exec", async () => {
+      const d = timed();
+      const id = d.put(N, "mine");
+      const s = spy();
+      d.setContainment(s.hook);
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      expect(d.verbs).toEqual(["inspect", "exec"]);
+      expect(s.calls).toHaveLength(1);
+    });
+
+    it("merges the environments: the caller's, then the hook's, then the reference's, which wins", async () => {
+      const d = timed();
+      const id = d.put(N, "mine");
+      const s = spy({ A: "hook", B: "hook" });
+      d.setContainment(s.hook);
+      await d.exec(makeRef(id, N, { B: "ref", C: "ref" }), ["true"], { ...OPTS, env: { A: "caller", B: "caller", D: "caller" } });
+      expect(execEnv(d.execs[0]!).sort()).toEqual(["A=hook", "B=ref", "C=ref", "D=caller"]);
+    });
+
+    it("applies the runtime comparison to a reference's exec from the same facts", async () => {
+      const d = mk({ MCPE_DOCKER_RUNTIME: "runsc" });
+      const id = d.put(N, "mine", { runtime: "runc" });
+      d.setContainment(spy().hook);
+      await expect(d.exec(makeRef(id, N), ["true"], OPTS)).rejects.toBeInstanceOf(RuntimeMismatchError);
+      expect(d.execs).toEqual([]);
+    });
+
+    it("a reference that is gone is not an error of the hook: the exec reports it as before", async () => {
+      const d = mk();
+      const s = spy();
+      d.setContainment(s.hook);
+      const res = await d.exec(makeRef(idFor("gone"), "gone"), ["true"], OPTS);
+      expect(res.code).toBe(0);
+      expect(s.calls).toEqual([]);
+    });
+
+    it("the restart after a stopped exec asks the hook again, before the start, and the retry carries the fresh answer", async () => {
+      const d = timed();
+      const id = d.put(N, "mine", { running: false });
+      const s = spy({ ROUND: "1" });
+      d.setContainment(s.hook);
+      d.execReplies = [{ code: 1, stderr: DAEMON }];
+      let n = 0;
+      s.hook = async (facts, mode) => {
+        s.calls.push({ facts, mode });
+        return { ROUND: String(++n) };
+      };
+      d.setContainment(s.hook);
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      // exec miss: hook round 1; restart: inspect, hook round 2, start; the retry carries round 2.
+      expect(d.verbs).toEqual(["inspect", "exec", "inspect", "start", "exec"]);
+      expect(execEnv(d.execs[0]!)).toEqual(["ROUND=1"]);
+      expect(execEnv(d.execs[1]!)).toEqual(["ROUND=2"]);
+      expect(s.calls).toHaveLength(2);
+      expect(d.verbs.indexOf("start")).toBeGreaterThan(d.verbs.lastIndexOf("inspect", d.verbs.indexOf("start")) - 1);
+      expect(d.verbs.slice(0, d.verbs.indexOf("start")).filter((v) => v === "inspect")).toHaveLength(2);
+    });
+
+    it("with restart: false a stopped exec is not restarted and the hook is asked once, in observe mode", async () => {
+      const d = timed();
+      const id = d.put(N, "mine", { running: false });
+      const s = spy();
+      d.setContainment(s.hook);
+      d.execReplies = [{ code: 1, stderr: DAEMON }];
+      const res = await d.exec(makeRef(id, N), ["true"], { ...OPTS, restart: false });
+      expect(res.code).toBe(1);
+      expect(d.count("start")).toBe(0);
+      expect(s.calls.map((c) => c.mode)).toEqual(["observe"]);
+    });
+  });
+
+  describe("the cache", () => {
+    it("an exec by reference on a running sandbox reuses the hook's answer for 5 s, then asks again", async () => {
+      const d = timed();
+      const id = d.put(N, "mine");
+      const s = spy();
+      d.setContainment(s.hook);
+      const ref = makeRef(id, N);
+      await d.exec(ref, ["true"], OPTS);
+      d.t += 4_999;
+      await d.exec(ref, ["true"], OPTS);
+      expect(s.calls).toHaveLength(1);
+      expect(inspects(d)).toHaveLength(1);
+      expect(execEnv(d.execs[1]!)).toEqual(execEnv(d.execs[0]!));
+      d.t += 1;
+      await d.exec(ref, ["true"], OPTS);
+      expect(s.calls).toHaveLength(2);
+      expect(inspects(d)).toHaveLength(2);
+    });
+
+    it("caches an answer of nothing too (an open sandbox costs one inspect per 5 s)", async () => {
+      const d = timed();
+      const id = d.put(N, "mine", { networks: ["bridge"] });
+      const s = spy(null);
+      d.setContainment(s.hook);
+      for (let i = 0; i < 5; i++) await d.exec(makeRef(id, N), ["true"], OPTS);
+      expect(s.calls).toHaveLength(1);
+      expect(execEnv(d.execs[4]!)).toEqual([]);
+    });
+
+    it("is neither read nor written when the inspect said the sandbox is stopped", async () => {
+      const d = timed();
+      const id = d.put(N, "mine", { running: false });
+      const s = spy();
+      d.setContainment(s.hook);
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      expect(s.calls).toHaveLength(2);
+    });
+
+    it("is never read by an exec by name, and never by the restart (startIfStopped)", async () => {
+      const d = timed();
+      const id = d.put(N, "mine");
+      const s = spy();
+      d.setContainment(s.hook);
+      const ref = makeRef(id, N);
+      await d.exec(ref, ["true"], OPTS);
+      await d.exec(N, ["true"], OPTS);
+      expect(s.calls).toHaveLength(2);
+      d.execReplies = [{ code: 1, stderr: DAEMON }];
+      await d.exec(ref, ["true"], OPTS); // a cache hit, then the stopped failure, then the restart's own inspect and hook
+      expect(s.calls).toHaveLength(3);
+    });
+
+    it("observe mode neither reads nor writes it", async () => {
+      const d = timed();
+      const id = d.put(N, "mine");
+      const s = spy();
+      d.setContainment(s.hook);
+      const ref = makeRef(id, N);
+      await d.exec(ref, ["true"], OPTS);
+      await d.exec(ref, ["true"], { ...OPTS, restart: false });
+      expect(s.calls.map((c) => c.mode)).toEqual(["full", "observe"]);
+    });
+
+    it("setNetwork invalidates it for that sandbox only", async () => {
+      const d = timed();
+      const id = d.put(N, "mine", { networks: ["bridge"] });
+      const other = "mcpe-0123abcd-other";
+      const idOther = d.put(other, "mine", { networks: ["bridge"] });
+      const s = spy();
+      d.setContainment(s.hook);
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      await d.exec(makeRef(idOther, other), ["true"], OPTS);
+      expect(s.calls).toHaveLength(2);
+      await d.setNetwork(N, "off");
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      await d.exec(makeRef(idOther, other), ["true"], OPTS);
+      expect(s.calls).toHaveLength(3);
+    });
+
+    it("a setNetwork that fails invalidates it too", async () => {
+      const d = timed();
+      const id = d.put(N, "mine", { networks: ["bridge"] });
+      const s = spy();
+      d.setContainment(s.hook);
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      d.script.push((a) => (a[0] === "network" && a[1] === "disconnect" ? { code: 1, stderr: "boom" } : undefined));
+      await expect(d.setNetwork(N, "off")).rejects.toThrow();
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      expect(s.calls).toHaveLength(2);
+    });
+
+    it("destroy invalidates it", async () => {
+      const d = timed();
+      const id = d.put(N, "mine");
+      d.putVolume(V, "mine");
+      const s = spy();
+      d.setContainment(s.hook);
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      await d.destroy(N, V);
+      d.put(N, "mine");
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      expect(s.calls).toHaveLength(2);
+    });
+
+    it("invalidate({id}), ({sandbox}), ({key}) and no filter each clear the matching entries and no others", async () => {
+      const d = timed();
+      const a = d.put(N, "mine");
+      const other = "mcpe-0123abcd-other";
+      const b = d.put(other, "mine");
+      d.containers.get(other)!.labels = { ...LABELS.mine, "mcp-everything.project": "github:O/Other" };
+      const s = spy();
+      d.setContainment(s.hook);
+      const prime = async () => {
+        s.calls.length = 0;
+        await d.exec(makeRef(a, N), ["true"], OPTS);
+        await d.exec(makeRef(b, other), ["true"], OPTS);
+        s.calls.length = 0;
+      };
+      const probe = async () => {
+        await d.exec(makeRef(a, N), ["true"], OPTS);
+        await d.exec(makeRef(b, other), ["true"], OPTS);
+        return s.calls.map((c) => c.facts.name);
+      };
+      await prime();
+      d.invalidate({ id: a });
+      expect(await probe()).toEqual([N]);
+      await prime();
+      d.invalidate({ sandbox: other });
+      expect(await probe()).toEqual([other]);
+      await prime();
+      d.invalidate({ key: "github:o/other" });
+      expect(await probe()).toEqual([other]);
+      await prime();
+      d.invalidate();
+      expect(await probe()).toEqual([N, other]);
+    });
+
+    it("an answer that was in flight across an invalidation is used once but not kept", async () => {
+      const d = timed();
+      const id = d.put(N, "mine");
+      const s = spy();
+      let release!: () => void;
+      s.gate = new Promise<void>((r) => {
+        release = r;
+      });
+      d.setContainment(s.hook);
+      const first = d.exec(makeRef(id, N), ["true"], OPTS);
+      await new Promise((r) => setImmediate(r));
+      expect(s.calls).toHaveLength(1);
+      d.invalidate({ id });
+      release();
+      await first;
+      s.gate = undefined;
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      expect(s.calls).toHaveLength(2);
+    });
+
+    it("installing or removing a hook clears it", async () => {
+      const d = timed();
+      const id = d.put(N, "mine");
+      const s = spy();
+      d.setContainment(s.hook);
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      d.setContainment(undefined);
+      d.setContainment(s.hook);
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      expect(s.calls).toHaveLength(2);
+    });
+  });
+
+  describe("with the real Containment as the hook", () => {
+    const PROJECT = "github:owner/app";
+    const dirs: string[] = [];
+    const setup = async (env: Record<string, string>) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-hook-"));
+      dirs.push(dir);
+      const d = timed({ MCPE_DATA_DIR: dir, ...env });
+      const cfg = loadConfig({ MCPE_DATA_DIR: dir, ...env });
+      const reg = new Registry(dir);
+      reg.put({ ...record("app"), container: N, ecosystems: ["node"] });
+      const c = new Containment(cfg, reg, d, { dataDir: dir });
+      let entries = 0;
+      d.setContainment(async (facts, mode) => {
+        entries++;
+        return c.ensureContained(facts, mode);
+      });
+      return { d, c, entries: () => entries };
+    };
+    afterEach(() => {
+      for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("a repair that makes a network and a proxy enters the hook once, and the exec carries the proxy environment", async () => {
+      const { d, entries } = await setup({ MCPE_NETWORK: "contained" });
+      const net = await d.ensureProjectNetwork(N, PROJECT);
+      const id = d.put(N, "mine", { networks: [net.name] });
+      d.containers.get(N)!.labels = { ...LABELS.mine, "mcp-everything.project": PROJECT };
+      await d.exec(makeRef(id, N), ["true"], OPTS);
+      expect(entries()).toBe(1);
+      expect(d.created.filter((c) => c.labels["mcp-everything.role"] === "project-proxy")).toHaveLength(1);
+      expect(execEnv(d.execs.at(-1)!)).toEqual(expect.arrayContaining(Object.entries(proxyEnvironment()).map(([k, v]) => `${k}=${v}`)));
+    });
+
+    it("acquire of a contained sandbox with no proxy repairs it with one hook entry and returns the environment on the reference", async () => {
+      const { d, entries } = await setup({ MCPE_NETWORK: "contained" });
+      const net = await d.ensureProjectNetwork(N, PROJECT);
+      d.put(N, "mine", { running: false, networks: [net.name] });
+      d.containers.get(N)!.labels = { ...LABELS.mine, "mcp-everything.project": PROJECT };
+      const ref = await d.acquire(N);
+      expect(entries()).toBe(1);
+      expect(ref!.env).toEqual(proxyEnvironment());
+      expect(d.containers.get(N)!.running).toBe(true);
+    });
+
+    it("contain, setNetwork and everything they call never enter the hook", async () => {
+      const { d, c, entries } = await setup({ MCPE_NETWORK: "contained" });
+      d.put(N, "mine", { networks: ["bridge"] });
+      d.containers.get(N)!.labels = { ...LABELS.mine, "mcp-everything.project": PROJECT };
+      const r = await c.contain(PROJECT);
+      expect(r).toMatchObject({ ok: true });
+      expect(entries()).toBe(0);
+      expect(await d.networkState(N)).toBe("contained");
+      await d.setNetwork(N, "off");
+      expect(entries()).toBe(0);
+      // The proxy and the network the contain made went with the setNetwork.
+      expect(d.containers.has(N)).toBe(true);
+      expect([...d.containers.values()].filter((x) => x.labels?.["mcp-everything.role"] === "project-proxy")).toEqual([]);
+    });
+
+    it("under open, 10 execs by reference on a running, non-contained sandbox cost 10 execs and at most one inspect per 5 s", async () => {
+      const { d } = await setup({});
+      const id = d.put(N, "mine", { networks: ["bridge"] });
+      d.containers.get(N)!.labels = { ...LABELS.mine, "mcp-everything.project": PROJECT };
+      // Ten execs one second apart (nine seconds): the cache answers within each 5 s.
+      for (let i = 0; i < 10; i++) {
+        await d.exec(makeRef(id, N), ["true"], OPTS);
+        d.t += 1_000;
+      }
+      expect(d.count("exec")).toBe(10);
+      expect(d.count("inspect")).toBe(2);
+      expect(d.argvs).toHaveLength(12);
+      // A burst of ten inside one window: one extra inspect.
+      const e = (await setup({})).d;
+      const id2 = e.put(N, "mine", { networks: ["bridge"] });
+      e.containers.get(N)!.labels = { ...LABELS.mine, "mcp-everything.project": PROJECT };
+      for (let i = 0; i < 10; i++) await e.exec(makeRef(id2, N), ["true"], OPTS);
+      expect(e.count("inspect")).toBe(1);
+      expect(e.argvs).toHaveLength(11);
+    });
+
+    it("under open, an exec by name costs the one inspect it always did", async () => {
+      const { d } = await setup({});
+      d.put(N, "mine", { networks: ["bridge"] });
+      await d.exec(N, ["true"], OPTS);
+      expect(d.verbs).toEqual(["inspect", "exec"]);
+    });
+  });
+});
+
+describe("what containment asks of the Docker layer (leg 7)", () => {
+  describe("startForContainment", () => {
+    it("starts a stopped sandbox by name, classified and runtime-checked, without asking the hook", async () => {
+      const d = mk();
+      d.put(N, "mine", { running: false });
+      let asked = 0;
+      d.setContainment(async () => {
+        asked++;
+        return undefined;
+      });
+      const ref = await d.startForContainment(N);
+      expect(ref).toMatchObject({ name: N, id: idFor(N) });
+      expect("env" in ref!).toBe(false);
+      expect(asked).toBe(0);
+      expect(d.verbs).toEqual(["inspect", "start"]);
+      expect(await mk().startForContainment(N)).toBeUndefined();
+    });
+
+    it("refuses another's sandbox and a runtime mismatch, and starts nothing", async () => {
+      const d = mk({ MCPE_DOCKER_RUNTIME: "runsc" });
+      d.put(N, "mine", { running: false, runtime: "runc" });
+      await expect(d.startForContainment(N)).rejects.toBeInstanceOf(RuntimeMismatchError);
+      const e = mk();
+      e.put(N, "another", { running: false });
+      await expect(e.startForContainment(N)).rejects.toBeInstanceOf(SandboxRefusedError);
+      expect(d.count("start") + e.count("start")).toBe(0);
+    });
+  });
+
+  describe("inspectSandbox", () => {
+    it("answers the facts of one full inspect, never starts, never asks the hook", async () => {
+      const d = mk();
+      d.put(N, "mine", { running: false, networks: ["bridge"], runtime: "runc" });
+      let asked = 0;
+      d.setContainment(async () => {
+        asked++;
+        return undefined;
+      });
+      expect(await d.inspectSandbox(N)).toEqual({ id: idFor(N), name: N, running: false, labels: LABELS.mine, networks: ["bridge"], runtime: "runc" });
+      expect(d.verbs).toEqual(["inspect"]);
+      expect(asked).toBe(0);
+      expect(await mk().inspectSandbox(N)).toBeUndefined();
+    });
+  });
+
+  describe("findProjectNetwork", () => {
+    it("is undefined when there is no such network, and the network, unchanged, when it is the project's", async () => {
+      const d = mkEgress();
+      expect(await d.findProjectNetwork(PS, PROJ)).toBeUndefined();
+      const net = putNet(d);
+      expect(await d.findProjectNetwork(PS, PROJ)).toEqual({ id: net.id, name: PNET, subnet: "172.30.50.0/24" });
+      expect(d.verbs).toEqual(["network inspect", "network inspect"]);
+    });
+
+    it("refuses a network of another project or another owner, and never makes or removes one", async () => {
+      const d = mkEgress();
+      putNet(d, { labels: { ...netLabels(), [PROJECT_L]: "github:o/elsewhere" } });
+      await expect(d.findProjectNetwork(PS, PROJ)).rejects.toBeInstanceOf(SandboxRefusedError);
+      expect(d.verbs.every((v) => v === "network inspect")).toBe(true);
+    });
+  });
+
+  describe("projectProxyAttached", () => {
+    it("is true for a proxy on the network under mcpe-proxy, false for one that is not, and reads only", async () => {
+      const d = mkEgress();
+      const net = putNet(d);
+      const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+      d.argvs.length = 0;
+      expect(await d.projectProxyAttached(p.id, net)).toBe(true);
+      expect(d.verbs).toEqual(["inspect"]);
+      d.containers.get(p.name)!.networks = ["bridge"];
+      expect(await d.projectProxyAttached(p.id, net)).toBe(false);
+      expect(await d.projectProxyAttached(p.id, { id: "other", name: PNET })).toBe(false);
+      expect(await d.projectProxyAttached(idFor("gone"), net)).toBe(false);
+      await expect(d.projectProxyAttached("not-an-id", net)).rejects.toThrow(/full id/);
+    });
+
+    it("needs the alias, not just the network", async () => {
+      const d = mkEgress();
+      const net = putNet(d);
+      const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+      d.script.push((a) =>
+        a[0] === "inspect" && a[a.indexOf("--format") + 1] === "{{json .NetworkSettings.Networks}}"
+          ? { stdout: JSON.stringify({ [PNET]: { NetworkID: net.id, Aliases: ["db.lan"] } }) }
+          : undefined,
+      );
+      expect(await d.projectProxyAttached(p.id, net)).toBe(false);
+    });
+
+    it("says it cannot tell when Docker cannot answer, rather than false", async () => {
+      const d = mkEgress();
+      const net = putNet(d);
+      const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+      d.script.push((a) => (a[0] === "inspect" ? { code: 1, stderr: "Cannot connect to the Docker daemon" } : undefined));
+      await expect(d.projectProxyAttached(p.id, net)).rejects.toBeInstanceOf(DockerUnavailableError);
+    });
+  });
+
+  describe("createProjectProxy with a name given beforehand", () => {
+    it("uses the name, and refuses one that is not this sandbox's proxy name", async () => {
+      const d = mkEgress();
+      putNet(d);
+      const name = `${PS}-proxy-0a1b2c3d`;
+      expect((await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS, { name })).name).toBe(name);
+      expect(d.created.at(-1)!.name).toBe(name);
+      for (const bad of ["x", `${PS}-proxy-zz`, `other-proxy-0a1b2c3d`, `${PS}-proxy-0a1b2c3d9`]) {
+        await expect(d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS, { name: bad })).rejects.toThrow(/is named <sandbox>-proxy/);
+      }
+    });
+  });
+
+  describe("removeProjectProxyNamed", () => {
+    it("removes the proxy of that name, by id, after classifying it", async () => {
+      const d = mkEgress();
+      putNet(d);
+      const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+      d.argvs.length = 0;
+      await d.removeProjectProxyNamed(PS, p.name);
+      expect(d.argvs.at(-1)).toEqual(["rm", "-f", "-v", p.id]);
+      expect(d.containers.has(p.name)).toBe(false);
+      d.argvs.length = 0;
+      await d.removeProjectProxyNamed(PS, p.name); // gone: success
+      expect(d.argvs.map((a) => a[0])).toEqual(["inspect"]);
+    });
+
+    it("refuses a name that is not a proxy name of the sandbox, and a proxy that is another sandbox's or another installation's", async () => {
+      const d = mkEgress();
+      putNet(d);
+      const p = await d.createProjectProxy(PS, PROJ, PCONFIG, CONF_LABELS);
+      await expect(d.removeProjectProxyNamed(PS, PS)).rejects.toThrow(/is named <sandbox>-proxy/);
+      await expect(d.removeProjectProxyNamed(PS, "mcpe-0123abcd-box")).rejects.toThrow(/is named <sandbox>-proxy/);
+      d.containers.get(p.name)!.labels = { ...d.containers.get(p.name)!.labels, [SANDBOX_L]: "another-sandbox" };
+      await expect(d.removeProjectProxyNamed(PS, p.name)).rejects.toBeInstanceOf(SandboxRefusedError);
+      d.containers.get(p.name)!.labels = { ...d.containers.get(p.name)!.labels, [SANDBOX_L]: PS, [OWNER_L]: "deadbeef" };
+      await expect(d.removeProjectProxyNamed(PS, p.name)).rejects.toBeInstanceOf(SandboxRefusedError);
+      expect(d.count("rm")).toBe(0);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The contained install (flight 02, leg 8): the sandbox created stopped, the clone and the scanners behind a proxy
+// ---------------------------------------------------------------------------
+describe("createContainer with start: false (leg 8)", () => {
+  const CONTAINED = { MCPE_NETWORK: "contained" };
+  const made = async (env: Record<string, string>, start?: boolean) => {
+    const d = mk(env);
+    d.putVolume("v", "mine");
+    const ref = await d.createContainer({ name: "n", volume: "v", image: "img", project: "p", ...(start === undefined ? {} : { start }) });
+    return { d, ref };
+  };
+
+  it("issues `docker create` with the arguments of `run -d` minus `-d`, on bridge, and nothing else changes", async () => {
+    const run = await made({});
+    const create = await made({}, false);
+    const runArgs = run.d.argvs.find((a) => a[0] === "run")!;
+    const createArgs = create.d.argvs.find((a) => a[0] === "create")!;
+    expect(createArgs.slice(1)).toEqual(runArgs.slice(2));
+    expect(runArgs.slice(0, 2)).toEqual(["run", "-d"]);
+    expect(create.d.count("run")).toBe(0);
+    expect(create.d.count("start")).toBe(0);
+    expect(sub(createArgs, "--network")).toEqual(["bridge"]);
+  });
+
+  it("never uses a network other than bridge, whichever the mode", async () => {
+    for (const env of [{}, CONTAINED]) {
+      const { d } = await made(env, false);
+      expect(sub(d.argvs.find((a) => a[0] === "create")!, "--network")).toEqual(["bridge"]);
+    }
+  });
+
+  it("returns a reference for the id that create printed, and verifies it", async () => {
+    const { d, ref } = await made(CONTAINED, false);
+    expect(ref).toEqual(makeRef(idFor("n"), "n"));
+    const bad = mk(CONTAINED);
+    bad.putVolume("v", "mine");
+    bad.script.push((a) => (a[0] === "create" ? { stdout: "not-an-id\n" } : undefined));
+    await expect(bad.createContainer({ name: "n", volume: "v", image: "img", project: "p", start: false })).rejects.toThrow(/created a sandbox container but printed no usable id/);
+    expect(d.containers.get("n")!.running).toBe(false);
+  });
+
+  it("a failed create says so, and a runtime Docker will not run is the runtime refusal", async () => {
+    const d = mk(CONTAINED);
+    d.putVolume("v", "mine");
+    d.script.push((a) => (a[0] === "create" ? { code: 1, stderr: "boom\n" } : undefined));
+    await expect(d.createContainer({ name: "n", volume: "v", image: "img", project: "p", start: false })).rejects.toThrow(/Failed to create sandbox container: boom/);
+    const r = mk({ ...CONTAINED, MCPE_DOCKER_RUNTIME: "runsc" });
+    r.putVolume("v", "mine");
+    r.script.push((a) => (a[0] === "create" ? { code: 125, stderr: "docker: Error response from daemon: unknown or invalid runtime name: runsc\n" } : undefined));
+    await expect(r.createContainer({ name: "n", volume: "v", image: "img", project: "p", start: false })).rejects.toBeInstanceOf(RuntimeUnavailableError);
+  });
+
+  it("under containment a start is refused before any Docker call: a sandbox that began on bridge would have reached the network", async () => {
+    for (const start of [undefined, true]) {
+      const d = mk(CONTAINED);
+      d.putVolume("v", "mine");
+      await expect(d.createContainer({ name: "n", volume: "v", image: "img", project: "p", ...(start === undefined ? {} : { start }) })).rejects.toThrow(/not started on bridge under MCPE_NETWORK=contained/);
+      expect(d.argvs).toEqual([]);
+    }
+  });
+
+  it("under open the default is today's `docker run -d`", async () => {
+    const { d } = await made({});
+    expect(d.count("run")).toBe(1);
+    expect(d.count("create")).toBe(0);
+  });
+});
+
+describe("startForContainment maps Docker's refusal of a runtime (leg 8)", () => {
+  it("is the runtime refusal when the start says the runtime is unknown, and a plain failure otherwise", async () => {
+    const d = mk({ MCPE_DOCKER_RUNTIME: "runsc" });
+    d.put(N, "mine", { running: false, runtime: "runsc" });
+    d.script.push((a) => (a[0] === "start" ? { code: 125, stderr: "Error response from daemon: unknown or invalid runtime name: runsc\n" } : undefined));
+    await expect(d.startForContainment(N)).rejects.toBeInstanceOf(RuntimeUnavailableError);
+    const e = mk({ MCPE_DOCKER_RUNTIME: "runsc" });
+    e.put(N, "mine", { running: false, runtime: "runsc" });
+    e.script.push((a) => (a[0] === "start" ? { code: 1, stderr: "boom\n" } : undefined));
+    await expect(e.startForContainment(N)).rejects.toThrow(/Failed to start sandbox .*boom/);
+    await expect(e.startForContainment(N)).rejects.not.toBeInstanceOf(RuntimeUnavailableError);
+  });
+});
+
+describe("the clone under containment (leg 8)", () => {
+  const CONTAINED = { MCPE_NETWORK: "contained" };
+  const FORGE = { ...REPO, host: "git.example.com", cloneUrl: "https://git.example.com/o/r.git" };
+  const clone = (d: ScriptedDocker, repo: typeof REPO | typeof FORGE = REPO) => d.probe(repo, V, {});
+  const allowOf = (d: ScriptedDocker) => (JSON.parse(d.argvs.find(isProxyCreate)!.at(-1)!) as { allow: Array<{ host: string; wildcard: boolean; ports: number[]; local: boolean }> }).allow;
+
+  it("runs through a one-shot proxy that allows only the repository's forge, not on bridge", async () => {
+    const d = mkEgress(CONTAINED);
+    await clone(d);
+    expect(allowOf(d).map((e) => [e.host, e.local])).toEqual([["github.com", false]]);
+    const oneShot = d.created.find((c) => c.labels[ROLE_L] === "clone")!;
+    expect(sub(oneShot.args, "--network")).not.toContain("bridge");
+    expect(sub(oneShot.args, "--network")[0]).toMatch(/^mcpe-0123abcd-oneshot-net-/);
+    expect(d.argvs.some(isProxyCreate)).toBe(true);
+  });
+
+  it("allows a forge named in MCPE_EXTRA_HOSTS to be local; github.com and gitlab.com never are", async () => {
+    const extra = mkEgress({ ...CONTAINED, MCPE_EXTRA_HOSTS: "git.example.com=gitlab" });
+    await clone(extra, FORGE);
+    expect(allowOf(extra).map((e) => [e.host, e.local])).toEqual([["git.example.com", true]]);
+    const lab = mkEgress(CONTAINED);
+    await clone(lab, { ...REPO, host: "gitlab.com", cloneUrl: "https://gitlab.com/o/r.git" });
+    expect(allowOf(lab).map((e) => [e.host, e.local])).toEqual([["gitlab.com", false]]);
+  });
+
+  it("under open it is today's clone on bridge: no proxy, no network", async () => {
+    const d = mk();
+    await d.probe(REPO, V, {});
+    expect(d.argvs.some(isProxyCreate)).toBe(false);
+    expect(d.count("network create")).toBe(0);
+    expect(sub(d.created.find((c) => c.labels[ROLE_L] === "clone")!.args, "--network")).toEqual(["bridge"]);
+  });
+
+  it("a failed clone with refusal rows carries a line for each refused host: the error and the lines of CloneFailedError", async () => {
+    const d = mkEgress(CONTAINED);
+    failRun(d, { code: 128, stderr: "fatal: unable to access 'https://other.example/x/'\n" });
+    d.statusBody = {
+      ...READY, total: 3, resolverFailures: 0,
+      refusals: [{ ...ROW, host: "other.example" }, { ...ROW, host: "other.example", port: 80 }, { ...ROW, host: "second.example" }],
+    };
+    const e = (await settle(clone(d))) as CloneFailedError;
+    expect(e).toBeInstanceOf(CloneFailedError);
+    expect(e.refusals).toEqual([
+      "The clone was refused `other.example`: submodules on other forges are not reachable under containment.",
+      "The clone was refused `second.example`: submodules on other forges are not reachable under containment.",
+    ]);
+    expect(e.detail).toMatch(/^Could not clone https:\/\/github\.com\/o\/r\.git:\nfatal: unable to access/);
+    expect(e.message).toBe(`${e.detail}\n${e.refusals.join("\n")}`);
+    clean(d);
+  });
+
+  it("a failed clone with no rows, or only rows that name no host, has no refusal lines", async () => {
+    for (const body of [READY, { ...READY, refusals: [{ ...ROW, host: null, port: null, kind: "http", reason: "method" }], total: 1 }]) {
+      const d = mkEgress(CONTAINED);
+      failRun(d, { code: 128, stderr: "fatal: not found\n" });
+      d.statusBody = body;
+      const e = (await settle(clone(d))) as CloneFailedError;
+      expect(e.refusals).toEqual([]);
+      expect(e.message).toBe(e.detail);
+    }
+  });
+
+  it("a proxy that did not start keeps ProxyStartError's message and is never a refusal", async () => {
+    const d = mkEgress(CONTAINED);
+    d.script.push((a) => (isProxyCreate(a) ? { code: 1, stderr: "Error response from daemon: no space left\n" } : undefined));
+    const e = await settle(clone(d));
+    expect(e).toBeInstanceOf(ProxyStartError);
+    expect(e).not.toBeInstanceOf(CloneFailedError);
+    expect((e as Error).message).toBe("the network proxy did not start: Error response from daemon: no space left");
+  });
+
+  it("under open, a failed clone is a plain Error with today's text", async () => {
+    const d = mk();
+    d.script.push((a) => (a[0] === "start" && a[1] === "-a" ? { code: 128, stderr: "fatal: nope\n" } : undefined));
+    const e = await settle(d.probe(REPO, V, {}));
+    expect(e).not.toBeInstanceOf(CloneFailedError);
+    expect((e as Error).message).toBe("Could not clone https://github.com/o/r.git:\nfatal: nope");
+  });
+});
+
+describe("a scanner under containment (leg 8)", () => {
+  const CONTAINED = { MCPE_NETWORK: "contained" };
+  const NETWORKED = { ...SCANNER, network: true, hosts: ["api.example.com:8443", "*.cdn.example.org", "203.0.113.7"] };
+  const stage = (d: ScriptedDocker) => d.putVolume(STAGING, "mine", "staging");
+  const allowOf = (d: ScriptedDocker) => (JSON.parse(d.argvs.find(isProxyCreate)!.at(-1)!) as { allow: Array<{ host: string; wildcard: boolean; ports: number[]; literal: boolean; local: boolean }> }).allow;
+
+  it("with a network, runs behind a proxy that allows its hosts (parsed in scanner mode, literals included), local allowed", async () => {
+    const d = mkEgress(CONTAINED);
+    stage(d);
+    await d.runScanner(STAGING, NETWORKED, { timeoutMs: 20_000 });
+    expect(allowOf(d)).toEqual([
+      { host: "api.example.com", wildcard: false, ports: [8443], literal: false, local: true },
+      { host: "cdn.example.org", wildcard: true, ports: [443, 80], literal: false, local: true },
+      { host: "203.0.113.7", wildcard: false, ports: [443, 80], literal: true, local: true },
+    ]);
+    const a = d.created.find((c) => c.labels[ROLE_L] === "scan")!.args;
+    expect(sub(a, "--network")[0]).toMatch(/^mcpe-0123abcd-oneshot-net-/);
+    expect(a.slice(-4)).toEqual(["scan:1", "scan", "--sarif", "."]);
+  });
+
+  it("without a network, runs on none, as it always did, even under containment", async () => {
+    const d = mkEgress(CONTAINED);
+    stage(d);
+    await d.runScanner(STAGING, SCANNER, { timeoutMs: 20_000 });
+    expect(d.argvs.some(isProxyCreate)).toBe(false);
+    expect(sub(d.created.find((c) => c.labels[ROLE_L] === "scan")!.args, "--network")).toEqual(["none"]);
+  });
+
+  it("under open, a scanner with a network is on bridge as before, and hosts are not read", async () => {
+    const d = mkEgress();
+    stage(d);
+    await d.runScanner(STAGING, NETWORKED, { timeoutMs: 20_000 });
+    expect(d.argvs.some(isProxyCreate)).toBe(false);
+    expect(sub(d.created.find((c) => c.labels[ROLE_L] === "scan")!.args, "--network")).toEqual(["bridge"]);
+  });
+
+  it("a failed run returns what the proxy refused (the caller turns it into lines)", async () => {
+    const d = mkEgress(CONTAINED);
+    stage(d);
+    d.script.push((a) => (a[0] === "start" && a[1] === "-a" && roleOf(d, a.at(-1)) === "scan" ? { code: 2, stderr: "boom" } : undefined));
+    d.statusBody = { ...READY, refusals: [ROW], total: 2, resolverFailures: 0 };
+    const r = await d.runScanner(STAGING, NETWORKED, { timeoutMs: 20_000 });
+    expect(r.code).toBe(2);
+    expect(r.proxy).toEqual({ rows: [ROW], total: 2, resolverFailures: 0 });
+  });
+});
+
+describe("projectRefusals (leg 8)", () => {
+  const rows = (...hosts: string[]) => hosts.map((host) => ({ ...ROW, host }));
+  const withProxies = (n: number) => {
+    const d = mkEgress({ MCPE_NETWORK: "contained" });
+    for (let i = 1; i <= n; i++) putProxy(d, proxyName(i));
+    return d;
+  };
+
+  it("reads the status of each of the sandbox's proxies and returns the parsed rows", async () => {
+    const d = withProxies(2);
+    d.statusBody = { ...READY, refusals: rows("a.example", "b.example"), total: 2 };
+    const got = await d.projectRefusals(PS);
+    expect(got.map((r) => r.host)).toEqual(["a.example", "b.example", "a.example", "b.example"]);
+    expect(d.execs).toHaveLength(2);
+  });
+
+  it("is an empty list when there is no proxy, the report cannot be read, or Docker cannot be asked; it never throws", async () => {
+    expect(await withProxies(0).projectRefusals(PS)).toEqual([]);
+    const bad = withProxies(1);
+    bad.statusBody = "<html>";
+    expect(await bad.projectRefusals(PS)).toEqual([]);
+    const broken = withProxies(1);
+    broken.script.push((a) => (a[0] === "ps" ? { code: 1, stderr: "Cannot connect" } : undefined));
+    expect(await broken.projectRefusals(PS)).toEqual([]);
+  });
+
+  it("issues no command that changes anything", async () => {
+    const d = withProxies(1);
+    d.strict = true;
+    d.script.push((a) => (a[0] === "exec" ? { stdout: JSON.stringify(READY) } : undefined));
+    await d.projectRefusals(PS);
+    expect(d.violations.filter((v) => v[0] !== "exec")).toEqual([]);
   });
 });

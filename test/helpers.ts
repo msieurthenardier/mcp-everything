@@ -3,7 +3,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { Server, type Tool } from "@modelcontextprotocol/server";
 import type { Connector, Launch } from "../src/proxy/mcp-proxy.js";
 import type { Config } from "../src/config.js";
-import { Docker, type ExecOptions, type ExecResult, type OwnershipReport, type SandboxRef } from "../src/sandbox/docker.js";
+import { Docker, type ExecOptions, type ExecResult, type NetworkMode, type OwnershipReport, type ProxyRefusalRow, type SandboxRef } from "../src/sandbox/docker.js";
 import type { ProjectRecord } from "../src/types.js";
 
 /** The installation id every test double carries unless a test passes another. */
@@ -52,7 +52,7 @@ export class FakeDocker extends Docker {
   calls: ExecCall[] = [];
   next: Partial<ExecResult> = {};
   exists = true;
-  network: Array<[string, boolean]> = [];
+  network: Array<[string, NetworkMode]> = [];
   destroyed: string[] = [];
   /** The volume each `destroy` was asked to remove, in step with `destroyed` (undefined where none was given). */
   destroyedVolumes: Array<string | undefined> = [];
@@ -107,9 +107,19 @@ export class FakeDocker extends Docker {
   override async state(): Promise<"running" | "stopped" | "missing"> {
     return this.stateResult;
   }
-  override async setNetwork(target: SandboxTarget, enabled: boolean): Promise<void> {
-    this.network.push([targetName(target), enabled]);
+  override async setNetwork(target: SandboxTarget, mode: NetworkMode): Promise<void> {
+    this.network.push([targetName(target), mode]);
     this.networkRefs.push(typeof target === "string" ? undefined : target);
+  }
+  /** Leg 9: what `networkState` reports (the default is a sandbox on no network), and an error it throws instead. */
+  networkStateResult: NetworkMode = "off";
+  networkStateError?: Error;
+  /** The target of every `networkState` question, by name, in order. */
+  networkStateCalls: string[] = [];
+  override async networkState(target: SandboxTarget): Promise<NetworkMode> {
+    this.networkStateCalls.push(targetName(target));
+    if (this.networkStateError) throw this.networkStateError;
+    return this.networkStateResult;
   }
   override async destroy(container: string, volume?: string): Promise<void> {
     if (this.destroyError) throw this.destroyError;
@@ -118,6 +128,13 @@ export class FakeDocker extends Docker {
   }
   override async removeContainer(container: string): Promise<void> {
     this.destroyed.push(`container:${container}`);
+  }
+  /** Leg 8: what a project's proxies refused (`projectRefusals`), and the sandbox name of every question. */
+  refusals: ProxyRefusalRow[] = [];
+  refusalCalls: string[] = [];
+  override async projectRefusals(sandbox: string): Promise<ProxyRefusalRow[]> {
+    this.refusalCalls.push(sandbox);
+    return this.refusals;
   }
   /** The `maxAgeSec` of every startup sweep of check leftovers, in order. */
   sweepCalls: number[] = [];
