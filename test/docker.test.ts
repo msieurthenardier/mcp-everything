@@ -127,6 +127,8 @@ class ScriptedDocker extends Docker {
   private subnetN = 0;
   /** How many pinned `network create`s still fail with "Pool overlaps" (another network took the probed subnet). */
   overlaps = 0;
+  /** The refusal text those creates fail with; Docker 29 words it differently from earlier daemons. */
+  overlapStderr = "Error response from daemon: invalid pool request: Pool overlaps with other one on this address space\n";
 
   /** A network the double has made, by the name the call used (the id is derived from it). */
   net(namePart: string): FakeNet {
@@ -264,7 +266,7 @@ class ScriptedDocker extends Docker {
           const pinned = args.includes("--subnet") ? args[args.indexOf("--subnet") + 1]! : undefined;
           if (pinned !== undefined && this.overlaps > 0) {
             this.overlaps--;
-            return { code: 1, stderr: "Error response from daemon: invalid pool request: Pool overlaps with other one on this address space\n" };
+            return { code: 1, stderr: this.overlapStderr };
           }
           const id = idFor(`net:${last}`);
           this.subnetN++;
@@ -2682,6 +2684,16 @@ describe("createContainedNetwork", () => {
     expect(lastLine(err)).toContain("Pool overlaps");
     expect(e.count("network create")).toBe(8);
     expect(e.networks.size).toBe(0); // every probe was removed
+  });
+
+  it("on Docker 29's 'conflicts with network' refusal probes again and retries", async () => {
+    const d = mk();
+    d.overlaps = 1;
+    d.overlapStderr = "Error response from daemon: cannot create network b51a5425 (br-b51a54256690): conflicts with network 8efd919d (br-8efd919d1234): networks have overlapping IPv4\n";
+    const n = await d.createContainedNetwork({ role: "oneshot-net" });
+    expect(d.count("network create")).toBe(4); // two probes and two real creates
+    expect(d.networks.size).toBe(1);
+    expect(n.subnet).toBe("172.30.2.0/24"); // the second probe's subnet
   });
 
   it("removes the probe even when its inspect fails, and a probe that is too small to hold the proxy is refused", async () => {

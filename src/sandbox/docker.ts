@@ -706,8 +706,11 @@ const RESERVED_LABELS = new Set(["mcp-everything", OWNER_LABEL, ROLE_LABEL, PROJ
 const NETWORK_FORMAT =
   '{"id":{{json .Id}},"name":{{json .Name}},"internal":{{json .Internal}},"ipv6":{{json .EnableIPv6}},"ipam":{{json .IPAM.Config}},"labels":{{json .Labels}},"created":{{json .Created}}}';
 const POOLS_EXHAUSTED = /all predefined address pools have been fully subnetted/i;
-/** Docker's refusal of a subnet that overlaps one in use: another network took it between the probe and the real create. */
-const POOL_OVERLAPS = /pool overlaps/i;
+/**
+ * Docker's refusal of a subnet that overlaps one in use: another network took it between the probe and the real create.
+ * Older daemons say "Pool overlaps with other one"; Docker 29 says "cannot create network ...: conflicts with network ...".
+ */
+const POOL_OVERLAPS = /pool overlaps|conflicts with network/i;
 /** How many times a network create is retried, with a fresh probe, when its subnet overlaps. */
 const POOL_RETRIES = 3;
 

@@ -12,12 +12,10 @@ import {
   MESSAGE_MAX,
   RULE_ID_MAX,
   SEVERITY_MAX,
-  clean,
   emptyCounts,
-  isObject,
-  own,
 } from "./sarif.js";
 import type { CheckOutcome, Finding, Level } from "./types.js";
+import { clean, isObject, own } from "./util.js";
 
 export interface DependencyLookup {
   check(repo: RepoRef, ref: string | undefined, signal: AbortSignal): Promise<CheckOutcome | undefined>;
@@ -228,8 +226,6 @@ export function dependencyFindings(
 export interface GithubOsvOptions {
   fetch: FetchLike;
   githubToken?: string;
-  /** Reserved: the deadline is an AbortSignal, so no clock is read. */
-  now?: () => number;
   /** The whole check's deadline (default 60 s); for tests. */
   deadlineMs?: number;
 }
