@@ -165,6 +165,14 @@ These items come from flight 2's and flight 3's debriefs. Each was checked again
 
 ---
 
+### HAT fix: refusal wording
+
+The operator saw `SandboxRefusedError` name the part twice. `refusalMessage` in `src/sandbox/ownership.ts` now names each part once in the subject, with its project label in parentheses (`(no project label)` when none; volumes get none). The per-part reasons refer to it as "it" (one part), "the container"/"the volume" (kind occurs once), or kind and name (kind repeated). The fix is in the shared builder, so every class is covered. `BEFORE_NOTE`, `removalCommands`, `ownerLine` and `describeLeftPart` are unchanged.
+
+Tests: 5 new in `test/old-sandboxes.test.ts` (before, another, no project label, container+volume, same kind twice); 2 expectations updated (`test/docker.test.ts` mixed pair, `test/installer.test.ts` refused new names). Result: 3017 passed, 71 skipped (baseline 3012). tsc and build clean.
+
+Integration (not edited or run): `test/integration/docker.test.ts:464` asserts the substring "was made before ownership was recorded; ... ask the operator" and still holds; `:465` "See project_info." still holds. `:472` is `ownerLine`, unchanged. No integration assertion breaks.
+
 ## Decisions
 
 ---
@@ -273,3 +281,32 @@ These items come from flight 2's and flight 3's debriefs. Each was checked again
   - **Docker suite** with the fixed integration case: 66 passed, 5 skipped, 0 failed in 669.9 s. Every object mcp-everything's suite creates was removed. The `afp-reh-probe-twin-*` objects are an anomaly, recorded under Anomalies.
   - **Unit run:** `npx vitest run` gives 3012 passed, 71 skipped, 0 failed. Typecheck and build are clean.
   - **State:** legs 1–4 are `completed` and checked off, and squawks 0054–0056 are `completed` with sign-off. The HAT leg is designed after the commit.
+- 2026-11-23, flight committed: `5938d47`, pushed, draft PR #33.
+  - HAT leg 5 designed: lightweight, six steps, step 6 optional and the operator's own.
+  - **Prerequisite verified** with a read-only `docker ps -a`: `mcpe-gron` has no owner label and is "Up 8 days". It is an old sandbox, running uncontained until this flight.
+- 2026-11-24, HAT leg 5 (one step at a time, the operator judging):
+  - **Step 1, rebuild and reconnect: pass.** Build clean; the operator reconnected with `/mcp`. `list_projects` answers with installation id `e44f84eb`, `gron` and `rea` both `ready`.
+  - **Step 2, docs: pass.** The operator read the README summaries and the docs on the PR branch on GitHub: "looks good". No wording changes.
+  - **Step 3, the old sandbox is refused: pass (wording pending the operator).** `gron__gron` and `sandbox_exec` on `gron` (`echo should-not-run`) both answered the same error, and nothing ran: `Refusing to act on container "mcpe-gron": container "mcpe-gron", project label "github:tomnomnom/gron" was made before ownership was recorded; this installation cannot tell whether it is its own and does not act on it. Do not remove it yourself; ask the operator. This installation is e44f84eb. See project_info.` There is no `docker` command. The Flight Director noted that the container name is repeated.
+  - **Step 3 wording fix (the operator: "fix the wording").** This is a fix, not a feature: wording only, in the one function that builds refusals (`refusalMessage`). Every refusal class now names each part once, in the subject. A Developer (Sonnet) made the change with Edit only, and the shell-write rule held this time. The Reviewer (Sonnet) gave `[HANDOFF:confirmed]`.
+    - Unit tests: 3017 passed, 71 skipped.
+    - No Docker run is needed: the integration assertions check only `BEFORE_NOTE`, "See project_info." and the unchanged owner line.
+    - The Reviewer's suggestion, outside the diff: no test sends a label that needs sanitising through the new shape. It is not acted on.
+    - Rebuilt. Step 3 is re-verified after the operator reconnects.
+  - **Step 3, re-verified after the reconnect: pass.** `gron__gron` answers: `Refusing to act on container "mcpe-gron" (project label "github:tomnomnom/gron"): it was made before ownership was recorded; … ask the operator. This installation is e44f84eb. See project_info.`
+  - **Step 4, `project_info gron`: output as designed, the H1 decision is pending the operator.** The owner line reads: "made before ownership was recorded", then the prohibition, then "If the operator confirms it is this installation's and not wanted, they can run `docker rm -f mcpe-gron` and `docker volume rm mcpe-gron`, then reinstall the project."
+    - The network line reads `network: unknown`. `networkState`'s inspect goes through the ownership gate, which refuses a `before` sandbox, and `project_info` reports that refusal as `unknown`. This is consistent with DD4.
+  - **Step 4: pass.** The operator accepts H1's placement: the commands appear only in `project_info`'s owner line and the `uninstall_project` result, and every other message carries the prohibition and a pointer.
+  - **Step 5, nothing else changed: pass.** `list_projects` answers as in step 1 (`e44f84eb`; `gron` and `rea` both `ready`). `rea__rea_capabilities` ran in `rea`'s own sandbox (owner `e44f84eb`): exit code 0, normal output.
+  - **Step 6, the old sandbox replaced: pass.** The operator asked the Flight Director to remove `gron` and reinstall it ("go ahead and remove gron and reinstall"). That is the operator's own decision, delegated to the FD; the leg had expected the operator to run the commands themselves. Before removing anything, the FD inspected both objects:
+    - container `mcpe-gron`: labels `mcp-everything=1` and project `github:tomnomnom/gron`, no owner label, running, with volume `mcpe-gron` at `/workspace`;
+    - volume `mcpe-gron`: label `mcp-everything=1`, created 2026-11-15, used by no other container.
+    - The FD then ran `docker rm -f mcpe-gron` and `docker volume rm mcpe-gron`, and nothing else.
+    - `install_project gron` (reinstall): `ready`, sandbox `mcpe-e44f84eb-gron`, checks ran (one dependency warning: golang.org/x/sys 0.33.0, GO-2026-5024, a Windows-only path).
+    - `project_info gron`: "Sandbox owner: container "mcpe-e44f84eb-gron" is this installation's (e44f84eb)", network `off`.
+    - `gron__gron` ran: exit code 0, normal output.
+    - **mcp-everything objects in Docker afterwards:** this installation's `gron` (new) and `rea`, and the `bde0aedf` (Windows) installation's eight sandboxes with their volumes, all unchanged. There are no networks.
+  - **HAT complete:** all six steps pass. One wording fix (the refusal message) was reviewed and confirmed.
+- 2026-11-24, flight landed:
+  - **Status:** leg 5 is `completed` and the flight is `landed`. It is checked off in `mission.md`, as are its criteria and checkpoints. "Code merged" stays open until PR #33 merges.
+  - **Docs check:** no new command, tool or configuration. The refusal message is not quoted in the README or `docs/`.

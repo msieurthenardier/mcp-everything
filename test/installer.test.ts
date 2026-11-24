@@ -1359,7 +1359,8 @@ describe("sandbox names and reinstall order", () => {
       docker.destroyErrors[WIDGET] = refusal(part("container", WIDGET, "not-ours"));
       const record = await install({ reinstall: true });
       expect(record.status).toBe("failed");
-      expect(record.error).toContain(`container "${WIDGET}" was not created by mcp-everything`);
+      expect(record.error).toContain(`container "${WIDGET}"`);
+      expect(record.error).toContain("it was not created by mcp-everything");
       expect(record.warnings.filter((x) => WARNING.test(x))).toHaveLength(1);
       expect(onDisk("widget")).toBeUndefined();
       expect(docker.created).toEqual([]);

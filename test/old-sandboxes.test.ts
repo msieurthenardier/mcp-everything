@@ -55,6 +55,48 @@ describe("the wording about a sandbox made before ownership was recorded", () =>
   });
 });
 
+describe("the refusal message names each part once", () => {
+  const BEFORE = "was made before ownership was recorded; this installation cannot tell whether it is its own and does not act on it. Do not remove it yourself; ask the operator";
+  const msg = (...f: SandboxFacts[]) => new SandboxRefusedError(f, "e44f84eb").message;
+
+  it("a sandbox made before ownership, as the operator saw it", () => {
+    const m = msg({ kind: "container", sandbox: "mcpe-gron", project: "github:tomnomnom/gron", cls: "before" });
+    expect(m).toBe(
+      `Refusing to act on container "mcpe-gron" (project label "github:tomnomnom/gron"): it ${BEFORE}. This installation is e44f84eb. See project_info.`,
+    );
+    expect(m.split("mcpe-gron")).toHaveLength(2);
+  });
+
+  it("another installation's sandbox", () => {
+    expect(msg({ kind: "container", sandbox: "mcpe-x", project: "p", cls: "another", owner: "other-id" })).toBe(
+      'Refusing to act on container "mcpe-x" (project label "p"): it is another installation\'s (owner label "other-id"). This installation is e44f84eb.',
+    );
+  });
+
+  it("a sandbox with no project label", () => {
+    expect(msg({ kind: "container", sandbox: "mcpe-x", cls: "not-ours" })).toBe(
+      'Refusing to act on container "mcpe-x" (no project label): it was not created by mcp-everything. This installation is e44f84eb.',
+    );
+  });
+
+  it("a container and its volume are 'the container' and 'the volume'", () => {
+    expect(msg({ kind: "container", sandbox: "mcpe-x", project: "p", cls: "mine" }, { kind: "volume", sandbox: "mcpe-x", cls: "before" })).toBe(
+      `Refusing to act on container "mcpe-x" (project label "p") and volume "mcpe-x": the container is this installation's; the volume ${BEFORE}. This installation is e44f84eb. See project_info.`,
+    );
+  });
+
+  it("two parts of one kind are told apart by name", () => {
+    expect(
+      msg(
+        { kind: "container", sandbox: "mcpe-a", project: "p", cls: "not-ours" },
+        { kind: "container", sandbox: "mcpe-b", project: "p", cls: "mine" },
+      ),
+    ).toBe(
+      'Refusing to act on container "mcpe-a" (project label "p") and container "mcpe-b" (project label "p"): container "mcpe-a" was not created by mcp-everything; container "mcpe-b" is this installation\'s. This installation is e44f84eb.',
+    );
+  });
+});
+
 describe("the name grammar of a printed command", () => {
   const raw = (name: string) => removalCommands([before("container", name)]);
 

@@ -90,26 +90,46 @@ export function removalCommands(facts: readonly SandboxFacts[]): string {
   return `If the operator confirms it is this installation's and not wanted, they can ${printable ? `run ${how}` : how}, then reinstall the project.`;
 }
 
-function describeFacts(f: SandboxFacts): string {
-  const what = `${f.kind} "${clean(f.sandbox)}"`;
-  const project = f.kind !== "volume" ? `, project label ${f.project === undefined ? "(none)" : `"${clean(f.project)}"`}` : "";
+/**
+ * What one part's reason says, led by `ref` (how the reason refers to the part: "it", "the container", or the kind and
+ * name). The name and project label are said once, in the subject of the refusal, not here.
+ */
+function describeFacts(f: SandboxFacts, ref: string): string {
   switch (f.cls) {
     case "another":
-      return `${what} is another installation's (owner label "${oneLine(f.owner ?? "", OWNER_SHOWN)}"${project})`;
+      return `${ref} is another installation's (owner label "${oneLine(f.owner ?? "", OWNER_SHOWN)}")`;
     case "not-ours":
-      return `${what} was not created by mcp-everything${project}`;
+      return `${ref} was not created by mcp-everything`;
     case "before":
-      return `${what}${project} ${BEFORE_NOTE}`;
+      return `${ref} ${BEFORE_NOTE}`;
     default:
-      return `${what} is this installation's${project}`;
+      return `${ref} is this installation's`;
   }
 }
 
-/** The one place a refusal's message is built. A `before` part adds a pointer to the commands, which are not here. */
+/**
+ * The one place a refusal's message is built: `Refusing to act on <each part, with its project label>: <why, per part>.`
+ * Each part is named once, in the subject (a volume has no project label). The reasons refer to a part as "it" when it is
+ * the only one, "the <kind>" when its kind occurs once, else by kind and name. A `before` part adds a pointer to the
+ * commands, which are not here.
+ */
 function refusalMessage(facts: SandboxFacts[], installationId: string): string {
-  const subject = facts.map((f) => `${f.kind} "${clean(f.sandbox)}"`).join(" and ");
+  const subject = facts
+    .map((f) => {
+      const what = `${f.kind} "${clean(f.sandbox)}"`;
+      if (f.kind === "volume") return what;
+      return `${what} (${f.project === undefined ? "no project label" : `project label "${clean(f.project)}"`})`;
+    })
+    .join(" and ");
+  const why = facts
+    .map((f) => {
+      const ref =
+        facts.length === 1 ? "it" : facts.filter((g) => g.kind === f.kind).length === 1 ? `the ${f.kind}` : `${f.kind} "${clean(f.sandbox)}"`;
+      return describeFacts(f, ref);
+    })
+    .join("; ");
   const see = facts.some((f) => f.cls === "before") ? " See project_info." : "";
-  return `Refusing to act on ${subject}: ${facts.map(describeFacts).join("; ")}. This installation is ${installationId}.${see}`;
+  return `Refusing to act on ${subject}: ${why}. This installation is ${installationId}.${see}`;
 }
 
 /** A sandbox is another installation's, not mcp-everything's, or of a kind that cannot be told apart: nothing was done to it. */

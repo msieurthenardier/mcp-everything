@@ -1,6 +1,6 @@
 # Flight: Groundwork, and Leaving Old Sandboxes Alone
 
-**Status**: in-flight
+**Status**: landed
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-23.** The mission's tentative flight 4 had three separate sets of design decisions:
@@ -11,9 +11,9 @@
 > The operator chose to split it. This flight does the groundwork: the docs move, the code split, and the clean-ups that share those files. It also fixes the treatment of old sandboxes, its only design decisions. "Checking what a build installed" becomes flight 5, planned on top of the split code.
 
 ## Contributing to Criteria
-- [ ] **The README describes what is checked and when, … and what none of this protects against.** The three security chapters move to `docs/` with their wording unchanged, and the README links to them. The text about old sandboxes is rewritten for DD4.
-- [ ] **No clone, build or sandbox can reach the host … whatever its network setting.** Flight 2 left two gaps in this: sandboxes made before ownership labels, and labelled sandboxes with no record, are never contained. After DD4, an old sandbox is never started, so it cannot run uncontained. Labelled sandboxes with no record remain a gap, unchanged.
-- [ ] **Constraint: what mcp-everything creates in Docker is never removed or changed by an installation that does not own it.** An old sandbox carries no owner label, so this installation cannot know it owns it. After DD4 it is left alone.
+- [x] **The README describes what is checked and when, … and what none of this protects against.** The three security chapters move to `docs/` with their wording unchanged, and the README links to them. The text about old sandboxes is rewritten for DD4.
+- [x] **No clone, build or sandbox can reach the host … whatever its network setting.** Flight 2 left two gaps in this: sandboxes made before ownership labels, and labelled sandboxes with no record, are never contained. After DD4, an old sandbox is never started, so it cannot run uncontained. Labelled sandboxes with no record remain a gap, unchanged.
+- [x] **Constraint: what mcp-everything creates in Docker is never removed or changed by an installation that does not own it.** An old sandbox carries no owner label, so this installation cannot know it owns it. After DD4 it is left alone.
 
 ---
 
@@ -184,12 +184,12 @@ Prepare the code and docs for flight 5, and close a way an installation can dele
 - [x] The Docker suite (`npm run test:docker`) run once on `main` as a baseline, before leg 3. **Done 2026-11-23:** 66 passed, 5 skipped, 0 failed (678.8 s), and no Docker objects were left behind. It separates failures that already exist from the split's.
   - 0057's fix was not run against a live Docker 29 daemon; this run is the first to exercise it.
   - The baseline includes the old-sandbox (`before`) cases in `test/integration/docker.test.ts`, which leg 4 inverts.
-- [ ] The operator's `gron` (an old sandbox, label `mcp-everything=1`, no owner label) is still present for the HAT; checked with `docker inspect` (read-only) before the HAT.
+- [x] The operator's `gron` (an old sandbox, label `mcp-everything=1`, no owner label) is still present for the HAT; checked with `docker inspect` (read-only) before the HAT.
 
 ### Pre-Flight Checklist
 - [x] All open questions resolved
 - [x] Design decisions documented
-- [ ] Prerequisites verified (Docker baseline before leg 3; `gron` check before the HAT)
+- [x] Prerequisites verified (Docker baseline before leg 3; `gron` check before the HAT)
 - [x] Validation approach defined
 - [x] Legs defined
 
@@ -210,11 +210,11 @@ Prepare the code and docs for flight 5, and close a way an installation can dele
 **Leg order.** The Architect review noted that doing the ownership leg before the split is also defensible: the security change would be verified on the unsplit file first. This flight keeps the split first. Ownership then changes one gate in a module of its own (`docker-base.ts` / `ownership.ts`), and the split's normalized diff stays against code that the clean-ups alone changed.
 
 ### Checkpoints
-- [ ] Docs moved; README summaries read by the operator at the HAT.
-- [ ] Clean-ups landed; the default unit run is shorter, and the slow run carries the moved cases.
-- [ ] Split landed; the normalized diff is empty and every suite passes as before.
-- [ ] Old sandboxes refused everywhere, with the removal message; the Docker suite passes.
-- [ ] HAT passed.
+- [x] Docs moved; README summaries read by the operator at the HAT.
+- [x] Clean-ups landed; the default unit run is shorter, and the slow run carries the moved cases.
+- [x] Split landed; the normalized diff is empty and every suite passes as before.
+- [x] Old sandboxes refused everywhere, with the removal message; the Docker suite passes.
+- [x] HAT passed.
 
 ### Adaptation Criteria
 
@@ -237,7 +237,7 @@ Prepare the code and docs for flight 5, and close a way an installation can dele
 - [x] `cleanups` — Squawks 0054–0056, the withheld-tool accessor, slow tests out of the default run, and the in-process outbound note (DD3). Low risk; behavior-neutral apart from the stated test moves.
 - [x] `split-docker-and-containment` — The mechanical split of `docker.ts` and `containment.ts` (DD5). High risk for its size: it gets a design review.
 - [x] `old-sandboxes` — Refuse `before` everywhere, with messages, inverted tests and the rewritten docs text (DD4). High risk: it touches ownership, the security-sensitive surface, and reverses pinned behavior.
-- [ ] `hat-and-alignment` — Short guided HAT on the operator's installation:
+- [x] `hat-and-alignment` — Short guided HAT on the operator's installation:
   1. read `docs/` on GitHub;
   2. use one tool of the operator's `gron` and see the removal message;
   3. check that `project_info gron` says the same;
@@ -248,10 +248,10 @@ Prepare the code and docs for flight 5, and close a way an installation can dele
 ## Post-Flight
 
 ### Completion Checklist
-- [ ] All legs completed
+- [x] All legs completed
 - [ ] Code merged
-- [ ] Tests passing (unit default and slow, Docker suite)
-- [ ] Documentation updated (`docs/`, README summaries, the old-sandbox text)
+- [x] Tests passing (unit default and slow, Docker suite)
+- [x] Documentation updated (`docs/`, README summaries, the old-sandbox text)
 
 ### Verification
 - `README.md` is roughly 660 lines shorter. Each security chapter has a summary and a link, and `docs/*.md` hold the old text unchanged (normalized diff).

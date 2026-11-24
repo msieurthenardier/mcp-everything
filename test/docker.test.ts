@@ -1030,8 +1030,10 @@ describe("destroy classifies both before it removes either, and refuses a pair w
     const r = (await settle(d.destroy(N, V))) as SandboxRefusedError;
     expect(r).toBeInstanceOf(SandboxRefusedError);
     expect([r.kind, r.sandbox, r.reason]).toEqual(["volume", V, "before"]);
-    expect(r.message).toContain(`container "${N}" is this installation's`);
-    expect(r.message).toContain(`volume "${V}" was made before ownership was recorded`);
+    expect(r.message).toContain(`container "${N}"`);
+    expect(r.message).toContain(`volume "${V}"`);
+    expect(r.message).toContain("the container is this installation's");
+    expect(r.message).toContain("the volume was made before ownership was recorded");
     expect(r.message).not.toContain("docker rm");
     expect(r.message).not.toContain("docker volume rm");
   });
