@@ -14,9 +14,14 @@ import { McpProxy, sweepEnvFiles, validateEnv } from "./proxy/mcp-proxy.js";
 import { Registry } from "./registry.js";
 import { VERSION } from "./version.js";
 import { loadInstallationId } from "./installation.js";
-import { Docker, DockerUnavailableError, OWNER_SHOWN, REPO_DIR, WORK_DIR, type ExecResult, type NetworkMode, type ProxyRefusalRow, type SandboxRef } from "./sandbox/docker.js";
+import { Docker, type ExecResult } from "./sandbox/docker.js";
+import type { SandboxRef } from "./sandbox/docker-base.js";
+import { DockerUnavailableError } from "./sandbox/errors.js";
+import type { NetworkMode, ProxyRefusalRow } from "./sandbox/network-spec.js";
+import { BEFORE_NOTE, OWNER_SHOWN, removalCommands } from "./sandbox/ownership.js";
+import { REPO_DIR, WORK_DIR } from "./sandbox/scripts.js";
 import { buildInvocation, resolveCwd, ToolInputError } from "./toolgen/invoke.js";
-import type { Ecosystem, McpServerSpec, ProjectRecord, ToolDef } from "./types.js";
+import type { Ecosystem, McpServerSpec, ProjectRecord, ToolDef, WithheldTool } from "./types.js";
 import { totalCounts, unreachableBlock } from "./scan/policy.js";
 import { inertDependencyLookup, type DependencyLookup } from "./scan/dependencies.js";
 import type { CheckOutcome, ScanReport } from "./scan/types.js";
@@ -356,7 +361,7 @@ const META_TOOLS: MetaTool[] = [
   {
     name: "uninstall_project",
     description:
-      "Remove a project: deletes its sandbox container, its volume and its generated tools. A sandbox that is another installation's, or was not created by mcp-everything, is never removed: the project's record and tools are removed, the sandbox is left in Docker, and the result says which parts were left and whose they are. If Docker cannot be asked or a removal fails, nothing is removed and the project stays installed.",
+      "Remove a project: deletes its sandbox container, its volume and its generated tools. A sandbox that is another installation's, was not created by mcp-everything, or was made before ownership was recorded, is never removed: the project's record and tools are removed, the sandbox is left in Docker, and the result says which parts were left and whose they are. If Docker cannot be asked or a removal fails, nothing is removed and the project stays installed.",
     inputSchema: { type: "object", properties: { project: projectProp }, required: ["project"], additionalProperties: false },
     annotations: { destructiveHint: true },
   },
@@ -525,6 +530,24 @@ export interface AppOptions {
   env?: Record<string, string | undefined>;
   /** The dependency check's lookup (the real one is wired in `index.ts`); inert by default, so nothing is sent. */
   dependencies?: DependencyLookup;
+}
+
+/** What `App.withheldOf` returns: the tools of one project that the tool-description check withheld, read-only. */
+interface WithheldView {
+  /** Every withheld generated name, uncapped, in catalog order. */
+  readonly names: readonly string[];
+  /** How many tools were withheld (the length of `names`). */
+  readonly count: number;
+  /** Whether a generated tool name was withheld. */
+  has(name: string): boolean;
+  /** The described entry for a withheld name; absent when the name is beyond the cap of described entries. */
+  entry(name: string): WithheldTool | undefined;
+  /** How many described entries belong to one registered MCP server (capped with the entries: see `omitted`). */
+  countOn(server: string): number;
+  /** Whether the list of described entries was cut, so `countOn` is a lower bound. */
+  readonly omitted: boolean;
+  /** The registered servers that had tools built and have none left. */
+  readonly servers: ReadonlySet<string>;
 }
 
 export class App {
@@ -814,9 +837,9 @@ export class App {
     const tool = project?.tools.find((t) => t.name === name);
     if (!project || !tool) {
       // Among all candidates, not only the owner: `a` and `a__b` can both prefix a name.
-      const holder = candidates.find((p) => p.toolCheck?.withheldNames?.includes(name));
+      const holder = candidates.find((p) => this.withheldOf(p).has(name));
       if (holder) {
-        const entry = holder.toolCheck!.withheld.find((w) => w.tool === name);
+        const entry = this.withheldOf(holder).entry(name);
         const why = entry ? ` (${oneLine(entry.ruleId, 80)}, ${oneLine(entry.level, 10)})` : "";
         throw new ToolInputError(`${name} was withheld by the tool-description check${why}. See project_info for the finding.`);
       }
@@ -945,7 +968,10 @@ export class App {
         case "mine":
           return `${head} ${what} is this installation's (${this.docker.installationId}).`;
         case "before":
-          return `${head} ${what} was made before ownership was recorded; it is treated as this installation's.`;
+          return `${head} ${what} ${BEFORE_NOTE}. ${removalCommands([
+            { kind: "container", sandbox: p.container, cls: "before" },
+            { kind: "volume", sandbox: p.volume, cls: "before" },
+          ])}`;
         case "another":
           return `${head} ${what} is another installation's (owner label "${oneLine(r.owner ?? "", OWNER_SHOWN)}"); this installation will not act on it.`;
         case "not-ours":
@@ -1011,6 +1037,31 @@ export class App {
     return `  security: scanned at install (commit ${oneLine(scan.commit, 40).slice(0, 12)}, ${then}): ${c.error} error, ${c.warning} warning, ${c.note} note; scanning is currently ${now}`;
   }
 
+  /**
+   * A read-only view of the generated tools the tool-description check withheld from a project (`ProjectRecord.toolCheck`).
+   * The one place that reads `withheld`, `withheldNames`, `withheldOmitted` and `allWithheldServers`; a project with no check
+   * has nothing withheld.
+   *
+   * The contract: a withheld tool is absent from the stored catalog (`record.tools`, set by `vetCatalog`), so it is absent from the
+   * published tool list and from `find_project_tools`, and `select_project_tools` cannot offer it (it selects within the catalog).
+   * `call_project_tool` answers that it was "withheld" (`findGenerated`), and `project_info` names it (`toolCheckLines`). Any new
+   * place that lists tools reads this view, so a withheld tool is never listed and never silently missing.
+   */
+  private withheldOf(p: ProjectRecord): WithheldView {
+    const tc = p.toolCheck;
+    const names = tc?.withheldNames ?? [];
+    const entries = tc?.withheld ?? [];
+    return {
+      names,
+      count: names.length,
+      has: (name) => names.includes(name),
+      entry: (name) => entries.find((w) => w.tool === name),
+      countOn: (server) => entries.filter((w) => w.server === server).length,
+      omitted: (tc?.withheldOmitted ?? 0) > 0,
+      servers: new Set(tc?.allWithheldServers ?? []),
+    };
+  }
+
   /** The `tool descriptions:` line, and under `verbose` the findings kept. The mode shown is the one recorded at the check. */
   private toolCheckLines(p: ProjectRecord, verbose: boolean): string[] {
     const tc = p.toolCheck;
@@ -1019,10 +1070,11 @@ export class App {
     if (o.status === "failed") return ["  tool descriptions: check failed (the tool-description check could not complete)"];
     const mode = tc.mode === "block" ? `block at ${oneLine(tc.blockAt, 10)}` : "warn";
     let line = `  tool descriptions: checked ${oneLine(tc.at.slice(0, 10), 12)} under ${mode}: ${o.counts.error} error, ${o.counts.warning} warning`;
-    const names = tc.withheldNames ?? [];
+    const withheld = this.withheldOf(p);
+    const names = withheld.names;
     if (names.length > 0) {
       const shown = names.slice(0, 10).map((n) => {
-        const w = tc.withheld.find((e) => e.tool === n);
+        const w = withheld.entry(n);
         return w ? `${oneLine(n, 120)} (${oneLine(w.ruleId, 80)})` : oneLine(n, 120);
       });
       line += `; withheld: ${shown.join(", ")}${names.length > 10 ? `, and ${names.length - 10} more` : ""}`;
@@ -1499,7 +1551,7 @@ export class App {
         // Stable sort: equal scores keep catalog order.
         hits.sort((a, b) => b.score - a.score);
         const withheldLines = projects.flatMap((p) => {
-          const n = p.toolCheck?.withheldNames?.length ?? 0;
+          const n = this.withheldOf(p).count;
           return n > 0 ? [`${n} tool(s) of ${p.slug} were withheld by the tool-description check; see project_info.`] : [];
         });
         if (hits.length === 0) {
@@ -1609,7 +1661,7 @@ export class App {
         if (this.jobs.has(project.repo.id.toLowerCase())) throw new ToolInputError(`${project.slug} is still installing.`);
         const updated = await this.installer.rediscover(project, extra as string[]);
         this.announceToolListChanged();
-        const withheld = updated.toolCheck?.withheldNames?.length ?? 0;
+        const withheld = this.withheldOf(updated).count;
         const lead = withheld > 0 ? `Withheld by the tool-description check: ${withheld} tool(s); see below.\n` : "";
         return text(`${lead}${this.describe(updated, true)}`);
       }
@@ -1641,10 +1693,10 @@ export class App {
         const updated = await this.installer.connectMcp(project, spec);
         this.announceToolListChanged();
         const count = updated.tools.filter((t) => t.mcp?.server === name).length;
-        const tc = updated.toolCheck;
-        const held = tc ? tc.withheld.filter((w) => w.server === name).length : 0;
+        const withheldHere = this.withheldOf(updated);
+        const held = withheldHere.countOn(name);
         const withheldNote =
-          held > 0 ? `, ${tc!.withheldOmitted > 0 ? "at least " : ""}${held} withheld by the tool-description check` : "";
+          held > 0 ? `, ${withheldHere.omitted ? "at least " : ""}${held} withheld by the tool-description check` : "";
         const offline = updated.network ? "" : " The sandbox is offline; enable set_project_network if this server needs the network.";
         return text(`Connected MCP server "${name}" of ${updated.slug}: ${count} tool(s) published${withheldNote}.${offline}\n\n${this.describe(updated, true)}`);
       }
@@ -1664,8 +1716,8 @@ export class App {
         const updated = out.record;
         const servers = updated.mcpServers ?? [];
         // A server whose tools were all withheld started; it is not one with no tool built.
-        const allWithheld = new Set(updated.toolCheck?.allWithheldServers ?? []);
-        const withheldCount = updated.toolCheck?.withheldNames?.length ?? 0;
+        const allWithheld = this.withheldOf(updated).servers;
+        const withheldCount = this.withheldOf(updated).count;
         const bare = servers.filter((s) => !allWithheld.has(s.name) && !updated.tools.some((t) => t.mcp?.server === s.name)).length;
         const proxied = updated.tools.filter((t) => t.kind === "mcp").length;
         const gone = out.before.filter((n) => !out.after.includes(n));
@@ -1708,8 +1760,9 @@ export class App {
         const left = await this.installer.uninstall(project);
         this.announceToolListChanged();
         if (left.length === 0) return text(`Removed ${project.slug} (${project.repo.id}) and its sandbox.`);
+        const commands = removalCommands(left);
         return text(
-          `Removed ${project.slug} (${project.repo.id}) and its tools. Its sandbox was left in place, because it is not this installation's to remove: ${left.map(describeLeftPart).join("; ")}. Nothing was removed from Docker; a part that is not wanted must be removed by hand there.`,
+          `Removed ${project.slug} (${project.repo.id}) and its tools. Its sandbox was left in place, because it is not this installation's to remove: ${left.map(describeLeftPart).join("; ")}. Nothing was removed from Docker${commands ? `. ${commands}` : "; a part that is not wanted must be removed by hand there."}`,
         );
       }
     }

@@ -5,18 +5,11 @@ import { joinRefusals, refusalLines, refusalWarnings } from "../network/refusals
 import { hostVariableNames, launchVariables } from "../proxy/host-env.js";
 import type { McpProxy } from "../proxy/mcp-proxy.js";
 import type { Registry } from "../registry.js";
-import {
-  CloneFailedError,
-  Docker,
-  REPO_DIR,
-  OWNER_SHOWN,
-  SandboxRefusedError,
-  WORKSPACE,
-  type ExecResult,
-  type ProbeData,
-  type SandboxFacts,
-  type SandboxRef,
-} from "../sandbox/docker.js";
+import { Docker, type ExecResult } from "../sandbox/docker.js";
+import type { SandboxRef } from "../sandbox/docker-base.js";
+import { CloneFailedError } from "../sandbox/errors.js";
+import { BEFORE_NOTE, OWNER_SHOWN, SandboxRefusedError, type SandboxFacts } from "../sandbox/ownership.js";
+import { REPO_DIR, WORKSPACE, type ProbeData } from "../sandbox/scripts.js";
 import { selectPublished, type SandboxExec } from "../toolgen/discover.js";
 import { makeSlug } from "../toolgen/naming.js";
 import type {
@@ -81,7 +74,7 @@ export function describeLeftPart(f: SandboxFacts): string {
     case "not-ours":
       return `${what} was not created by mcp-everything`;
     case "before":
-      return `${what} was made before ownership was recorded`;
+      return `${what} ${BEFORE_NOTE}`;
     default:
       return `${what} is this installation's`;
   }
@@ -95,7 +88,10 @@ const describeLeft = (facts: readonly SandboxFacts[]): string => facts.map(descr
  * discovery and publishing use for the warnings they recompute.
  */
 function leftInPlaceWarning(facts: readonly SandboxFacts[]): string {
-  return `The previous sandbox of this project was left in place, untouched, because it is not this installation's to remove: ${describeLeft(facts)}. It now has no record; remove it by hand in Docker if it is not wanted.`;
+  // The new record has no way to show the old sandbox's commands (project_info reads the new sandbox), so a `before`
+  // part carries the prohibition alone; whether to remove it is the operator's, who knows the names from this text.
+  const tail = facts.some((f) => f.cls === "before") ? "It now has no record." : "It now has no record; remove it by hand in Docker if it is not wanted.";
+  return `The previous sandbox of this project was left in place, untouched, because it is not this installation's to remove: ${describeLeft(facts)}. ${tail}`;
 }
 
 /** Added to a record put back after a reinstall met a sandbox at the very names it needs. */

@@ -31,8 +31,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # Both projects (`default` and `slow`, see vitest.config.ts) in one run, so the floor below counts them all.
       - name: Unit tests
-        run: npm test -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest.json"
+        run: npx vitest run --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest.json"
 
       # Vitest already fails when no test file matches, so this catches a suite
       # that was mostly skipped or excluded. The floor is kept somewhat under the

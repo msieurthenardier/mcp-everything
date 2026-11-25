@@ -4,9 +4,10 @@ import path from "node:path";
 import { InMemoryTransport, SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, type Config } from "../src/config.js";
-import { DockerUnavailableError, SandboxRefusedError } from "../src/sandbox/docker.js";
+import { DockerUnavailableError } from "../src/sandbox/errors.js";
+import { SandboxRefusedError } from "../src/sandbox/ownership.js";
 import { dockerConnector, McpProxy, sweepEnvFiles, validateEnv, type Connector } from "../src/proxy/mcp-proxy.js";
-import type { SandboxRef } from "../src/sandbox/docker.js";
+import type { SandboxRef } from "../src/sandbox/docker-base.js";
 import type { McpServerSpec } from "../src/types.js";
 import { FakeDocker, fakeSandboxId, fakeUpstream, SECRET_VALUE, type FakeUpstream } from "./helpers.js";
 

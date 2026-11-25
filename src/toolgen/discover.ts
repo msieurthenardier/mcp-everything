@@ -1,4 +1,4 @@
-import { REPO_DIR, WORK_DIR } from "../sandbox/docker.js";
+import { REPO_DIR, WORK_DIR } from "../sandbox/scripts.js";
 import type { CommandSpec, OptionSpec, ParsedHelp, ProjectMeta, ToolDef } from "../types.js";
 import { oneLine } from "../util/text.js";
 import { looksLikeHelp, parseHelp } from "./help-parser.js";

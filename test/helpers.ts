@@ -3,7 +3,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/client";
 import { Server, type Tool } from "@modelcontextprotocol/server";
 import type { Connector, Launch } from "../src/proxy/mcp-proxy.js";
 import type { Config } from "../src/config.js";
-import { Docker, type ExecOptions, type ExecResult, type NetworkMode, type OwnershipReport, type ProxyRefusalRow, type SandboxRef } from "../src/sandbox/docker.js";
+import { Docker, type ExecOptions, type ExecResult } from "../src/sandbox/docker.js";
+import type { SandboxRef } from "../src/sandbox/docker-base.js";
+import type { NetworkMode, ProxyRefusalRow } from "../src/sandbox/network-spec.js";
+import type { OwnershipReport } from "../src/sandbox/ownership.js";
 import type { ProjectRecord } from "../src/types.js";
 
 /** The installation id every test double carries unless a test passes another. */

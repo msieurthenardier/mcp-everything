@@ -3,6 +3,7 @@ import path from "node:path";
 import { API } from "typescript/unstable/sync";
 import { SyntaxKind, type Node, type SourceFile } from "typescript/unstable/ast";
 import { Docker } from "../src/sandbox/docker.js";
+import { DOCKER_CLASSES } from "./sources.js";
 
 /**
  * No bypass (leg 7). Every method of `Docker` is in exactly one table: the methods the containment hook guards, or a
@@ -12,7 +13,6 @@ import { Docker } from "../src/sandbox/docker.js";
  */
 
 const ROOT = path.resolve(import.meta.dirname, "..");
-const DOCKER_TS = path.join(ROOT, "src/sandbox/docker.ts");
 
 /** Methods whose body asks the hook (`this.hooked(...)`) before it starts a sandbox or runs a command in one. */
 const HOOK_GUARDED = ["acquire", "ensureRunning", "startIfStopped", "exec"];
@@ -130,9 +130,9 @@ const UNHOOKED_BY_DESIGN: Record<string, string> = {
   startForContainment: "the start containment makes itself, before and without the hook, while it builds the network and the proxy",
   // Leg 14. Under a non-runc runtime a running sandbox's network can only change while it is stopped: `whileStopped` is stop, the
   // change, then the unhooked start and the post-start step. Reached only from `setNetworkNow` and `attachProjectNetwork` (the
-  // network changes containment makes) and `restartSandbox` (containment's named fallback, off); never an exec.
+  // network changes containment makes) and `restartSandbox` (the T18 rollback's restart); never an exec.
   whileStopped: "stop, a network change and an unhooked start of a sandbox, for containment's own network changes under a non-runc runtime",
-  restartSandbox: "containment's restart of a running sandbox after a proxy swap (a named switch, off): resolves and classifies, then whileStopped",
+  restartSandbox: "containment's restart of a running sandbox when it rolls back a restore (T18): resolves and classifies, then whileStopped",
   // The one exec in a sandbox that is not the hook's: a root write of `/etc/hosts` (a fixed script, validated lines). Through the
   // hook it would recurse (the hook repairs, and repair writes). Only `Containment` and the class's own `clearLocalAccess` call it.
   writeLocalAccess: "a root exec of a fixed script that writes the sandbox's /etc/hosts, called by containment's post-start step and replacement",
@@ -150,7 +150,8 @@ interface Site {
 }
 
 let api: API;
-let docker: SourceFile;
+/** Every class that makes up `Docker` (`DOCKER_CLASSES`), found in the program. */
+let dockerClasses: Node[];
 let all: SourceFile[];
 
 function walk(node: Node, fn: (n: Node) => void): void {
@@ -166,20 +167,19 @@ function nameOf(member: Node): string | undefined {
   return typeof n?.text === "string" ? n.text : undefined;
 }
 
-function dockerClass(): Node {
-  const cls = docker.statements.find((s) => s.kind === SyntaxKind.ClassDeclaration && nameOf(s) === "Docker");
-  if (!cls) throw new Error("class Docker not found");
-  return cls;
-}
-
 function members(cls: Node): Node[] {
   return (cls as unknown as { members: Node[] }).members.filter((m) => nameOf(m) !== undefined);
 }
 
-/** The class's methods, accessors and class-field functions, by name. */
+/** The members of every class in `DOCKER_CLASSES`, in list order. */
+function dockerMembers(): Node[] {
+  return dockerClasses.flatMap(members);
+}
+
+/** The methods, accessors and class-field functions of every class in `DOCKER_CLASSES`, by name, once each. */
 function memberNames(): string[] {
   const out: string[] = [];
-  for (const m of members(dockerClass())) {
+  for (const m of dockerMembers()) {
     if (m.kind === SyntaxKind.MethodDeclaration || m.kind === SyntaxKind.GetAccessor || m.kind === SyntaxKind.SetAccessor) out.push(nameOf(m)!);
     else if (m.kind === SyntaxKind.PropertyDeclaration) {
       const init = (m as unknown as { initializer?: Node }).initializer;
@@ -198,7 +198,7 @@ const isThisAccess = (n: Node): string | undefined => {
 /** Every call in the class that starts or execs: a call of a primitive, or `this.docker(`/`this.ask(` with a start-or-exec verb or a verb that is not a literal. */
 function sites(): Site[] {
   const found: Site[] = [];
-  for (const m of members(dockerClass())) {
+  for (const m of dockerMembers()) {
     const caller = nameOf(m)!;
     walk(m, (n) => {
       if (n.kind !== SyntaxKind.CallExpression) return;
@@ -240,14 +240,23 @@ beforeAll(() => {
     if (!sf) throw new Error(`no source file ${f}`);
     return sf;
   };
-  docker = get(DOCKER_TS);
+  dockerClasses = DOCKER_CLASSES.map(({ file, className }) => {
+    const cls = get(path.join(ROOT, file)).statements.find((s) => s.kind === SyntaxKind.ClassDeclaration && nameOf(s) === className);
+    if (!cls) throw new Error(`class ${className} not found in ${file}`);
+    return cls;
+  });
   all = project.program.getSourceFileNames().filter((f) => f.startsWith(path.join(ROOT, "src") + path.sep) && f.endsWith(".ts")).map(get);
 });
 afterAll(() => api?.close());
 
 describe("no bypass of the containment hook", () => {
   it("the tables and the class agree: every method and class-field function is in exactly one, and nothing else is", () => {
-    const protoNames = Object.getOwnPropertyNames(Docker.prototype).filter((n) => n !== "constructor");
+    // Own names along Docker's prototype chain up to Object.prototype, so a base class holding some of the methods counts too.
+    const protoSet = new Set<string>();
+    for (let p: object | null = Docker.prototype; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+      for (const n of Object.getOwnPropertyNames(p)) if (n !== "constructor") protoSet.add(n);
+    }
+    const protoNames = [...protoSet];
     const fromSource = memberNames();
     // Fields hold functions only as class fields (they are not on the prototype): none is expected, and the two views agree.
     expect([...fromSource].sort()).toEqual([...protoNames].sort());
@@ -279,13 +288,14 @@ describe("no bypass of the containment hook", () => {
 
   it("calls of the primitives come only from the guarded methods and startForContainment, with the exact callers recorded", () => {
     const callers = (what: string) => [...new Set(sites().filter((s) => s.what === what).map((s) => s.caller))].sort();
-    expect(callers("this.startId")).toEqual(["acquire", "ensureRunning", "startForContainment", "startIfStopped", "whileStopped"]);    expect(callers("this.execOnce")).toEqual(["exec"]);
+    expect(callers("this.startId")).toEqual(["acquire", "ensureRunning", "startForContainment", "startIfStopped", "whileStopped"]);
+    expect(callers("this.execOnce")).toEqual(["exec"]);
     expect(callers("this.startIfStopped")).toEqual(["exec"]);
     expect(callers("this.ensureRunning")).toEqual([]);
   });
 
   it("each guarded method asks the hook before its first start or exec", () => {
-    const byName = new Map(members(dockerClass()).map((m) => [nameOf(m)!, m]));
+    const byName = new Map(dockerMembers().map((m) => [nameOf(m)!, m]));
     for (const name of HOOK_GUARDED) {
       const member = byName.get(name)!;
       const hooked: number[] = [];
@@ -325,9 +335,8 @@ describe("no bypass of the containment hook", () => {
       });
     }
     expect([...new Set(users)].sort()).toEqual([path.join("src", "network", "containment.ts"), path.join("src", "sandbox", "docker.ts")]);
-    const cls = dockerClass();
     const callers: string[] = [];
-    for (const m of members(cls)) {
+    for (const m of dockerMembers()) {
       walk(m, (n) => {
         if (n.kind === SyntaxKind.CallExpression && isThisAccess((n as unknown as { expression: Node }).expression) === "writeLocalAccess") callers.push(nameOf(m)!);
       });
@@ -396,8 +405,8 @@ describe("no bypass of the containment hook", () => {
     }
     // `dockerConnector` is a function returning an arrow: the enclosing named function is it. It runs `docker exec -i <id> sh -c <the server>`
     // on a reference whose `env` came from `acquire` (the hook's answer): the proxy variables travel as `-e` flags.
-    expect([...users.keys()].sort()).toEqual([path.join("src", "proxy", "mcp-proxy.ts"), path.join("src", "sandbox", "docker.ts")]);
+    expect([...users.keys()].sort()).toEqual([path.join("src", "proxy", "mcp-proxy.ts"), path.join("src", "sandbox", "docker-base.ts")]);
     expect([...users.get(path.join("src", "proxy", "mcp-proxy.ts"))!]).toEqual(["dockerConnector"]);
-    expect([...users.get(path.join("src", "sandbox", "docker.ts"))!].sort()).toEqual(["assertAvailable", "ask", "docker"].sort());
+    expect([...users.get(path.join("src", "sandbox", "docker-base.ts"))!].sort()).toEqual(["assertAvailable", "ask", "docker"].sort());
   });
 });

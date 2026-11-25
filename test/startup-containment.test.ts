@@ -25,17 +25,11 @@ import {
 } from "../src/network/startup.js";
 import { isStaleInstall, staleInstallLimitSec } from "../src/install/installer.js";
 import { Registry } from "../src/registry.js";
-import {
-  makeRef,
-  networkModeOf,
-  PROJECT_LABEL,
-  type ContainedNetwork,
-  type ContainmentHook,
-  type NetworkMode,
-  type ProjectProxy,
-  type SandboxInspectFacts,
-  type SandboxRef,
-} from "../src/sandbox/docker.js";
+import { makeRef } from "../src/sandbox/docker.js";
+import type { ContainmentHook, SandboxRef } from "../src/sandbox/docker-base.js";
+import type { ContainedNetwork, ProjectProxy } from "../src/sandbox/docker-network.js";
+import { networkModeOf, type NetworkMode } from "../src/sandbox/network-spec.js";
+import { PROJECT_LABEL, type SandboxInspectFacts } from "../src/sandbox/ownership.js";
 import type { ProjectRecord } from "../src/types.js";
 import { record } from "./helpers.js";
 

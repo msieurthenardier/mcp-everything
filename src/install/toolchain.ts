@@ -1,6 +1,6 @@
 import semver from "semver";
 import { parse as parseToml } from "smol-toml";
-import type { ProbeData } from "../sandbox/docker.js";
+import type { ProbeData } from "../sandbox/scripts.js";
 import type { Ecosystem } from "../types.js";
 
 /**

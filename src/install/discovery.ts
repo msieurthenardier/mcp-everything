@@ -1,15 +1,10 @@
 import type { Config } from "../config.js";
 import { isUnusableValueError } from "../proxy/host-env.js";
 import type { McpProxy, UpstreamTool } from "../proxy/mcp-proxy.js";
-import {
-  BIN_DIR,
-  DockerUnavailableError,
-  REPO_DIR,
-  SandboxRefusedError,
-  VENV_DIR,
-  WORK_DIR,
-  type SandboxRef,
-} from "../sandbox/docker.js";
+import type { SandboxRef } from "../sandbox/docker-base.js";
+import { DockerUnavailableError } from "../sandbox/errors.js";
+import { SandboxRefusedError } from "../sandbox/ownership.js";
+import { BIN_DIR, REPO_DIR, VENV_DIR, WORK_DIR } from "../sandbox/scripts.js";
 import { checkToolText, failedToolCheck } from "../scan/tool-text.js";
 import { levelAtLeast, type Finding } from "../scan/types.js";
 import { buildToolsWithText, crawlCommand, fetchRootHelp, type SandboxExec } from "../toolgen/discover.js";

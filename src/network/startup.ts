@@ -1,7 +1,8 @@
 import type { Config } from "../config.js";
 import { isStaleInstall } from "../install/installer.js";
 import type { Registry } from "../registry.js";
-import { projectNetworkName, PROJECT_LABEL, type SandboxInspectFacts } from "../sandbox/docker.js";
+import { projectNetworkName } from "../sandbox/network-spec.js";
+import { PROJECT_LABEL, type SandboxInspectFacts } from "../sandbox/ownership.js";
 import type { ProjectRecord } from "../types.js";
 import type { Clock, Containment } from "./containment.js";
 
@@ -17,8 +18,9 @@ import type { Clock, Containment } from "./containment.js";
  * the gate is released. A key's promise is settled by the step of the sandbox the record names, and by nothing else.
  *
  * Orphaned proxies and networks, the proxies of stopped sandboxes and stale lock files are not handled here (squawk 0052).
- * A sandbox from before ownership (no project label) and a labelled sandbox with no record are left as they are: standing
- * gaps in "nothing runs uncontained", stated in the README.
+ * A labelled sandbox with no record is left as it is: a standing gap in "nothing runs uncontained", stated in the README.
+ * A sandbox made before ownership was recorded has no owner label, so it is never listed here; and it never runs, because
+ * every start of it is refused.
  */
 
 /** The whole pass is bounded: when it passes, the steps not yet started do not start and every unsettled key is rejected. */

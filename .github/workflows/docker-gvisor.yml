@@ -435,7 +435,7 @@ jobs:
           set -uo pipefail
           start=$(date +%s)
           status=0
-          npx vitest run test/integration --exclude test/integration/gvisor.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/run-a.json" || status=$?
+          npx vitest run test/integration/docker.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/run-a.json" || status=$?
           echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
           exit "$status"
 

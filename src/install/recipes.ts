@@ -1,4 +1,4 @@
-import { BIN_DIR, PREFIX, REPO_DIR, VENV_DIR, WORK_DIR, WORKSPACE } from "../sandbox/docker.js";
+import { BIN_DIR, PREFIX, REPO_DIR, VENV_DIR, WORK_DIR, WORKSPACE } from "../sandbox/scripts.js";
 import type { Ecosystem } from "../types.js";
 
 /**

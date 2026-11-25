@@ -1,31 +1,39 @@
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import type { Config } from "../config.js";
 import type { Registry } from "../registry.js";
 import type { Ecosystem, ProjectRecord } from "../types.js";
+import { makeRef } from "../sandbox/docker.js";
+import type { AfterStartHook, ContainmentHook, ContainmentHookMode, SandboxRef } from "../sandbox/docker-base.js";
+import type { ContainedNetwork, ProjectProxy } from "../sandbox/docker-network.js";
+import { isRuncRuntime, networkModeOf, newProjectProxyName, projectNetworkName, proxyAddress, type NetworkMode } from "../sandbox/network-spec.js";
+import { PROJECT_LABEL, type SandboxInspectFacts } from "../sandbox/ownership.js";
 import {
-  isRuncRuntime,
-  makeRef,
-  networkModeOf,
-  newProjectProxyName,
-  projectNetworkName,
-  PROJECT_LABEL,
-  proxyAddress,
-  type AfterStartHook,
-  type ContainedNetwork,
-  type ContainmentHook,
-  type ContainmentHookMode,
-  type NetworkMode,
-  type ProjectProxy,
-  type SandboxInspectFacts,
-  type SandboxRef,
-} from "../sandbox/docker.js";
+  ContainmentError,
+  ContainmentLockLostError,
+  ContainmentStartupError,
+  ContainmentUnreadableError,
+  LIMITS,
+  realClock,
+  sha256,
+  type Clock,
+} from "./containment-core.js";
 import { buildHosts, DEFAULT_HOSTS_VERSION, sandboxHosts } from "./defaults.js";
 import { formatHostEntry, parseHostEntry, PROXY_PORT, type HostEntry } from "./hosts.js";
 import { localAccessFor, type LocalTarget } from "./local-access.js";
+import { type HeldLock, ProjectLocks } from "./project-lock.js";
 import { proxyConfig, PROXY_PROGRAM_VERSION, type ProxyConfig } from "./proxy/config.js";
 import { startupAction, STARTUP_WARNING_PREFIX, type StartupKind, type StartupStepResult } from "./startup.js";
+
+export {
+  ContainmentBusyError,
+  ContainmentDeadlineError,
+  ContainmentError,
+  ContainmentLockLostError,
+  ContainmentStartupError,
+  ContainmentUnreadableError,
+  LIMITS,
+  realClock,
+  type Clock,
+} from "./containment-core.js";
 
 /**
  * Containment (flight 02, leg 7): the logic above the Docker layer that turns a project's record and the session's
@@ -35,6 +43,11 @@ import { startupAction, STARTUP_WARNING_PREFIX, type StartupKind, type StartupSt
  * Keys. Docker objects are named by the sandbox's name and the project label exactly as the sandbox carries it (from
  * the facts). The in-process mutex, the lock file, the startup promises and the cache groups are keyed by the
  * lower-cased repository id (`key`).
+ *
+ * Outbound traffic of mcp-everything's own. The dependency lookup (`src/scan/dependencies.ts`) calls GitHub's API and OSV
+ * from this process: that is mcp-everything's traffic, not a container's, and it does not go through the proxy. A new stage
+ * that calls an outside service follows its pattern: inert unless it is injected in `src/index.ts`, `contacted` recorded on
+ * the stage's outcome, and a sent-statement rendered for it.
  */
 
 /** The labels a project's proxy carries. */
@@ -57,94 +70,6 @@ export function proxyEnvironment(address: string): Record<string, string> {
     no_proxy: "",
     NODE_USE_ENV_PROXY: "1",
   };
-}
-
-export class ContainmentError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = new.target.name;
-  }
-}
-/** The lock for a project could not be had within the wait: refused, which fails closed. */
-export class ContainmentBusyError extends ContainmentError {}
-/** The overall deadline of a replacement passed. */
-export class ContainmentDeadlineError extends ContainmentError {}
-/** The lock file's token is no longer ours: another process took the lock over. */
-export class ContainmentLockLostError extends ContainmentError {}
-/** The registry could not be read. */
-export class ContainmentUnreadableError extends ContainmentError {}
-/**
- * A startup step for the project was rejected; its sandbox's execs are refused until a contain or replace succeeds.
- * With `gate: true` it is the startup gate that failed (the listing of the sandboxes did): the hook then judges each
- * sandbox by its fresh facts instead of refusing every one.
- */
-export class ContainmentStartupError extends ContainmentError {
-  readonly gate: boolean;
-  constructor(message: string, opts: { gate?: boolean } = {}) {
-    super(message);
-    this.gate = opts.gate ?? false;
-  }
-}
-
-/** How long things take; a field of the options so that a test can move the clock instead of waiting. */
-export interface Clock {
-  /** Wall-clock milliseconds: what a lock file's age is judged by. */
-  now(): number;
-  /** Monotonic milliseconds: what the deadline is judged by. */
-  mono(): number;
-  /** A timer: resolves after `ms` unless cancelled. */
-  after(ms: number): { promise: Promise<void>; cancel(): void };
-  /** Wait `ms`. */
-  sleep(ms: number): Promise<void>;
-}
-
-export const realClock: Clock = {
-  now: () => Date.now(),
-  mono: () => performance.now(),
-  after(ms) {
-    let timer: NodeJS.Timeout | undefined;
-    const promise = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, ms);
-    });
-    return { promise, cancel: () => clearTimeout(timer) };
-  },
-  sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  },
-};
-
-export const LIMITS = {
-  /** The whole replacement, measured from the moment the lock is held. */
-  deadlineMs: 90_000,
-  /** How long a caller waits for the lock (mutex and file together). */
-  lockWaitMs: 60_000,
-  /** A lock file older than this belongs to a process that died. Longer than the deadline, so a live holder is never stale. */
-  staleMs: 120_000,
-  pollMs: 100,
-  /** The proxy's resolver failures are read at most this often per project. */
-  statusEveryMs: 60_000,
-  /** How long "a newer proxy was kept" is remembered. */
-  newerMemoryMs: 60_000,
-  /** Resolver failures that make the proxy's resolvers suspect. */
-  resolverFailures: 3,
-} as const;
-
-/**
- * THE SWITCH (leg 14). Under a non-runc runtime (gVisor), whether a running, contained sandbox is restarted after its
- * proxy was swapped, in case the sandbox's neighbor cache still holds the old proxy's MAC. OFF: the proxy's fixed MAC
- * (`proxyMac`) is relied on first. The Flight Director turns it on only if CI still shows `EHOSTUNREACH` after a replacement.
- */
-export const RESTART_AFTER_SWAP = false;
-
-/**
- * Whether a sandbox is restarted after a proxy replacement: only when the switch is on, the sandbox is running, on its
- * project network only, and its runtime is not runc. Pure; `enabled` defaults to the named switch.
- */
-export function restartAfterSwap(
-  sandbox: { running: boolean; contained: boolean; runc: boolean },
-  enabled: boolean = RESTART_AFTER_SWAP,
-): boolean {
-  return enabled && sandbox.running && sandbox.contained && !sandbox.runc;
 }
 
 /** What `Containment` needs of the Docker layer; `Docker` is one, and a test's double is another. */
@@ -221,8 +146,6 @@ export function canonicalJson(value: unknown): string {
   };
   return JSON.stringify(sorted(value));
 }
-
-const sha256 = (text: string): string => crypto.createHash("sha256").update(text).digest("hex");
 
 /** What the record says the proxy may reach: the phase, the validated entries and the warnings for the ones dropped. */
 export interface Allowance {
@@ -308,17 +231,10 @@ interface Subject {
 
 type Assessment = { kind: "ok" | "start"; proxy: ProjectProxy; newer: boolean } | { kind: "replace" };
 
-/** A held lock: the mutex and the lock file, with the deadline and the token to check before anything is removed. */
-interface HeldLock {
-  /** Throws when the deadline has passed or the lock file's token is no longer ours. Called before others are removed. */
-  assertLive(): void;
-}
-
 export class Containment {
   private readonly clock: Clock;
   private readonly log: (line: string) => void;
-  /** The tail of each project's mutex chain. */
-  private readonly tails = new Map<string, Promise<void>>();
+  private readonly locks: ProjectLocks;
   private readonly startups = new Map<string, { promise: Promise<void>; failed?: unknown }>();
   /** The startup gate (leg 10): covers the window before the pass has listed the sandboxes and registered each key. */
   private gate?: { promise: Promise<void>; pending: boolean; failed?: unknown };
@@ -338,6 +254,7 @@ export class Containment {
     private readonly opts: ContainmentOptions,
   ) {
     this.clock = opts.clock ?? realClock;
+    this.locks = new ProjectLocks(this.clock, opts.dataDir);
     this.log = opts.log ?? (() => {});
   }
 
@@ -466,161 +383,6 @@ export class Containment {
     if (this.gate?.failed !== undefined) this.gateCleared.add(key);
   }
 
-  // --- locks -----------------------------------------------------------------------------------------------------
-
-  private lockPath(key: string): string {
-    return path.join(this.opts.dataDir, `registry.json.proxy-${sha256(key).slice(0, 16)}.lock`);
-  }
-
-  /**
-   * The one lock path: the in-process mutex and the lock file together, then the function under a 90 s deadline
-   * that starts once both are held. The wait for both is bounded by 60 s (`ContainmentBusyError`, which fails
-   * closed). The lock file is removed only if its token is still ours. "Locked" functions assume the caller holds it.
-   */
-  private async withProjectLock<T>(key: string, fn: (lock: HeldLock) => Promise<T>): Promise<T> {
-    const waitStart = this.clock.mono();
-    const releaseMutex = await this.acquireMutex(key);
-    let file: { ours(): boolean; release(): void };
-    try {
-      file = await this.acquireFile(key, waitStart);
-    } catch (e) {
-      releaseMutex();
-      throw e;
-    }
-    const startedMono = this.clock.mono();
-    let aborted = false;
-    const lock: HeldLock = {
-      assertLive: () => {
-        if (aborted || this.clock.mono() - startedMono > LIMITS.deadlineMs) {
-          aborted = true;
-          throw new ContainmentDeadlineError(`The replacement for ${key} passed its ${LIMITS.deadlineMs / 1000} s deadline.`);
-        }
-        if (!file.ours()) throw new ContainmentLockLostError(`The lock for ${key} was taken over while it was held; nothing was removed.`);
-      },
-    };
-    // The mutex and the lock file are released only once `fn` has settled, even when the caller was refused at the
-    // deadline earlier: a straggling `fn` (which keeps checking `assertLive`) never runs beside the next holder.
-    const run = (async (): Promise<T> => {
-      try {
-        return await fn(lock);
-      } finally {
-        try {
-          file.release();
-        } finally {
-          releaseMutex();
-        }
-      }
-    })();
-    const deadline = this.clock.after(LIMITS.deadlineMs);
-    try {
-      return await Promise.race([
-        run,
-        deadline.promise.then((): never => {
-          aborted = true;
-          throw new ContainmentDeadlineError(`The replacement for ${key} passed its ${LIMITS.deadlineMs / 1000} s deadline.`);
-        }),
-      ]);
-    } finally {
-      deadline.cancel();
-    }
-  }
-
-  private async acquireMutex(key: string): Promise<() => void> {
-    const prev = this.tails.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const mine = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const tail = prev.then(() => mine);
-    this.tails.set(key, tail);
-    void tail.then(() => {
-      if (this.tails.get(key) === tail) this.tails.delete(key);
-    });
-    const timer = this.clock.after(LIMITS.lockWaitMs);
-    try {
-      const timedOut = await Promise.race([prev.then(() => false), timer.promise.then(() => true)]);
-      if (timedOut) {
-        // Our place in the chain stays, and is given up as soon as the one before us is done.
-        void prev.then(release);
-        throw new ContainmentBusyError(`Another replacement for ${key} is in progress and did not finish within ${LIMITS.lockWaitMs / 1000} s; this sandbox is refused rather than left uncontained.`);
-      }
-    } finally {
-      timer.cancel();
-    }
-    return release;
-  }
-
-  /**
-   * Remove a lock file judged stale, without ever removing a fresh one another waiter has just created: the file is
-   * renamed to a name of our own, judged again there (a rename keeps the mtime), and only then deleted. If it turns
-   * out fresh it is put back with an exclusive link.
-   */
-  private removeIfStale(file: string): void {
-    const mine = `${file}.stale-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
-    try {
-      fs.renameSync(file, mine);
-    } catch {
-      return; // already gone
-    }
-    try {
-      if (this.clock.now() - fs.statSync(mine).mtimeMs <= LIMITS.staleMs) {
-        try {
-          fs.linkSync(mine, file);
-        } catch {
-          // another lock was created meanwhile: this one is lost, and its holder finds out by its token
-        }
-      }
-    } finally {
-      fs.rmSync(mine, { force: true });
-    }
-  }
-
-  private async acquireFile(key: string, waitStart: number): Promise<{ ours(): boolean; release(): void }> {
-    const file = this.lockPath(key);
-    fs.mkdirSync(this.opts.dataDir, { recursive: true, mode: 0o700 });
-    const token = `${process.pid}:${crypto.randomBytes(16).toString("hex")}`;
-    for (;;) {
-      try {
-        const fd = fs.openSync(file, "wx", 0o600);
-        try {
-          fs.writeSync(fd, token);
-        } finally {
-          fs.closeSync(fd);
-        }
-        break;
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      }
-      let age = 0;
-      try {
-        age = this.clock.now() - fs.statSync(file).mtimeMs;
-      } catch {
-        continue; // released between our two calls
-      }
-      if (age > LIMITS.staleMs) {
-        this.removeIfStale(file);
-        continue;
-      }
-      if (this.clock.mono() - waitStart >= LIMITS.lockWaitMs) {
-        throw new ContainmentBusyError(`Another process is replacing the proxy for ${key} and did not finish within ${LIMITS.lockWaitMs / 1000} s; this sandbox is refused rather than left uncontained.`);
-      }
-      await this.clock.sleep(LIMITS.pollMs);
-    }
-    const ours = (): boolean => {
-      try {
-        return fs.readFileSync(file, "utf8") === token;
-      } catch {
-        return false;
-      }
-    };
-    return {
-      ours,
-      release: () => {
-        if (ours()) fs.rmSync(file, { force: true });
-      },
-    };
-  }
-
   // --- the record ------------------------------------------------------------------------------------------------
 
   /** The project's record from the registry's file, read fresh; undefined when there is none. A registry that cannot be read is a refusal. */
@@ -672,7 +434,7 @@ export class Containment {
     if ((this.newerUntil.get(k) ?? 0) > this.clock.now()) return { kind: "kept-newer", warnings: [] };
     const subject = this.subjectFor(k);
     await this.docker.ensureImage(this.cfg.docker.proxyImage);
-    const result = await this.withProjectLock(k, (lock) => this.replaceLocked(lock, subject, opts));
+    const result = await this.locks.withProjectLock(k, (lock) => this.replaceLocked(lock, subject, opts));
     this.clearFailedStartup(k);
     return result;
   }
@@ -742,7 +504,6 @@ export class Containment {
         await this.docker.removeProjectProxy(p.id);
         removed++;
       }
-      await this.restartForSwap(s);
       // The names are the same when only hosts changed (the address is fixed); they are written again when there are any, and
       // taken out when the session's forwards changed and none are left.
       if (names.length > 0 || olds.some((p) => p.labels[SESSION_LABEL] !== plan.labels[SESSION_LABEL])) await this.syncLocalAccess(s, net, names);
@@ -757,24 +518,9 @@ export class Containment {
   }
 
   /**
-   * The named fallback (see `RESTART_AFTER_SWAP`, off): after a proxy swap, a running contained sandbox under a non-runc
-   * runtime is restarted. Never throws: a failure is logged, and the sandbox is then left as the swap left it.
-   */
-  private async restartForSwap(s: Subject): Promise<void> {
-    if (!RESTART_AFTER_SWAP) return;
-    try {
-      const f = await this.docker.inspectSandbox(s.sandbox);
-      if (!f) return;
-      if (restartAfterSwap({ running: f.running, contained: networkModeOf(f.name, f.networks) === "contained", runc: isRuncRuntime(f.runtime) })) await this.docker.restartSandbox(s.sandbox);
-    } catch (e) {
-      this.log(`containment: could not restart ${s.sandbox} after its proxy was replaced: ${(e as Error).message}`);
-    }
-  }
-
-  /**
    * T18: a proxy reconnected with `network connect --ip` keeps its address but gets a NEW MAC (a MAC can only be fixed at
    * create). So after a rollback restored the old proxy, a running sandbox under a non-runc runtime is restarted, to rebuild its
-   * neighbor cache. Not behind `RESTART_AFTER_SWAP`: this path always needs it. Never throws (logged).
+   * neighbor cache. Never throws (logged).
    */
   private async restartAfterRestore(s: Subject): Promise<void> {
     try {
@@ -910,7 +656,7 @@ export class Containment {
     }
     try {
       await this.docker.ensureImage(this.cfg.docker.proxyImage);
-      const done = await this.withProjectLock(k, (lock) => this.containLocked(lock, subject, { start: opts.start }));
+      const done = await this.locks.withProjectLock(k, (lock) => this.containLocked(lock, subject, { start: opts.start }));
       this.clearFailedStartup(k);
       return { ok: true, result: done.result, ...(done.sandbox ? { sandbox: done.sandbox } : {}) };
     } catch (e) {
@@ -981,7 +727,7 @@ export class Containment {
     const k = key.toLowerCase();
     const subject = this.subjectFor(k);
     const where = target ?? subject.sandbox;
-    return this.withProjectLock(k, async () => {
+    return this.locks.withProjectLock(k, async () => {
       const state = await this.docker.networkState(where);
       if (state === "contained") return { state, opened: false };
       if (state === "open") return { state, opened: false };
@@ -1040,7 +786,7 @@ export class Containment {
    */
   async ensureContained(facts: SandboxInspectFacts, mode: ContainmentHookMode): Promise<Record<string, string> | undefined> {
     const label = facts.labels?.[PROJECT_LABEL];
-    if (label === undefined || label === "") return undefined; // a sandbox from before ownership: nothing is done
+    if (label === undefined || label === "") return undefined; // no project label (a sandbox made before ownership never reaches here, its start is refused): nothing is done
     if (mode === "observe" || this.cfg.network.mode !== "contained") return this.envIfContained(facts);
     const key = label.toLowerCase();
     let f = facts;
@@ -1093,7 +839,7 @@ export class Containment {
     }
     // Only a repair needs the proxy image, and it is ensured outside the lock.
     if (looked.verdict !== "start") await this.docker.ensureImage(this.cfg.docker.proxyImage);
-    const repaired = await this.withProjectLock(key, (lock) => this.repairLocked(lock, s, f, { resolverTrouble: looked.verdict === "resolvers" }));
+    const repaired = await this.locks.withProjectLock(key, (lock) => this.repairLocked(lock, s, f, { resolverTrouble: looked.verdict === "resolvers" }));
     this.clearFailedStartup(key);
     return proxyEnvironment(proxyAddress(repaired.net.subnet));
   }
@@ -1184,7 +930,7 @@ export class Containment {
    */
   async startupStep(key: string, sandboxName: string): Promise<StartupStepResult> {
     const k = key.toLowerCase();
-    const done = await this.withProjectLock(k, async (lock): Promise<StartupStepResult> => {
+    const done = await this.locks.withProjectLock(k, async (lock): Promise<StartupStepResult> => {
       const record = this.peek(k);
       const settles = record !== undefined && record.container === sandboxName;
       const facts = await this.docker.inspectSandbox(sandboxName);

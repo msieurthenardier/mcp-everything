@@ -9,23 +9,19 @@ import { vetCatalog } from "../src/install/discovery.js";
 import { buildToolsWithText } from "../src/toolgen/discover.js";
 import { Installer, staleInstallLimitSec, type InstallContainment } from "../src/install/installer.js";
 import type { ContainResult, ReplaceResult } from "../src/network/containment.js";
-import { CloneFailedError, type ProxyRefusalRow } from "../src/sandbox/docker.js";
+import { CloneFailedError } from "../src/sandbox/errors.js";
+import type { ProxyRefusalRow } from "../src/sandbox/network-spec.js";
 import { McpProxy } from "../src/proxy/mcp-proxy.js";
 import type { Connector, Launch } from "../src/proxy/mcp-proxy.js";
 import { Registry } from "../src/registry.js";
-import { RuntimeUnavailableError } from "../src/sandbox/docker.js";
+import { RuntimeUnavailableError } from "../src/sandbox/errors.js";
 import { App } from "../src/server.js";
-import {
-  DockerUnavailableError,
-  SandboxRefusedError,
-  type ExecOptions,
-  type ExecResult,
-  type NetworkMode,
-  OWNER_SHOWN,
-  type ProbeData,
-  type SandboxFacts,
-  type SandboxRef,
-} from "../src/sandbox/docker.js";
+import type { ExecOptions, ExecResult } from "../src/sandbox/docker.js";
+import type { SandboxRef } from "../src/sandbox/docker-base.js";
+import { DockerUnavailableError } from "../src/sandbox/errors.js";
+import type { NetworkMode } from "../src/sandbox/network-spec.js";
+import { OWNER_SHOWN, SandboxRefusedError, type SandboxFacts } from "../src/sandbox/ownership.js";
+import type { ProbeData } from "../src/sandbox/scripts.js";
 import { FakeDocker, fakeUpstream, record as seedRecord, SECRET_VALUE, targetName, TEST_INSTALLATION_ID, type FakeUpstream, type SandboxTarget } from "./helpers.js";
 import type { DependencyLookup } from "../src/scan/dependencies.js";
 import type { CheckOutcome } from "../src/scan/types.js";
@@ -1292,7 +1288,11 @@ describe("sandbox names and reinstall order", () => {
     it.each([
       ["a container that is not ours", refusal(part("container", OLD, "not-ours")), `container "${OLD}" was not created by mcp-everything`],
       ["only a container", refusal(part("container", OLD, "another", OTHER)), `container "${OLD}" is another installation's`],
-      ["a volume that was made before ownership", refusal(part("container", OLD, "not-ours"), part("volume", OLD, "before")), `volume "${OLD}" was made before ownership was recorded`],
+      [
+        "a volume that was made before ownership, with the prohibition and no docker command",
+        refusal(part("container", OLD, "not-ours"), part("volume", OLD, "before")),
+        `volume "${OLD}" was made before ownership was recorded; this installation cannot tell whether it is its own and does not act on it. Do not remove it yourself; ask the operator`,
+      ],
       [
         "an owner label with a line break and excessive length",
         refusal(part("container", OLD, "another", `ab\ncd${"x".repeat(200)}`)),
@@ -1311,6 +1311,24 @@ describe("sandbox names and reinstall order", () => {
       expect(w).toContain(expected);
       expect(w).not.toContain("\n");
       expect(w.length).toBeLessThan(400);
+    });
+
+    it("a reinstall over a sandbox made before ownership does not remove it, builds on fresh names, and carries the prohibition (no docker command, no name-held warning)", async () => {
+      spyClose();
+      seedOld({ status: "ready" });
+      docker.destroyErrors[OLD] = refusal(part("container", OLD, "before"), part("volume", OLD, "before"));
+      const record = await install({ reinstall: true });
+      expect(record).toMatchObject({ status: "ready", container: WIDGET, volume: WIDGET });
+      expect(OLD).not.toBe(WIDGET);
+      const w = record.warnings.filter((x) => WARNING.test(x));
+      expect(w).toHaveLength(1);
+      expect(w[0]).toContain(`container "${OLD}" was made before ownership was recorded; this installation cannot tell whether it is its own and does not act on it. Do not remove it yourself; ask the operator`);
+      expect(w[0]).not.toMatch(/docker (rm|volume)/);
+      expect(w[0]).not.toContain("by hand");
+      expect(w[0]).not.toContain("\n");
+      expect(w[0]!.length).toBeLessThan(600); // two parts that are `before` say the note twice; the 400 bound is for one part and a mixed pair
+      expect(record.warnings.some((x) => /name this project's sandbox needs is held/.test(x))).toBe(false);
+      expect(docker.destroyed).not.toContain(OLD);
     });
 
     it("carries the warning on the failed record when the build then fails once a container exists", async () => {
@@ -1341,7 +1359,8 @@ describe("sandbox names and reinstall order", () => {
       docker.destroyErrors[WIDGET] = refusal(part("container", WIDGET, "not-ours"));
       const record = await install({ reinstall: true });
       expect(record.status).toBe("failed");
-      expect(record.error).toContain(`container "${WIDGET}" was not created by mcp-everything`);
+      expect(record.error).toContain(`container "${WIDGET}"`);
+      expect(record.error).toContain("it was not created by mcp-everything");
       expect(record.warnings.filter((x) => WARNING.test(x))).toHaveLength(1);
       expect(onDisk("widget")).toBeUndefined();
       expect(docker.created).toEqual([]);
