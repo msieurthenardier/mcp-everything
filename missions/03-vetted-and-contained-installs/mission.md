@@ -112,4 +112,4 @@ N/A
   - sandboxes made before ownership labels are never touched again (the operator removes them).
 
   *(Split from the tentative flight 4 below with the operator on 2026-11-23. It held three separate sets of design decisions.)*
-- [ ] Flight 5: [**Checking what a build installed**](flights/05-checking-what-a-build-installed/flight.md) — build output kept on the sandbox's volume (`/opt/mcpe` a symlink into it, Ruby gems too) and a scanner stage after the build, before discovery. A block at that stage on a reinstall leaves no working sandbox, by the operator's choice. *(Planned with the operator on 2026-11-25; trimmed of the earlier flight 4 text, which flight 4 delivered.)*
+- [x] Flight 5: [**Checking what a build installed**](flights/05-checking-what-a-build-installed/flight.md) — build output kept on the sandbox's volume (`/opt/mcpe` a symlink into it, Ruby gems too) and a scanner stage after the build, before discovery. A block at that stage on a reinstall leaves no working sandbox, by the operator's choice. *(Planned with the operator on 2026-11-25; trimmed of the earlier flight 4 text, which flight 4 delivered.)*

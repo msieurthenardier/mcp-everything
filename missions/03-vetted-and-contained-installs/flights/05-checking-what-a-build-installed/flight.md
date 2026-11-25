@@ -1,6 +1,6 @@
 # Flight: Checking What a Build Installed
 
-**Status**: in-flight
+**Status**: landed
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-25**, after flight 4 (PR #33) merged. The operator asked that it not be over-engineered: it has the smallest shape that meets the criterion. Three things were decided with the operator:
@@ -9,14 +9,14 @@
 > - there is no HAT leg.
 
 ## Contributing to Criteria
-- [ ] **With scanning on, what a build installed is checked before its tools are published**, and generated tool descriptions are checked before they are published.
+- [x] **With scanning on, what a build installed is checked before its tools are published**, and generated tool descriptions are checked before they are published.
   - Flight 3 did the tool descriptions.
   - This flight does the first half: a scanner stage that runs after the build and before discovery. Build output is put where that stage can read it.
-- [ ] **With scanning on, a repository is checked before any of its code runs. … A project already installed under that slug is left working as it was.**
+- [x] **With scanning on, a repository is checked before any of its code runs. … A project already installed under that slug is left working as it was.**
   - The check before the build is unchanged and still keeps the old project working.
   - The new check after the build cannot do the same on a reinstall: by then the old sandbox has been replaced (DD6). The docs say so.
-- [ ] **Which scanners run is always visible to the agent.** The server's instructions, install results and `project_info` name the build-stage scanners and their findings separately from the source-stage ones.
-- [ ] **The README describes what is checked and when, … what existing projects need after upgrading, and what none of this protects against.**
+- [x] **Which scanners run is always visible to the agent.** The server's instructions, install results and `project_info` name the build-stage scanners and their findings separately from the source-stage ones.
+- [x] **The README describes what is checked and when, … what existing projects need after upgrading, and what none of this protects against.**
   - `docs/checking.md` gains the build stage and its limits.
   - The upgrade note says that existing projects keep working, and get the build check only once reinstalled.
 
@@ -213,7 +213,7 @@ Check what a build installed, before any of it runs. A new sandbox keeps its bui
 - [x] Flight 4 merged to `main` (PR #33, `1034afb`).
 - [x] The default sandbox images are present locally for the premise checks and the Docker suite: `python:3.13`, `ruby:3`, `golang:1`, `rust:1` and `node:lts`, checked 2026-11-25.
 - [x] The venv and gems work through the symlink, verified 2026-11-25 (Open Questions).
-- [ ] Docker available for `npm run test:docker` before the PR is marked ready, as in flights 1–4 (Docker 29.8.2, Docker Desktop on WSL2).
+- [x] Docker available for `npm run test:docker` before the PR is marked ready, as in flights 1–4 (Docker 29.8.2, Docker Desktop on WSL2).
 
 ### Pre-Flight Checklist
 - [x] All open questions resolved
@@ -268,9 +268,9 @@ Check what a build installed, before any of it runs. A new sandbox keeps its bui
   - and under `warn`: `ready`, with the finding in `project_info`.
 
 ### Checkpoints
-- [ ] Leg 1: new sandboxes keep their build output on the volume; the Docker suite passes with the new assertions.
-- [ ] Leg 2: a build-stage scanner's findings reach the agent, and under `block` stop the install before discovery; the Docker suite passes with the new case.
-- [ ] The flight-end review confirms; the Docker suite passes on the final tree.
+- [x] Leg 1: new sandboxes keep their build output on the volume; the Docker suite passes with the new assertions.
+- [x] Leg 2: a build-stage scanner's findings reach the agent, and under `block` stop the install before discovery; the Docker suite passes with the new case.
+- [x] The flight-end review confirms; the Docker suite passes on the final tree.
 
 ### Adaptation Criteria
 
@@ -300,10 +300,10 @@ No HAT leg (operator, 2026-11-25).
 ## Post-Flight
 
 ### Completion Checklist
-- [ ] All legs completed
+- [x] All legs completed
 - [ ] Code merged
-- [ ] Tests passing (`npm test`, `npm run test:slow`, `npm run typecheck`, `npm run build`, `npm run test:docker`)
-- [ ] Documentation updated (`docs/checking.md`, the README's summary if it names the stages)
+- [x] Tests passing (`npm test`, `npm run test:slow`, `npm run typecheck`, `npm run build`, `npm run test:docker`)
+- [x] Documentation updated (`docs/checking.md`, the README's summary if it names the stages)
 
 ### Verification
 - **Unit tests:** `npx vitest run` passes. The new cases cover:
