@@ -1,6 +1,6 @@
 # Flight: Checking What a Build Installed
 
-**Status**: ready
+**Status**: in-flight
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-25**, after flight 4 (PR #33) merged. The operator asked that it not be over-engineered: it has the smallest shape that meets the criterion. Three things were decided with the operator:
@@ -60,8 +60,10 @@ Check what a build installed, before any of it runs. A new sandbox keeps its bui
   The removal matters: a retry on the fallback image runs in a new container on the same volume, and must not see the first attempt's output.
 - **The prelude's sequence**, inserted before its `mkdir -p ${BIN_DIR}` (`src/install/recipes.ts`, `PRELUDE`):
   1. `mkdir -p /opt`, which not every image has;
-  2. if `/opt/mcpe` is a real directory (`[ -d ] && [ ! -L ]`), print `MCPE_WARN` and leave both it and the volume alone;
-  3. otherwise `rm -rf /workspace/.mcpe`, `mkdir -p /workspace/.mcpe`, then `ln -sfn /workspace/.mcpe /opt/mcpe`.
+  2. `rm -rf /workspace/.mcpe` and `mkdir -p /workspace/.mcpe`, always, so that a retry never leaves the first attempt's output on the volume;
+  3. if `/opt/mcpe` is a real directory (`[ -d ] && [ ! -L ]`), print `MCPE_WARN` and leave it alone; otherwise `ln -sfn /workspace/.mcpe /opt/mcpe`.
+
+  *(Steps 2 and 3 were reordered at leg 1's design, 2026-11-25: the clearing used to run only in the link branch.)*
 
   A plain `ln -s` onto an existing directory would silently create `/opt/mcpe/.mcpe`; the explicit test is what prevents it.
 - **Nothing writes `/opt/mcpe` before the recipe.** The Architect checked `createContainer`, containment, and `CLEAN_SCRIPT` on a retry (`src/install/installer.ts`, `buildAttempts`). A stopped and restarted sandbox keeps the link, which is in its container layer.
@@ -285,10 +287,11 @@ Check what a build installed, before any of it runs. A new sandbox keeps its bui
 
 > **Note:** These are tentative suggestions, not commitments. Legs are planned and created one at a time as the flight progresses. This list will evolve based on discoveries during implementation.
 
-- [ ] `output-on-the-volume` - `/opt/mcpe` a symlink to `/workspace/.mcpe`, cleared per attempt; `GEM_HOME` on the volume; the Docker suite asserts where gron's binary is (DD1–DD3).
-- [ ] `build-stage-scanners` - `"stage": "build"`, the gated scanner run after the build and before discovery, the block path and its hold (DD10), the report and its rendering, the docs and limits (DD4–DD10).
+- [x] `output-on-the-volume` - `/opt/mcpe` a symlink to `/workspace/.mcpe`, cleared per attempt; `GEM_HOME` on the volume; the Docker suite asserts where gron's binary is (DD1–DD3).
+- [x] `build-stage-scanners` - `"stage": "build"`, the gated scanner run after the build and before discovery, the block path and its hold (DD4–DD6, DD8, DD10), with the Docker case.
+- [x] `build-stage-reporting` - the build stage's report, the `security:` line, the instructions, `check_project`'s note, and `docs/checking.md` with DD9's limits and the upgrade note (DD5, DD7, DD9).
 
-The Architect suggested splitting leg 2. It stays one leg: its parts are one feature slice, and splitting them would split by task type. Each part carries its own tests.
+*(At design, the original leg 2 was split into these two, 2026-11-25. The leg design review found it too large for one pass, and enforcement and reporting are a risk boundary. They are reviewed and committed together.)*
 
 No HAT leg (operator, 2026-11-25).
 

@@ -25,7 +25,7 @@ import { inertDependencyLookup, type DependencyLookup } from "../scan/dependenci
 import { decide } from "../scan/policy.js";
 import { runScanners } from "../scan/run.js";
 import { emptyCounts } from "../scan/sarif.js";
-import type { CheckOutcome, ScanReport } from "../scan/types.js";
+import { buildReport, scannersAt, type CheckOutcome, type ScanReport, type ScannerSpec } from "../scan/types.js";
 import { detect } from "./detect.js";
 import { discover, type McpDiscovery } from "./discovery.js";
 import { recipeFor } from "./recipes.js";
@@ -257,7 +257,7 @@ export class Installer {
         submodules: params.submodules,
         onOutput: (c) => log(c.trimEnd()),
       });
-      return await this.finishInstall(params, record, probe, container, volume, state, log);
+      return await this.finishInstall(params, record, probe, container, volume, state, log, before?.status === "ready");
     } catch (e) {
       return this.settleFailure(e, record, slug, container, volume, state);
     }
@@ -300,7 +300,7 @@ export class Installer {
       }
       const dependencies = lookup ? await lookup : undefined;
       log("Running the scanners…");
-      const scanned = await runScanners(this.docker, staging, this.cfg.scan.scanners, {
+      const scanned = await runScanners(this.docker, staging, this.scannersFor("source"), {
         totalTimeoutSec: this.cfg.scan.timeoutSec,
         dataDir: this.cfg.dataDir,
       });
@@ -318,6 +318,11 @@ export class Installer {
       }
       throw new Error(oneLine(e instanceof Error ? e.message : String(e), CHECK_REASON_MAX) + sent);
     }
+  }
+
+  /** The configured scanners that run at one stage; a scanner with no `stage` runs at the source stage. */
+  private scannersFor(stage: "source" | "build"): ScannerSpec[] {
+    return scannersAt(this.cfg.scan.scanners, stage);
   }
 
   /** Starts the dependency lookup; the promise never rejects (a throw or a rejection is a failed outcome). */
@@ -451,7 +456,8 @@ export class Installer {
         await this.docker.createSandboxVolume(volume);
         await this.docker.copyVolume(staging, volume);
         await dropOnce();
-        return { kind: "installed", record: await this.finishInstall(params, record, probe, container, volume, state, log) };
+        const replaced = before?.status === "ready";
+        return { kind: "installed", record: await this.finishInstall(params, record, probe, container, volume, state, log, replaced) };
       } catch (e) {
         return { kind: "installed", record: await this.settleFailure(e, record, slug, container, volume, state) };
       }
@@ -541,6 +547,7 @@ export class Installer {
     volume: string,
     state: { current: InstallState },
     log: Logger,
+    replaced: boolean,
   ): Promise<ProjectRecord> {
     record.commit = probe.commit;
 
@@ -598,6 +605,31 @@ export class Installer {
       await this.takeOffline(record, "failed", sandbox);
       this.registry.putKeeping(record, ["hosts"]);
       return record;
+    }
+
+    // The check after the build (DD5): over the install's own volume, before the network policy is applied and before
+    // discovery runs any built program. `record.scan` is set only by `installChecked`, so a direct `install` skips it.
+    const buildScanners = this.cfg.scan.mode !== "off" && record.scan ? this.scannersFor("build") : [];
+    if (record.scan && buildScanners.length > 0) {
+      log("Running the scanners after the build…");
+      // A throw out of here (a refusal or an unusable volume) reaches `settleFailure` like any throw of this method: the
+      // record is `failed` with no `scan.build`, so it is not held (DD10). Accepted: it cannot happen for the install's own volume.
+      const scanned = await runScanners(this.docker, volume, buildScanners, {
+        totalTimeoutSec: this.cfg.scan.timeoutSec,
+        dataDir: this.cfg.dataDir,
+      });
+      const decision = decide(this.cfg.scan.mode, this.cfg.scan.blockAt, scanned);
+      record.scan.build = { checks: scanned, decision, at: new Date().toISOString() };
+      if (decision.verdict === "block") {
+        if (this.contained) record.warnings.push(...refusalWarnings(refused, MAX_REFUSAL_WARNINGS));
+        record.status = "failed";
+        record.error =
+          `The check after the build blocked the install: ${decision.reason}.` +
+          (replaced ? " The previous version was replaced before the build and is not restored." : "");
+        await this.takeOffline(record, "failed", sandbox);
+        this.registry.putKeeping(record, ["hosts"]);
+        return record;
+      }
     }
 
     // From here on the project's code only runs with the network policy the
@@ -954,6 +986,18 @@ export class Installer {
     return sandbox;
   }
 
+  /**
+   * A project the check after the build blocked stays blocked until it is reinstalled (DD10): every path that ends
+   * in `finish()` would otherwise set it `ready` after running its programs. Throws before anything runs. The marker
+   * is read through `buildReport`, so a malformed stored value does not hold a project.
+   */
+  assertNotBlocked(project: ProjectRecord): void {
+    if (buildReport(project.scan)?.decision.verdict !== "block") return;
+    throw new Error(
+      `${project.slug} was blocked by the check after the build and stays blocked. Reinstall it (install_project with reinstall: true), or ask the operator to change the scanning policy.`,
+    );
+  }
+
   private finish(record: ProjectRecord): ProjectRecord {
     record.status = "ready";
     record.error = undefined;
@@ -969,6 +1013,7 @@ export class Installer {
    * manual build via sandbox_exec.
    */
   async rediscover(project: ProjectRecord, extraCommands: string[]): Promise<ProjectRecord> {
+    this.assertNotBlocked(project);
     const sandbox = await this.requireSandbox(project);
     const record: ProjectRecord = { ...project, warnings: [...project.warnings] };
     await this.discover(record, sandbox, extraCommands);
@@ -982,6 +1027,7 @@ export class Installer {
    * variable's value is unusable.
    */
   async refreshMcp(project: ProjectRecord): Promise<RefreshOutcome> {
+    this.assertNotBlocked(project);
     // Before anything is stopped: an unusable value fails the call and changes nothing.
     launchVariables(project.slug, this.slugsWith(project), this.env);
     const sandbox = await this.requireSandbox(project);
@@ -1006,6 +1052,7 @@ export class Installer {
    * start, leaving the project unchanged.
    */
   async connectMcp(project: ProjectRecord, spec: McpServerSpec): Promise<ProjectRecord> {
+    this.assertNotBlocked(project);
     const sandbox = await this.requireSandbox(project);
     // Before anything is stopped: an unusable value fails the call and changes nothing.
     const launch = this.launchSpec(project, spec);
@@ -1019,6 +1066,7 @@ export class Installer {
 
   /** Forget a registered MCP server (and whatever environment was stored for it). */
   async disconnectMcp(project: ProjectRecord, name: string): Promise<ProjectRecord> {
+    this.assertNotBlocked(project);
     const server = (project.mcpServers ?? []).find((s) => s.name === name);
     if (!server) throw new Error(`${project.slug} has no MCP server named "${name}"`);
     if (server.origin !== "registered") {

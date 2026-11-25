@@ -17,14 +17,14 @@ import { Registry } from "../src/registry.js";
 import { RuntimeUnavailableError } from "../src/sandbox/errors.js";
 import { App } from "../src/server.js";
 import type { ExecOptions, ExecResult } from "../src/sandbox/docker.js";
-import type { SandboxRef } from "../src/sandbox/docker-base.js";
+import type { OneShotResult, SandboxRef } from "../src/sandbox/docker-base.js";
 import { DockerUnavailableError } from "../src/sandbox/errors.js";
 import type { NetworkMode } from "../src/sandbox/network-spec.js";
 import { OWNER_SHOWN, SandboxRefusedError, type SandboxFacts } from "../src/sandbox/ownership.js";
 import type { ProbeData } from "../src/sandbox/scripts.js";
 import { FakeDocker, fakeUpstream, record as seedRecord, SECRET_VALUE, targetName, TEST_INSTALLATION_ID, type FakeUpstream, type SandboxTarget } from "./helpers.js";
 import type { DependencyLookup } from "../src/scan/dependencies.js";
-import type { CheckOutcome } from "../src/scan/types.js";
+import type { CheckOutcome, ScannerSpec } from "../src/scan/types.js";
 import type { ProjectRecord } from "../src/types.js";
 
 const TOOL_HELP = `Tool does things.
@@ -172,8 +172,16 @@ class ScriptedDocker extends FakeDocker {
     this.traced("removeStagingVolume", volume);
     if (this.removeStagingError) throw this.removeStagingError;
   }
-  override async runScanner(): Promise<never> {
+  /** What `runScanner` returns for a scanner, by its name: a result (SARIF on stdout) or an Error to throw. Unscripted: `runScannerError`, or "no scanner expected". */
+  scannerResults = new Map<string, OneShotResult | Error>();
+  /** The volume and spec of every `runScanner`, in order, with how many `exec`s had run by then. */
+  scannerRuns: Array<{ volume: string; spec: ScannerSpec; execs: number }> = [];
+  override async runScanner(volume: string, spec: ScannerSpec): Promise<OneShotResult> {
     this.traced("runScanner");
+    this.scannerRuns.push({ volume, spec, execs: this.calls.length });
+    const scripted = this.scannerResults.get(spec.name);
+    if (scripted instanceof Error) throw scripted;
+    if (scripted) return scripted;
     throw this.runScannerError ?? new Error("no scanner expected");
   }
   /** Leg 8: the project's proxy refusals are read through the trace, so that their order against the network change is visible. */
@@ -3108,5 +3116,274 @@ describe("the tool-description check at discovery", () => {
     expect(record.toolCheck!.outcome).toMatchObject({ status: "failed", error: "the tool-description check could not complete" });
     expect(record.toolCheck).toMatchObject({ withheld: [], withheldNames: [], withheldOmitted: 0, allWithheldServers: [] });
     expect(JSON.stringify(record.toolCheck)).not.toContain("EVILPROP");
+  });
+});
+
+describe("the check after the build", () => {
+  const REPO = () => parseRepoRef("acme/widget", cfg.hosts);
+  const checked = (extra: object = {}) => installer.installChecked({ repo: REPO(), ...extra });
+  const calls = () => docker.trace.map((t) => t.call);
+  const sarif = (...results: Array<{ level: string; text: string }>) => ({
+    code: 0, stdout: JSON.stringify({ version: "2.1.0", runs: [{ tool: { driver: { name: "x" } }, results: results.map((r) => ({ ruleId: "r1", level: r.level, message: { text: r.text } })) }] }),
+    stderr: "", timedOut: false, truncated: false,
+  });
+  const SRC: ScannerSpec = { name: "src", image: "scan:1", command: ["scan"], network: false, hosts: [], timeoutSec: 60, env: [] };
+  const BLD: ScannerSpec = { ...SRC, name: "bld", stage: "build" };
+  const FOUND = { level: "error", text: "found gron in /scan/.mcpe/bin" };
+  const buildRuns = () => docker.scannerRuns.filter((r) => r.spec.stage === "build");
+  const recipeAt = () => docker.calls.findIndex((c) => (c.argv[2] ?? "").includes("soft_fail()"));
+  const row = (host: string): ProxyRefusalRow => ({
+    kind: "connect", host, port: 443, reason: "not-allowed", count: 1, firstAt: "2026-01-01T00:00:00.000Z", lastAt: "2026-01-01T00:00:01.000Z",
+  });
+  const seedReady = (over: Partial<ProjectRecord> = {}) => {
+    registry.put({ ...seedRecord("widget", "acme/widget"), container: WIDGET, volume: WIDGET, ...over });
+  };
+  const scripted = (build: OneShotResult | Error = sarif(FOUND)) => {
+    cfg.scan.scanners = [SRC, BLD];
+    docker.scannerResults.set("src", sarif());
+    docker.scannerResults.set("bld", build);
+  };
+
+  beforeEach(() => {
+    setup({ MCPE_SCAN: "block", MCPE_SCAN_BLOCK_AT: "error" });
+    docker.repoFiles = { "package.json": pkg({}) };
+  });
+
+  describe("which scanners run", () => {
+    it("each stage runs only its own: the source scanner over the staging volume, the build scanner over the install's volume", async () => {
+      scripted(sarif());
+      const out = await checked();
+      expect(out.kind).toBe("installed");
+      expect(docker.scannerRuns.map((r) => r.spec.name)).toEqual(["src", "bld"]);
+      expect(docker.scannerRuns[0]!.volume).toMatch(new RegExp(`^${WIDGET_PREFIX}-stg-`));
+      expect(docker.scannerRuns[1]!.volume).toBe(WIDGET);
+    });
+
+    it("check_project never runs a build scanner", async () => {
+      scripted();
+      const out = await installer.check({ repo: REPO() });
+      expect(out.kind).toBe("checked");
+      expect(docker.scannerRuns.map((r) => r.spec.name)).toEqual(["src"]);
+    });
+
+    it("a scanner with no stage runs at the source stage only", async () => {
+      cfg.scan.scanners = [SRC];
+      docker.scannerResults.set("src", sarif());
+      const out = await checked();
+      expect(out.kind).toBe("installed");
+      expect(docker.scannerRuns.map((r) => r.spec.name)).toEqual(["src"]);
+      expect((out as { record: ProjectRecord }).record.scan!.build).toBeUndefined();
+    });
+  });
+
+  describe("when it runs", () => {
+    it("after the build and the refusal read, before the first setNetwork (contained)", async () => {
+      setup({ MCPE_NETWORK: "contained", MCPE_SCAN: "warn" });
+      docker.repoFiles = { "package.json": pkg({}) };
+      scripted(sarif());
+      const out = await checked();
+      expect(out.kind).toBe("installed");
+      const names = calls().filter((c) => /^(runScanner|projectRefusals|setNetwork|removeStagingVolume)$/.test(c));
+      expect(names).toEqual(["runScanner", "removeStagingVolume", "projectRefusals", "runScanner", "setNetwork"]);
+      expect(recipeAt()).toBeGreaterThanOrEqual(0);
+      expect(buildRuns()[0]!.execs).toBeGreaterThan(recipeAt());
+      expect(buildRuns()[0]!.execs).toBe(recipeAt() + 1);
+    });
+
+    it("under open: after the recipe's exec, before setNetwork and any discovery exec", async () => {
+      scripted(sarif());
+      await checked();
+      expect(calls().indexOf("runScanner", calls().indexOf("removeStagingVolume"))).toBeLessThan(calls().indexOf("setNetwork"));
+      expect(buildRuns()[0]!.execs).toBe(recipeAt() + 1);
+    });
+  });
+
+  describe("when it does not run", () => {
+    it("scanning off", async () => {
+      setup({ MCPE_SCAN: "off" });
+      docker.repoFiles = { "package.json": pkg({}) };
+      scripted();
+      const out = await checked();
+      expect((out as { record: ProjectRecord }).record.scan!.build).toBeUndefined();
+      expect(buildRuns()).toEqual([]);
+    });
+
+    it("no scanner is marked for the build stage", async () => {
+      cfg.scan.scanners = [SRC];
+      docker.scannerResults.set("src", sarif());
+      const out = await checked();
+      expect((out as { record: ProjectRecord }).record.scan!.build).toBeUndefined();
+      expect(buildRuns()).toEqual([]);
+    });
+
+    it("record.scan is unset (install called directly)", async () => {
+      scripted();
+      const record = await installer.install({ repo: REPO() });
+      expect(record.status).toBe("ready");
+      expect(record.scan).toBeUndefined();
+      expect(docker.scannerRuns).toEqual([]);
+    });
+
+    it("after a failed build", async () => {
+      scripted();
+      docker.recipe = () => ({ code: 1 });
+      const out = await checked();
+      const record = (out as { record: ProjectRecord }).record;
+      expect(record.status).toBe("failed");
+      expect(record.scan!.build).toBeUndefined();
+      expect(buildRuns()).toEqual([]);
+    });
+  });
+
+  describe("under block, with a finding at or above the threshold", () => {
+    it("fails the project offline, without discovery, and says why", async () => {
+      scripted();
+      const out = await checked();
+      expect(out.kind).toBe("installed");
+      const record = (out as { record: ProjectRecord }).record;
+      expect(record.status).toBe("failed");
+      expect(record.tools).toEqual([]);
+      expect(record.network).toBe(false);
+      expect(record.error).toMatch(/^The check after the build blocked the install: 1 finding at error or above, from bld\./);
+      expect(record.error).toContain(record.scan!.build!.decision.reason);
+      expect(record.scan!.build!.decision.verdict).toBe("block");
+      expect(record.scan!.build!.checks[0]!.findings[0]!.message).toContain("gron");
+      // The source stage's own verdict is unchanged.
+      expect(record.scan!.decision.verdict).toBe("build");
+      // Offline, and nothing ran after the build.
+      expect(docker.network.map((n) => n[1])).toEqual(["off"]);
+      expect(docker.calls.length).toBe(recipeAt() + 1);
+      expect(onDisk("widget")).toMatchObject({ status: "failed", scan: { build: { decision: { verdict: "block" } } } });
+    });
+
+    it("under containment, keeps the build's refusals as warnings and never opens the network", async () => {
+      setup({ MCPE_NETWORK: "contained", MCPE_SCAN: "block", MCPE_SCAN_BLOCK_AT: "error" });
+      docker.repoFiles = { "package.json": pkg({}) };
+      docker.refusals = [row("evil.example")];
+      scripted();
+      const out = await checked({ network: true });
+      const record = (out as { record: ProjectRecord }).record;
+      expect(record.status).toBe("failed");
+      expect(record.warnings.join("\n")).toContain("evil.example");
+      expect(docker.network.map((n) => n[1])).toEqual(["off"]);
+      expect(calls()).not.toContain("replace");
+      expect(docker.calls.length).toBe(recipeAt() + 1);
+    });
+
+    it("a first install, a reinstall over a ready record, and a reinstall over a failed one: the replaced-version sentence only for the ready one", async () => {
+      scripted();
+      const first = ((await checked()) as { record: ProjectRecord }).record;
+      expect(first.error).not.toContain("previous version");
+
+      seedReady();
+      docker.scannerRuns = [];
+      const over = ((await checked({ reinstall: true })) as { record: ProjectRecord }).record;
+      expect(over.status).toBe("failed");
+      expect(over.error).toContain("The previous version was replaced before the build and is not restored.");
+
+      const again = ((await checked({ reinstall: true })) as { record: ProjectRecord }).record;
+      expect(again.status).toBe("failed");
+      expect(again.error).toMatch(/blocked the install/);
+      expect(again.error).not.toContain("previous version");
+    });
+
+    it("a direct install never runs the stage, even as a reinstall over a ready record", async () => {
+      scripted();
+      seedReady();
+      const record = await installer.install({ repo: REPO(), reinstall: true });
+      expect(record.status).toBe("ready");
+      expect(record.error).toBeUndefined();
+    });
+  });
+
+  describe("under warn", () => {
+    it("stores the findings and the install goes on, with tools", async () => {
+      setup({ MCPE_SCAN: "warn" });
+      docker.repoFiles = { "package.json": pkg({}) };
+      scripted();
+      const record = ((await checked()) as { record: ProjectRecord }).record;
+      expect(record.status).toBe("ready");
+      expect(record.tools.length).toBeGreaterThan(0);
+      expect(record.scan!.build).toMatchObject({ decision: { mode: "warn", verdict: "build" } });
+      expect(record.scan!.build!.checks[0]!.counts.error).toBe(1);
+      expect(onDisk("widget")!.scan!.build!.checks[0]!.findings[0]!.message).toContain("gron");
+    });
+  });
+
+  describe("a build scanner that fails", () => {
+    it.each<[string, OneShotResult | Error]>([
+      ["exits non-zero", { code: 2, stdout: "", stderr: "boom", timedOut: false, truncated: false }],
+      ["times out", { code: 124, stdout: "", stderr: "", timedOut: true, truncated: false }],
+      ["throws", new Error("could not start")],
+    ])("when it %s, the check is failed, does not block, and the install goes on", async (_n, result) => {
+      scripted(result);
+      const record = ((await checked()) as { record: ProjectRecord }).record;
+      expect(record.status).toBe("ready");
+      expect(record.scan!.build!.checks[0]).toMatchObject({ name: "bld", status: "failed" });
+      expect(record.scan!.build!.decision.verdict).toBe("build");
+    });
+  });
+
+  describe("a throw out of the stage", () => {
+    it("reaches settleFailure: the record is failed, with no scan.build, so it is not held", async () => {
+      scripted();
+      docker.runScannerError = undefined;
+      // A refusal is not caught by runScanners' per-scanner handling.
+      docker.scannerResults.set("bld", refusal(part("volume", WIDGET, "another", OTHER)));
+      const out = await checked();
+      const record = (out as { record: ProjectRecord }).record;
+      expect(record.status).toBe("failed");
+      expect(record.scan!.build).toBeUndefined();
+      expect(() => installer.assertNotBlocked(record)).not.toThrow();
+    });
+  });
+
+  describe("blocked stays blocked", () => {
+    const blockedRecord = (build: unknown): ProjectRecord => ({
+      ...seedRecord("widget", "acme/widget"),
+      container: WIDGET,
+      volume: WIDGET,
+      status: "failed",
+      scan: {
+        commit: "c".repeat(40), checks: [], at: "2026-01-01T00:00:00.000Z",
+        decision: { mode: "block", blockAt: "error", verdict: "build", reason: "x" },
+        build: build as never,
+      },
+    });
+    const BLOCK = { checks: [], at: "2026-01-01T00:00:00.000Z", decision: { mode: "block", blockAt: "error", verdict: "block", reason: "1 finding" } };
+    const ops: Array<[string, (p: ProjectRecord) => Promise<unknown>]> = [
+      ["rediscover", (p) => installer.rediscover(p, [])],
+      ["refreshMcp", (p) => installer.refreshMcp(p)],
+      ["connectMcp", (p) => installer.connectMcp(p, { name: "srv", argv: ["srv"], cwd: "/workspace/repo", env: {}, origin: "registered" })],
+      ["disconnectMcp", (p) => installer.disconnectMcp(p, "srv")],
+    ];
+
+    it.each(ops)("%s on a blocked project throws, runs nothing and leaves it failed", async (_n, op) => {
+      const p = blockedRecord(BLOCK);
+      registry.put(p);
+      await expect(op(registry.get("widget")!)).rejects.toThrow(/widget was blocked by the check after the build.*install_project with reinstall: true.*operator/);
+      expect(docker.calls).toEqual([]);
+      expect(docker.trace).toEqual([]);
+      expect(onDisk("widget")!.status).toBe("failed");
+    });
+
+    it.each([
+      ["a string decision", { ...BLOCK, decision: "block" }],
+      ["no checks", { ...BLOCK, checks: undefined }],
+      ["an unknown verdict", { ...BLOCK, decision: { ...BLOCK.decision, verdict: "maybe" } }],
+      ["a non-object", "block"],
+      ["a null", null],
+    ])("a malformed stored build (%s) does not hold the project", async (_n, build) => {
+      const p = blockedRecord(build);
+      expect(() => installer.assertNotBlocked(p)).not.toThrow();
+      registry.put(p);
+      // It goes through to the sandbox (which this scripted double has).
+      await installer.rediscover(registry.get("widget")!, []);
+      expect(onDisk("widget")!.status).toBe("ready");
+    });
+
+    it("a build verdict does not hold it", () => {
+      expect(() => installer.assertNotBlocked(blockedRecord({ ...BLOCK, decision: { ...BLOCK.decision, verdict: "build" } }))).not.toThrow();
+    });
   });
 });

@@ -22,6 +22,8 @@ export interface ScannerSpec {
   hosts: string[];
   timeoutSec: number;
   env: string[];
+  /** When the scanner runs: "source" (the default, over the checkout before the build) or "build" (over the sandbox's volume after it). */
+  stage?: "source" | "build";
 }
 
 export interface Finding {
@@ -73,10 +75,41 @@ export interface ScanDecision {
   reason: string;
 }
 
+/** What the scanners that run after the build found, judged on their own. */
+export interface BuildReport {
+  checks: CheckOutcome[];
+  decision: ScanDecision;
+  /** ISO time. */
+  at: string;
+}
+
 export interface ScanReport {
   commit: string;
   checks: CheckOutcome[];
   decision: ScanDecision;
   /** ISO time. */
   at: string;
+  /** The check after the build; absent when it did not run (or the project was installed before it existed). */
+  build?: BuildReport;
+}
+
+/** The scanners that run at one stage; a scanner with no `stage` runs at the source stage. */
+export function scannersAt(scanners: readonly ScannerSpec[], stage: "source" | "build"): ScannerSpec[] {
+  return scanners.filter((s) => (s.stage ?? "source") === stage);
+}
+
+/**
+ * Read a stored `scan.build` safely: it is returned only when it is an object whose `checks` is an array and whose
+ * `decision.verdict` is "build" or "block". Anything else is treated as absent, so a malformed stored value never
+ * holds a project and never throws.
+ */
+export function buildReport(scan: ScanReport | undefined): BuildReport | undefined {
+  const b: unknown = scan?.build;
+  if (typeof b !== "object" || b === null) return undefined;
+  const { checks, decision } = b as { checks?: unknown; decision?: unknown };
+  if (!Array.isArray(checks)) return undefined;
+  if (typeof decision !== "object" || decision === null) return undefined;
+  const verdict = (decision as { verdict?: unknown }).verdict;
+  if (verdict !== "build" && verdict !== "block") return undefined;
+  return b as BuildReport;
 }

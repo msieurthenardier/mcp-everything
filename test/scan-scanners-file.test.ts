@@ -77,6 +77,11 @@ describe("parseScannersFile", () => {
     expect(parse({ scanners: [entry({ timeout_seconds: 1800 })] })[0]!.timeoutSec).toBe(1800);
     for (const e of ["A", [1], ["1A"], ["a-b"], [""], ["a".repeat(129)]]) bad({ scanners: [entry({ env: e })] }, /"env"/);
     bad({ scanners: [entry({ stage: "built" })] }, /"stage"/);
+    bad({ scanners: [entry({ stage: "built" })] }, /"stage" must be "source" or "build"/);
+    bad({ scanners: [entry({ stage: 1 })] }, /"stage" must be "source" or "build"/);
+    expect(parse({ scanners: [entry({ stage: "build" })] })[0]!.stage).toBe("build");
+    expect(parse({ scanners: [entry({ stage: "source" })] })[0]!.stage).toBe("source");
+    expect("stage" in parse({ scanners: [entry()] })[0]!).toBe(false);
   });
   it("refuses unknown fields, including prototype-ish keys, and non-object entries", () => {
     bad({ scanners: [entry({ extra: 1 })] }, /scanners\[0\] \(trivy\).*unknown field "extra"/);

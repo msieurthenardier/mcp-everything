@@ -4,6 +4,7 @@ import { record, TEST_INSTALLATION_ID } from "./helpers.js";
 import { CONTAINMENT_SOURCES, DOCKER_SOURCES, prototypeChainNames, readSources } from "./sources.js";
 import { Containment, proxyEnvironment } from "../src/network/containment.js";
 import { Registry } from "../src/registry.js";
+import { recipeFor } from "../src/install/recipes.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -395,6 +396,23 @@ describe("createContainer", () => {
     expect(pairs("-v")).toEqual(["v:/workspace"]);
     expect(pairs("-w")).toEqual(["/workspace/repo"]);
     expect(pairs("-e")).toEqual(expect.arrayContaining(["HOME=/root", "TERM=dumb"]));
+  });
+
+  it("sets GEM_HOME on the volume and orders PATH: bin, gems, venv, cargo, go, then the image's", async () => {
+    const a = await runArgs({});
+    const pairs = a.flatMap((x, i) => (x === "-e" ? [a[i + 1]!] : []));
+    expect(pairs).toContain("GEM_HOME=/opt/mcpe/gems");
+    const p = pairs.find((x) => x.startsWith("PATH="))!;
+    expect(p.startsWith("PATH=/opt/mcpe/bin:/opt/mcpe/gems/bin:/opt/mcpe/venv/bin:/root/.cargo/bin:/usr/local/go/bin:")).toBe(true);
+  });
+
+  it("the recipe prelude makes the output link before anything is written under /opt/mcpe", () => {
+    const script = recipeFor("go");
+    const at = ["set -e", "rm -rf", "[ -d", "ln -sfn", "mkdir -p /opt/mcpe/bin"].map((s) => script.indexOf(s));
+    expect(at.every((i) => i >= 0)).toBe(true);
+    expect([...at].sort((x, y) => x - y)).toEqual(at);
+    expect(script).toContain("rm -rf '/workspace/.mcpe'");
+    expect(script).toContain("ln -sfn '/workspace/.mcpe' '/opt/mcpe'");
   });
 
   it("passes the timeout and poll interval as decimal strings", async () => {
@@ -800,6 +818,7 @@ const CASES: Record<string, MethodCase> = {
   probe: { run: (d) => d.probe(REPO, V, {}), resource: "volume", acts: null },
   createContainer: { run: (d) => d.createContainer({ name: N, volume: V, image: "img", project: "p" }), resource: "volume", acts: null },
   // Leg 6. The staging volume is read through a read-only mount; the target of a copy is a sandbox volume (no role).
+  // This row is `runScanner` at the source stage (role staging); its build stage (role none) is covered in `describe("runScanner")`, "at the build stage".
   runScanner: { run: (d) => d.runScanner(STAGING, SCANNER, { timeoutMs: 20_000 }), resource: "volume", volumes: [{ name: STAGING, role: "staging" }], acts: null },
   copyVolume: { run: (d) => d.copyVolume(STAGING, TARGET), resource: "volume", volumes: [{ name: STAGING, role: "staging" }, { name: TARGET }], acts: null },
   createSandboxVolume: { run: (d) => d.createSandboxVolume(TARGET), resource: "volume", volumes: [{ name: TARGET }], acts: null },
@@ -1800,6 +1819,77 @@ describe("runScanner", () => {
     }
     expect(d.count("create")).toBe(0);
     expect(d.count("start")).toBe(0);
+  });
+
+  describe("at the build stage", () => {
+    const BUILD = { ...SCANNER, stage: "build" as const };
+    const sandbox = (d: ScriptedDocker, cls: SandboxClass = "mine", role: string | null = null) => d.putVolume(TARGET, cls, role ?? undefined);
+
+    it("runs over a sandbox volume (no role), read-only at /scan, in /scan", async () => {
+      const d = mk();
+      sandbox(d);
+      await d.runScanner(TARGET, BUILD, { timeoutMs: 20_000 });
+      const a = d.created[0]!.args;
+      expect(d.created[0]!.labels["mcp-everything.role"]).toBe("scan");
+      expect(a.slice(a.indexOf("--mount"), a.indexOf("--mount") + 2)).toEqual(["--mount", `type=volume,src=${TARGET},dst=/scan,readonly`]);
+      expect(a.filter((x) => x === "--mount")).toHaveLength(1);
+      expect(a.slice(a.indexOf("-w"), a.indexOf("-w") + 2)).toEqual(["-w", "/scan"]);
+      expect(a.slice(a.indexOf("--network"), a.indexOf("--network") + 2)).toEqual(["--network", "none"]);
+    });
+
+    it("a source spec (and one with stage \"source\") still runs in /scan/repo", async () => {
+      for (const spec of [SCANNER, { ...SCANNER, stage: "source" as const }]) {
+        const d = mk();
+        stage(d);
+        await d.runScanner(STAGING, spec, { timeoutMs: 20_000 });
+        const a = d.created[0]!.args;
+        expect(a.slice(a.indexOf("-w"), a.indexOf("-w") + 2)).toEqual(["-w", "/scan/repo"]);
+      }
+    });
+
+    it("refuses a build spec on a staging volume, and a source spec on a sandbox volume, before any container is created", async () => {
+      const a = mk();
+      stage(a);
+      const e1 = await settle(a.runScanner(STAGING, BUILD, { timeoutMs: 20_000 }));
+      expect((e1 as Error).message).toMatch(/not a sandbox volume/);
+      expect(a.count("create")).toBe(0);
+      const b = mk();
+      sandbox(b);
+      const e2 = await settle(b.runScanner(TARGET, SCANNER, { timeoutMs: 20_000 }));
+      expect((e2 as Error).message).toMatch(/not a staging volume/);
+      expect(b.count("create")).toBe(0);
+    });
+
+    it.each<[string, SandboxClass | "missing"]>([
+      ["another's", "another"],
+      ["not mcp-everything's", "not-ours"],
+      ["made before ownership", "before"],
+    ])("refuses a volume that is %s, with inspects only and no container", async (_n, cls) => {
+      for (const spec of [BUILD, SCANNER]) {
+        const d = mk();
+        d.strict = true;
+        d.putVolume(spec === BUILD ? TARGET : STAGING, cls as SandboxClass, spec === BUILD ? undefined : "staging");
+        const e = await settle(d.runScanner(spec === BUILD ? TARGET : STAGING, spec, { timeoutMs: 20_000 }));
+        expect(d.violations).toEqual([]);
+        expect(e).toBeInstanceOf(SandboxRefusedError);
+        expect((e as SandboxRefusedError).reason).toBe(cls);
+        expect(d.count("create")).toBe(0);
+        expect(d.count("start")).toBe(0);
+      }
+    });
+
+    it("refuses a volume that is missing", async () => {
+      const d = mk();
+      const e = await settle(d.runScanner(TARGET, BUILD, { timeoutMs: 20_000 }));
+      expect((e as Error).message).toMatch(/does not exist/);
+      expect(d.count("create")).toBe(0);
+    });
+
+    it("does not refuse a sandbox volume that is mine", async () => {
+      const d = mk();
+      sandbox(d);
+      expect(await settle(d.runScanner(TARGET, BUILD, { timeoutMs: 20_000 }))).toBeNull();
+    });
   });
 });
 

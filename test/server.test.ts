@@ -1029,6 +1029,36 @@ describe("host environment variables for proxied MCP servers", () => {
       });
     });
 
+    describe("a project blocked after the build", () => {
+      const BLOCKED = {
+        commit: "c".repeat(40), checks: [], at: "2026-01-01T00:00:00.000Z",
+        decision: { mode: "block" as const, blockAt: "error" as const, verdict: "build" as const, reason: "x" },
+        build: { checks: [], at: "2026-01-01T00:00:00.000Z", decision: { mode: "block" as const, blockAt: "error" as const, verdict: "block" as const, reason: "1 finding" } },
+      };
+      const blockedApp = async () => {
+        const a = appWith({});
+        seeded(a, "demo");
+        a.registry.put({ ...a.registry.get("demo")!, status: "failed", scan: BLOCKED });
+        return a;
+      };
+      it("refresh_mcp says it was blocked, not 'repair the build'", async () => {
+        const a = await blockedApp();
+        const before = state(a);
+        const res = await a.callTool("refresh_mcp", { project: "demo" });
+        expect(res.isError).toBe(true);
+        expect(body(res)).toMatch(/blocked after the build.*install_project\(reinstall: true\).*operator/);
+        expect(body(res)).not.toMatch(/Repair the build/);
+        expect(state(a)).toEqual(before);
+      });
+      it("discover_tools returns the installer's message as an error and the status stays failed", async () => {
+        const a = await blockedApp();
+        const res = await a.callTool("discover_tools", { project: "demo" });
+        expect(res.isError).toBe(true);
+        expect(body(res)).toMatch(/demo was blocked by the check after the build.*install_project with reinstall: true.*operator/);
+        expect(a.registry.get("demo")!.status).toBe("failed");
+      });
+    });
+
     it("fails before anything is stopped when a value is unusable, naming the variable and not the value", async () => {
       const env: Record<string, string> = { demo__API_KEY: SECRET_VALUE };
       const a = appWith(env);
@@ -1988,6 +2018,21 @@ describe("the checked install in the server", () => {
       expect(res.isError).toBe(true);
       expect(body(res)).toMatch(/The sandbox was kept\./);
     });
+    it("installed with status failed, blocked after the build: reinstall or change the policy, not repair", async () => {
+      make({ MCPE_SCAN: "block" });
+      stubChecked();
+      const blocked = {
+        ...record("demo"),
+        status: "failed" as const,
+        scan: { ...report(), build: { checks: [], at: "2026-01-01T00:00:00.000Z", decision: { mode: "block" as const, blockAt: "error" as const, verdict: "block" as const, reason: "1 finding" } } },
+      };
+      a.registry.put(blocked);
+      gate.finish({ kind: "installed", record: blocked });
+      const res = await a.callTool("install_project", { repo: "owner/demo" });
+      expect(res.isError).toBe(true);
+      expect(body(res)).toMatch(/Blocked after the build; reinstall, or ask the operator to change the policy\.$/);
+      expect(body(res)).not.toMatch(/sandbox_exec|discover_tools/);
+    });
     it("installed with status failed and no record: nothing installed", async () => {
       const res = await run({ kind: "installed", record: { ...record("ghost"), status: "failed" } });
       expect(res.isError).toBe(true);
@@ -2316,6 +2361,29 @@ describe("check_project", () => {
       expect(t).toContain("go install runs nothing from the repository");
       expect(t).toContain("Installs are not scanned at present; the operator turns scanning on with MCPE_SCAN.");
     });
+    it("names build-stage scanners as not run, and adds nothing without them", async () => {
+      const file = JSON.stringify({
+        scanners: [
+          { name: "trivy", image: "aquasec/trivy:0.1@sha256:abc", command: ["trivy", "fs", "."] },
+          { name: "yara", image: "yara:1@sha256:abc", command: ["yara", "."], stage: "build" },
+        ],
+      });
+      const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, MCPE_SCAN: "warn", MCPE_SCANNERS: "/s.json" }, () => file);
+      const fake = new FakeDocker(cfg);
+      app2 = new App({ cfg, docker: fake, proxy: new McpProxy(cfg, fake, up.connector) });
+      app2.registry.refresh();
+      const pending = new Promise<CheckOutcome>((r) => (finish = r));
+      (app2.installer as unknown as { check: unknown }).check = async () => pending;
+      const p = app2.callTool("check_project", { repo: "owner/demo" });
+      finish({ kind: "checked", report: rep("warn", "build", "findings: 1 warning") });
+      const t = body(await p);
+      expect(t).toContain("\nBuild-stage scanners (yara) run only after a build, so this check did not run them.\n");
+      expect(t).not.toContain("trivy)");
+      await app2.startup;
+      await app2.shutdown();
+      const plain = body(await check({ kind: "checked", report: rep("warn", "build", "findings: 1 warning") }));
+      expect(plain).not.toContain("Build-stage scanners");
+    });
     it("warn", async () => {
       const t = body(await check({ kind: "checked", report: rep("warn", "build", "findings: 1 warning") }));
       expect(t).toContain("An install would build and report these findings.");
@@ -2353,8 +2421,19 @@ describe("what the agent is told about security", () => {
   const SCANNERS = JSON.stringify({ scanners: [{ name: "trivy", image: "aquasec/trivy:0.1@sha256:abc", command: ["trivy", "fs", "."] }] });
   let a: App;
   let logs: string[];
-  const make = (env: Record<string, string>, withScanner = false) => {
-    const cfg = loadConfig({ HOME: dir, MCPE_DATA_DIR: dir, ...env, ...(withScanner ? { MCPE_SCANNERS: "/s.json" } : {}) }, () => SCANNERS);
+  const BUILD_SCANNERS = JSON.stringify({
+    scanners: [
+      { name: "trivy", image: "aquasec/trivy:0.1@sha256:abc", command: ["trivy", "fs", "."] },
+      { name: "yara", image: "yara:1@sha256:abc", command: ["yara", "-r", "/rules", "."], stage: "build" },
+    ],
+  });
+  const ONLY_BUILD = JSON.stringify({ scanners: [{ name: "yara", image: "yara:1@sha256:abc", command: ["yara", "."], stage: "build" }] });
+  /** `withScanner` true is the one source scanner; a string is a scanners file's text. */
+  const make = (env: Record<string, string>, withScanner: boolean | string = false) => {
+    const cfg = loadConfig(
+      { HOME: dir, MCPE_DATA_DIR: dir, ...env, ...(withScanner ? { MCPE_SCANNERS: "/s.json" } : {}) },
+      () => (typeof withScanner === "string" ? withScanner : SCANNERS),
+    );
     const fake = new FakeDocker(cfg);
     logs = [];
     a = new App({ cfg, docker: fake, proxy: new McpProxy(cfg, fake, up.connector), log: (l) => logs.push(l) });
@@ -2431,6 +2510,23 @@ describe("what the agent is told about security", () => {
         "tool-descriptions (built-in, generated tools when they are discovered), and the operator's scanners: trivy.",
       );
       expect(await instructionsOf(make({ MCPE_SCAN: "warn" }))).toContain("the operator has configured no scanners of their own");
+    });
+    it("name build-stage scanners separately, and read as before when there are none", async () => {
+      const both = await instructionsOf(make({ MCPE_SCAN: "warn" }, BUILD_SCANNERS));
+      expect(both).toContain("and the operator's scanners: trivy.");
+      expect(both).toContain("The operator's scanners that run on the build's output, after the build and before tools are published: yara.");
+      expect(both).not.toContain("must be reinstalled.");
+      const only = await instructionsOf(make({ MCPE_SCAN: "block" }, ONLY_BUILD));
+      expect(only).not.toContain("the operator has configured no scanners of their own");
+      expect(only).not.toContain("and the operator's scanners:");
+      expect(only).toContain("before tools are published: yara. A project they block is left failed and must be reinstalled.");
+      const none = await instructionsOf(make({ MCPE_SCAN: "warn" }, true));
+      expect(none).not.toContain("before tools are published");
+    });
+    it("say a project blocked after the build is reinstalled, not finished by hand", async () => {
+      expect(await instructionsOf(make({}))).toContain(
+        "then run discover_tools. A project blocked by the check after the build is not finished that way: reinstall it instead.",
+      );
     });
     it("name the runtime when one is set, and say that it is required", async () => {
       const t = await instructionsOf(make({ MCPE_DOCKER_RUNTIME: "runsc" }));
@@ -2543,6 +2639,56 @@ describe("what the agent is told about security", () => {
     it("says not scanned when the setting is on now but the install predates it", async () => {
       make({ MCPE_SCAN: "warn" });
       expect(lines(await info(record("demo")))).toContain("  security: not scanned at install; scanning is currently warn");
+    });
+    const withBuild = (p: ProjectRecord, build: unknown): ProjectRecord => ({ ...p, scan: { ...p.scan!, build: build as never } });
+    const aBuild = {
+      at: "2026-11-25T10:00:00.000Z",
+      decision: { mode: "warn", blockAt: "error", verdict: "build", reason: "1 finding below the level, from yara" },
+      checks: [
+        { name: "yara", kind: "scanner", status: "ran", counts: { error: 0, warning: 1, note: 2 }, findings: [{ check: "yara", ruleId: "yara/odd", level: "warning", message: "odd file", location: "/scan/.mcpe/bin/x" }], omitted: 0, notes: [] },
+      ],
+    };
+    it("adds the build stage's counts after the source's when the record has them", async () => {
+      make({ MCPE_SCAN: "warn" }, BUILD_SCANNERS);
+      const t = await info(withBuild(scanned("warn"), aBuild));
+      expect(lines(t)).toContain(
+        "  security: scanned at install (commit 0123456789ab, warn): 0 error, 2 warning, 5 note; after the build: 0 error, 1 warning, 2 note; scanning is currently warn",
+      );
+    });
+    it("says the build output was not checked when build scanners are configured now and the record has no build report", async () => {
+      make({ MCPE_SCAN: "warn" }, BUILD_SCANNERS);
+      expect(lines(await info(scanned("warn")))).toContain(
+        "  security: scanned at install (commit 0123456789ab, warn): 0 error, 2 warning, 5 note; build output not checked at install; scanning is currently warn",
+      );
+    });
+    it("treats a malformed build report as absent", async () => {
+      make({ MCPE_SCAN: "warn" }, BUILD_SCANNERS);
+      const t = await info(withBuild(scanned("warn"), { checks: "no", decision: { verdict: "block" } }));
+      expect(t).toContain("5 note; build output not checked at install; scanning is currently warn");
+      expect(t).not.toContain("after the build:");
+    });
+    it("treats a build report with an unknown verdict as absent", async () => {
+      make({ MCPE_SCAN: "warn" }, true);
+      const t = await info(withBuild(scanned("warn"), { ...aBuild, decision: { ...aBuild.decision, verdict: "maybe" } }));
+      expect(t).not.toContain("after the build");
+      expect(lines(t)).toContain("  security: scanned at install (commit 0123456789ab, warn): 0 error, 2 warning, 5 note; scanning is currently warn");
+    });
+    it("is as before with no build scanners configured and no build report", async () => {
+      make({ MCPE_SCAN: "warn" }, true);
+      const t = await info(scanned("warn"));
+      expect(t).toContain("5 note; scanning is currently warn");
+      expect(t).not.toContain("build output not checked");
+    });
+    it("shows the build stage's checks and reason in the verbose form, after the source stage's", async () => {
+      make({ MCPE_SCAN: "warn" }, BUILD_SCANNERS);
+      const verbose = await info(withBuild(scanned("warn"), aBuild));
+      const ls = lines(verbose);
+      const at = ls.indexOf("  after the build:");
+      expect(at).toBeGreaterThan(ls.findIndex((l) => l.includes("- gone: failed")));
+      expect(ls[at + 1]).toBe("  - yara: ran; 0 error, 1 warning, 2 note");
+      expect(ls[at + 2]).toBe("      [warning] yara/odd: odd file (/scan/.mcpe/bin/x)");
+      expect(ls[at + 3]).toBe("      1 finding below the level, from yara");
+      expect(await list(withBuild(scanned("warn"), aBuild))).not.toContain("after the build:\n");
     });
     it("lists the stored report's checks in the verbose form only", async () => {
       make({ MCPE_SCAN: "warn" });

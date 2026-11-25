@@ -236,6 +236,9 @@ describe.skipIf(!enabled)("docker integration", () => {
     const project = app.registry.get("gron")!;
     expect(project.container).toBe(`${prefix}${app.docker.installationId}-gron`);
     gron = project.container;
+    // Build output is on the volume, behind the /opt/mcpe link.
+    const onVolume = await app.docker.exec(gron, ["sh", "-c", "readlink /opt/mcpe; test -x /workspace/.mcpe/bin/gron && echo ok"], { timeoutSec: 30 });
+    expect(onVolume.stdout.trim().split("\n")).toEqual(["/workspace/.mcpe", "ok"]);
     expect(project.commit).toMatch(/^[0-9a-f]{40}$/);
     const tool = project.tools.find((t) => t.name === "gron__gron")!;
     expect(tool.options.map((o) => o.flag)).toContain("--ungron");
@@ -505,7 +508,7 @@ class FailsFirstBuild extends Docker {
   private builds = 0;
   override async exec(container: string, argv: string[], opts: ExecOptions): Promise<ExecResult> {
     if (argv[0] === "sh" && argv[2]?.includes("soft_fail()") && this.builds++ === 0) {
-      const debris = "touch /workspace/repo/DEBRIS && mkdir -p /opt/mcpe/bin && touch /opt/mcpe/bin/stale && chmod +x /opt/mcpe/bin/stale";
+      const debris = "touch /workspace/repo/DEBRIS && mkdir -p /workspace/.mcpe/bin && touch /workspace/.mcpe/bin/stale && chmod +x /workspace/.mcpe/bin/stale";
       await super.exec(container, ["sh", "-c", debris], { timeoutSec: 30 });
       return { code: 0, stdout: "MCPE_SOFT_FAIL\nMCPE_WARN simulated build failure\n", stderr: "", timedOut: false, truncated: false };
     }
@@ -533,12 +536,12 @@ describe.skipIf(!enabled)("docker integration: rebuilding on another image", () 
 
       const state = await docker.exec(
         record.container,
-        ["sh", "-c", "ls /opt/mcpe/bin; test -e /workspace/repo/DEBRIS && echo debris-left; git -C /workspace/repo status --porcelain | wc -l"],
+        ["sh", "-c", "ls /opt/mcpe/bin; readlink /opt/mcpe; test -e /workspace/repo/DEBRIS && echo debris-left; git -C /workspace/repo status --porcelain | wc -l"],
         { timeoutSec: 30 },
       );
       // Only the real build's output: no stale binary from the first container,
       // no debris in the checkout, and a clean working tree.
-      expect(state.stdout.trim().split("\n")).toEqual(["gron", "0"]);
+      expect(state.stdout.trim().split("\n")).toEqual(["gron", "/workspace/.mcpe", "0"]);
     } finally {
       for (const p of registry.list()) await installer.uninstall(p);
       fs.rmSync(dir, { recursive: true, force: true });
@@ -1636,6 +1639,151 @@ describe.skipIf(!enabled)("docker integration: the check tool", () => {
 });
 
 /**
+ * The check after the build (flight 05, leg 2). One scanner, marked `"stage": "build"`, lists `/scan/.mcpe/bin` (where the
+ * Go recipe's binary lands, on the sandbox's volume) and prints one `error` result naming what it found. It is the only
+ * scanner of this describe's own `scanners.json`: the scan-mode cases' file has a source-stage scanner, which would block
+ * before the build. Everything made carries this describe's own installation id and a name under the suite's prefix.
+ */
+describe.skipIf(!enabled)("docker integration: the check after the build", () => {
+  /** Set by `beforeAll` when every guard has passed, and by nothing else. */
+  let safe = false;
+  let dir = "";
+  let id = "";
+  const apps: App[] = [];
+  let blocking: App;
+  let warning: App;
+  const proceed = (): void => {
+    if (!safe) throw new Error("a guard failed in beforeAll: no Docker command is issued");
+  };
+  const SCRIPT = [
+    `entries=$(ls /scan/.mcpe/bin | tr '\\n' ' ')`,
+    `printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"bin-lister"}},"results":[{"level":"error","ruleId":"BIN1","message":{"text":"build output: %s"}}]}]}' "$entries"`,
+  ].join("; ");
+
+  /** An App on this describe's own directory, with a name prefix under the suite's, whatever the ambient environment says. */
+  function appOn(mode: "warn" | "block"): App {
+    if (!isUnderTmp(dir) || !dir.includes("mcpe-it-bst-")) throw new Error("not the directory this describe made");
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of ["MCPE_SCAN_BLOCK_AT", "MCPE_SCAN_TIMEOUT", "MCPE_SCANNERS"]) delete env[k];
+    Object.assign(env, {
+      MCPE_DATA_DIR: dir,
+      MCPE_NAME_PREFIX: `${prefix}bst-`,
+      MCPE_SCAN: mode,
+      ...(mode === "block" ? { MCPE_SCAN_BLOCK_AT: "error" } : {}),
+      MCPE_SCANNERS: path.join(dir, "scanners.json"),
+      MCPE_TOOL_TIMEOUT: "20",
+    });
+    const cfg = loadConfig(env);
+    expect(cfg.dataDir).toBe(dir);
+    expect(cfg.docker.namePrefix.startsWith(prefix)).toBe(true);
+    const made = new App({ cfg });
+    apps.push(made);
+    return made;
+  }
+
+  /** This installation's containers and volumes: name and role, by owner label. */
+  const objects = async () => {
+    const list = async (args: string[]) => (await run("docker", args, { timeoutMs: 60_000 })).stdout.split("\n").filter(Boolean);
+    return {
+      containers: await list(["ps", "-a", "--filter", `label=mcp-everything.owner=${id}`, "--format", '{{.Names}}\t{{.Label "mcp-everything.role"}}']),
+      volumes: await list(["volume", "ls", "--filter", `label=mcp-everything.owner=${id}`, "--format", '{{.Name}}\t{{.Label "mcp-everything.role"}}']),
+    };
+  };
+  const roleLabelled = async () => {
+    const o = await objects();
+    return [...o.containers, ...o.volumes].filter((l) => (l.split("\t")[1] ?? "") !== "");
+  };
+  const noRoleLeft = async (): Promise<string[]> => {
+    const until = Date.now() + 10_000;
+    let now = await roleLabelled();
+    while (now.length > 0 && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 500));
+      now = await roleLabelled();
+    }
+    return now;
+  };
+
+  beforeAll(() => {
+    assertNameCheckBehaves();
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-it-bst-"));
+    expect(isUnderTmp(dir)).toBe(true);
+    // Never the operator's default data directory or registry.
+    expect(dir).not.toBe(loadConfig({ ...process.env, MCPE_SCAN: "off", MCPE_SCANNERS: "" }).dataDir);
+    fs.writeFileSync(
+      path.join(dir, "scanners.json"),
+      JSON.stringify({ scanners: [{ name: "bin-lister", image: ALPINE, entrypoint: "sh", command: ["-c", SCRIPT], stage: "build", timeout_seconds: 60 }] }),
+    );
+    blocking = appOn("block");
+    warning = appOn("warn");
+    id = blocking.docker.installationId;
+    expect(id).toMatch(HEX8);
+    // Its own installation: the id came from this directory's file, and both Apps share it.
+    expect(fs.readFileSync(path.join(dir, "installation-id"), "utf8").trim()).toBe(id);
+    expect(warning.docker.installationId).toBe(id);
+    expect(blocking.registry.list()).toEqual([]);
+    console.log(`check after the build: installation ${id} (${dir})`);
+    safe = true;
+  }, 30_000);
+
+  afterAll(async () => {
+    try {
+      await Promise.allSettled(apps.map((a) => a.shutdown()));
+      if (safe) {
+        warning.registry.refresh();
+        for (const p of warning.registry.list()) await warning.installer.uninstall(p).catch(() => undefined);
+        // Anything left that carries this installation's label (names are under the suite's prefix, which the checked helpers insist on).
+        const left = await objects();
+        for (const l of left.containers) await removeContainerChecked(l.split("\t")[0]!, []);
+        for (const l of left.volumes) await removeVolumeChecked(l.split("\t")[0]!, []);
+        const after = await objects();
+        expect(after.containers, `containers of ${id}`).toEqual([]);
+        expect(after.volumes, `volumes of ${id}`).toEqual([]);
+      }
+    } finally {
+      if (isUnderTmp(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 300_000);
+
+  it("(a) under block a finding on the built output fails the install before discovery; (b) a reinstall under warn goes ready with the finding", async () => {
+    proceed();
+    const res = await blocking.callTool("install_project", { repo: "tomnomnom/gron" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/Blocked after the build; reinstall, or ask the operator to change the policy\./);
+    blocking.registry.refresh();
+    const rec = blocking.registry.get("gron")!;
+    expect(rec.status).toBe("failed");
+    expect(rec.scan!.build!.decision.verdict).toBe("block");
+    expect(rec.scan!.build!.checks[0]).toMatchObject({ name: "bin-lister", status: "ran", counts: { error: 1 } });
+    expect(rec.scan!.build!.checks[0]!.findings[0]!.message).toContain("gron");
+    expect(rec.error).toMatch(/blocked the install/);
+    expect(rec.tools).toEqual([]);
+    expect(await blocking.docker.networkState(rec.container)).toBe("off");
+    const again = await blocking.callTool("discover_tools", { project: "gron" });
+    expect(again.isError).toBe(true);
+    expect(text(again)).toMatch(/blocked by the check after the build/);
+    blocking.registry.refresh();
+    expect(blocking.registry.get("gron")!.status).toBe("failed");
+    expect(await noRoleLeft()).toEqual([]);
+
+    const warned = await warning.callTool("install_project", { repo: "tomnomnom/gron", reinstall: true });
+    expect(warned.isError).toBe(false);
+    warning.registry.refresh();
+    const ready = warning.registry.get("gron")!;
+    expect(ready.status).toBe("ready");
+    expect(ready.tools.some((t) => t.name === "gron__gron")).toBe(true);
+    expect(ready.scan!.build!.decision).toMatchObject({ mode: "warn", verdict: "build" });
+    expect(ready.scan!.build!.checks[0]!.findings[0]!.message).toContain("gron");
+    expect(await noRoleLeft()).toEqual([]);
+
+    // Teardown, as the scan-mode cases do: uninstall, and nothing of this installation is left.
+    const gone = await warning.callTool("uninstall_project", { project: "gron" });
+    expect(gone.isError).toBe(false);
+    expect(await noRoleLeft()).toEqual([]);
+    expect(await objects()).toEqual({ containers: [], volumes: [] });
+  }, 1_800_000);
+});
+
+/**
  * Contained networks and the one-shot proxy (flight 02, leg 5). Every object these cases make carries the describe's
  * own installation id as its owner label (random, so none is an operator's) and a name under the suite's prefix
  * `mcpe-it-<pid>-`. Every removal goes through `removeContainerChecked`, `removeNetworkChecked` or
@@ -2549,6 +2697,8 @@ describe.skipIf(!enabled)("docker integration: the contained install (leg 8)", (
       expect(record.tools.map((t) => t.name)).toContain("gron__gron");
       expect(refusalWarnings(record.warnings)).toEqual([]);
       expect(buildWarnings(log)).toEqual([]);
+      const onVolume = await docker.exec(record.container, ["sh", "-c", "readlink /opt/mcpe; test -x /workspace/.mcpe/bin/gron && echo ok"], { timeoutSec: 30 });
+      expect(onVolume.stdout.trim().split("\n")).toEqual(["/workspace/.mcpe", "ok"]);
       // T15: on bridge (open) right after create, contained right before its first start.
       expect(docker.stateAfterCreate).toEqual(["open"]);
       expect(docker.stateBeforeStart).toEqual(["contained"]);

@@ -8,6 +8,10 @@ export const WORK_DIR = "/workspace/work";
 export const PREFIX = "/opt/mcpe";
 export const BIN_DIR = "/opt/mcpe/bin";
 export const VENV_DIR = "/opt/mcpe/venv";
+/** Where build output really lives: on the sandbox's volume; PREFIX is a symlink to it. */
+export const OUTPUT_DIR = `${WORKSPACE}/.mcpe`;
+/** Ruby's GEM_HOME, under PREFIX and so on the volume. */
+export const GEM_DIR = `${PREFIX}/gems`;
 
 export const DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 

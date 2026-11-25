@@ -26,6 +26,19 @@ or remove a scanner, or change the policy.
 4. If the build goes ahead, the checked staging volume is copied into the
    project's new volume and the build runs on that copy: the build runs on
    exactly the bytes that were checked, not on a second clone.
+5. After a build that exited 0, and before the network policy is applied and
+   tools are discovered, the operator's scanners that have `"stage": "build"`
+   run over the sandbox's volume (see [Adding a scanner](#adding-a-scanner)).
+   This step runs only when at least one scanner has that stage. The policy
+   judges their findings on their own. Under `block`, findings at or above the
+   threshold leave the project `failed` and offline with no tools, and
+   `discover_tools`, `refresh_mcp`, `connect_mcp_server` and
+   `disconnect_mcp_server` refuse it until it is reinstalled. Under `warn` the
+   findings are reported and the install goes on. The report is stored with the
+   project and shown after the source stage's under `after the build:`, in the
+   install result and in `project_info`. It is a snapshot from install:
+   `discover_tools`, `refresh_mcp` and `sandbox_exec` do not refresh it, only
+   a reinstall does.
 
 A **reinstall** (`reinstall: true`, or an install of a project that exists but
 is not ready) is checked
@@ -33,16 +46,22 @@ before anything of it is touched: its sandbox, volume, record and tools stay
 as they were until the check passes. A blocked reinstall changes one thing in
 the existing record, a warning saying that a reinstall at that commit was
 blocked on that (UTC) date. If the check cannot be made (for example the clone
-fails), the existing project is left as it was. `install_project` on a
+fails), the existing project is left as it was. This holds for the check
+before the build only: the check after the build cannot keep the previous
+version, because the reinstall has replaced it by then. A reinstall blocked
+there leaves the project `failed`, and the result and the record's error say
+that the previous version was replaced before the build and is not restored. `install_project` on a
 repository that is already installed and ready, without `reinstall`, returns
 the existing project and checks nothing.
 
 **`check_project`** clones and checks a repository at any time, whatever
 `MCPE_SCAN` says, without installing it: nothing is built, no installed
 project is changed, and the staging volume is removed afterwards. It runs the
-built-in check and every configured scanner, and says what an install would
-do under the current setting (blocked, built with the findings reported, not
-blocked, or that scanning is off).
+built-in check and every configured scanner that runs at the source stage, and
+says what an install would do under the current setting (blocked, built with
+the findings reported, not blocked, or that scanning is off). Nothing is built,
+so scanners with `"stage": "build"` are not run; when any are configured, the
+result names them and says so.
 
 What the agent sees: the report lists each check with its status (`ran`,
 `incomplete`, `failed` or `not-run`), its counts per level, up to 20 findings
@@ -126,8 +145,12 @@ that GitHub or OSV could not answer.
   `env` to none. `hosts` (1 to 64 strings) names what a scanner with `network:
   true` may reach under `MCPE_NETWORK=contained`; see
   [Scanners' hosts](containment.md#scanners-hosts). At most 16 scanners. Any other key is
-  refused at startup (`stage` is accepted with the value `"source"` and has no
-  effect today).
+  refused at startup.
+- `stage` (optional) is `"source"` (the default) or `"build"`. A `"source"`
+  scanner runs over the clone before the build, as described below. A
+  `"build"` scanner runs after the build, over what the build produced (see
+  the end of this list). Each entry runs at one stage, so a scanner wanted at
+  both is listed twice, under two names.
 - **Pin the image by digest**, as the example does, and bump the digest
   yourself when you choose a newer version: a tag can be moved. mcp-everything
   pins the images it chooses itself (`MCPE_PROBE_IMAGE`) the same way.
@@ -191,6 +214,15 @@ that GitHub or OSV could not answer.
   its output is not complete SARIF) is reported as `failed` with a short
   reason and **never blocks**. The clone itself has its own 600-second limit
   before the budget starts.
+- **A `"build"` scanner** sees the sandbox's volume **read-only** at `/scan`,
+  with working directory `/scan`, not the staging volume. The build's output
+  is at `/scan/.mcpe` (the executables are in `/scan/.mcpe/bin`), Rust's and
+  CMake's build trees are at `/scan/target` and `/scan/build`, the checkout is
+  at `/scan/repo`, and the agent's scratch space is at `/scan/work`. Its
+  network, `hosts`, `env`, redaction and SARIF output are as for any scanner.
+  Build-stage scanners have their own `MCPE_SCAN_TIMEOUT` budget, separate
+  from the source stage's, so an install can spend up to twice that on
+  scanners.
 
 ## The built-in check
 
@@ -409,6 +441,38 @@ steer the agent. It runs in mcp-everything's own process and does no I/O.
   covers the clone image, the sandbox images and your scanners' images.
 - **A scanner you configure is trusted code** that reads the repository's
   files, and a credential you give it is available to it.
+- **A process the build left running** can change files after the check after
+  the build, and so can anything that runs later.
+- **Building by hand, then `discover_tools`.** What the agent builds itself
+  with `sandbox_exec` is not checked again; a project blocked after its build
+  is refused by `discover_tools` until it is reinstalled, but one that was never
+  blocked is not looked at again.
+- **Go's module cache and Cargo's registry** are seen only through the binaries
+  built from them.
+- **An image with its own `/opt/mcpe`** keeps the build's output off the
+  volume, so the check after the build does not see it.
+- **Older sandboxes** are checked after the build only once reinstalled.
+- **A block after the build on a reinstall** leaves no working sandbox: the
+  previous version is gone.
+- **The build network during the scan.** While build-stage scanners run, the
+  sandbox is still on its build network (or its build allowlist under
+  containment), so a process the build left running keeps that reach for up to
+  `MCPE_SCAN_TIMEOUT`.
+- **Files hidden by mode 000.** A scanner runs with all capabilities dropped,
+  so a file the build made unreadable is hidden from it, and a scanner that
+  fails for that reason never blocks.
+- **Code installed outside the volume** is not seen: `npm install -g` of pnpm
+  or yarn, and system packages from `apt-get` (the CMake and autotools
+  recipes' needs).
+- **Absolute symlinks that dangle.** Absolute symlinks under `/scan/.mcpe`
+  (the executables `link_elves` makes, Ruby's executables, the venv's
+  `python`) dangle inside the scanner. Their targets are on the volume under
+  `/scan/repo` or `/scan/build`, or in the image.
+
+**Upgrading.** Projects installed before the check after the build existed
+keep working. Their build output was never checked. Once build-stage scanners
+are configured, `project_info` says "build output not checked at install" for
+them; reinstalling checks it.
 
 Stronger isolation of the containers (including the clone and the scanners) is
 available by setting `MCPE_DOCKER_RUNTIME` (for example `runsc`), which also
