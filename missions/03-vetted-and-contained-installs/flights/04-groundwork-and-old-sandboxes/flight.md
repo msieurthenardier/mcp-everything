@@ -1,6 +1,6 @@
 # Flight: Groundwork, and Leaving Old Sandboxes Alone
 
-**Status**: landed
+**Status**: completed
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-23.** The mission's tentative flight 4 had three separate sets of design decisions:

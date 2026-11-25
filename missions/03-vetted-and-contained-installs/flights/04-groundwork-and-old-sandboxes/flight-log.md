@@ -3,7 +3,10 @@
 **Flight**: [Groundwork, and Leaving Old Sandboxes Alone](flight.md)
 
 ## Summary
-Planned 2026-11-23 with the operator; approved the same day. Not yet started.
+Planned 2026-11-23 with the operator and approved the same day. Executed 2026-11-23 and 2026-11-24.
+- **Legs 1–4:** committed as `5938d47`.
+- **HAT and wording fix:** committed as `a5d7ec4`.
+- **PR:** #33. Debriefed 2026-11-24 ([flight-debrief.md](flight-debrief.md)).
 
 **Baseline** (2026-11-23, `72a0420`): two consecutive runs of `npx vitest run` each gave 2988 passed, 71 skipped, 0 failed, in 18.3 s and 17.4 s. The Docker suite baseline is to be run before leg 3.
 
@@ -188,6 +191,7 @@ Integration (not edited or run): `test/integration/docker.test.ts:464` asserts t
   - **Why it is not this suite:** the name `afp` appears nowhere in `src/` or `test/`. The suite has no `prune`; every `docker rm` and `volume rm` names an exact object it created or classified as this installation's. The one sweep, `sweepCheckLeftovers`, filters on this installation's owner label.
   - **What the daemon's events show:** for the last 3 h (253 events), no `afp` event at all, not even their creation. The objects' create and destroy events were not among them, so the daemon cannot show who removed them.
   - **Conclusion:** most likely another tool on this machine made them and removed them itself, as transient probe objects. Reported to the operator. No action taken.
+  - **Closed 2026-11-24 at the debrief:** the operator confirms they belong to another of their tools.
 
 ---
 
@@ -310,3 +314,8 @@ Integration (not edited or run): `test/integration/docker.test.ts:464` asserts t
 - 2026-11-24, flight landed:
   - **Status:** leg 5 is `completed` and the flight is `landed`. It is checked off in `mission.md`, as are its criteria and checkpoints. "Code merged" stays open until PR #33 merges.
   - **Docs check:** no new command, tool or configuration. The refusal message is not quoted in the README or `docs/`.
+- 2026-11-24, debrief: [flight-debrief.md](flight-debrief.md).
+  - **Crew:** Developer and Architect interviews, both Sonnet.
+  - **Operator:** the `afp` anomaly is closed, and the shell-write rule stays restated (no hook).
+  - **Squawks logged:** 0061 (`project_info` network line for an old sandbox) and 0062 (CI floor).
+  - **Status:** the flight is `completed`.
