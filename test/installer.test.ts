@@ -825,6 +825,16 @@ describe("install failure paths", () => {
       expect(registry.get("widget")).toMatchObject({ status: "failed", network: false });
     });
 
+    it("settleFailure takes the sandbox offline before it writes the record: the file says network off", async () => {
+      docker.repoFiles = { "package.json": pkg({}) };
+      (installer as unknown as { discover: () => Promise<void> }).discover = async () => {
+        throw new Error("discovery lost the daemon");
+      };
+      await install({ network: true });
+      // Read from the file, not the registry: `put` stores the object by reference, so the registry sees a later change either way.
+      expect(onDisk("widget")).toMatchObject({ status: "failed", network: false });
+    });
+
     describe("a throw after discovery opened proxy sessions", () => {
       const spec = { name: "tool", argv: ["tool"], cwd: "/workspace/repo", env: {}, origin: "detected" as const };
       const openThenThrow = () => {
@@ -3325,16 +3335,41 @@ describe("the check after the build", () => {
   });
 
   describe("a throw out of the stage", () => {
-    it("reaches settleFailure: the record is failed, with no scan.build, so it is not held", async () => {
+    // A refusal is not caught by runScanners' per-scanner handling, so it rises out of the stage.
+    const throwing = () => {
       scripted();
       docker.runScannerError = undefined;
-      // A refusal is not caught by runScanners' per-scanner handling.
       docker.scannerResults.set("bld", refusal(part("volume", WIDGET, "another", OTHER)));
+    };
+
+    it("under block holds the project: failed, with a stored block, and rediscover refused", async () => {
+      throwing();
       const out = await checked();
       const record = (out as { record: ProjectRecord }).record;
       expect(record.status).toBe("failed");
-      expect(record.scan!.build).toBeUndefined();
-      expect(() => installer.assertNotBlocked(record)).not.toThrow();
+      expect(record.error).toMatch(/The check after the build blocked the install: the check after the build could not run/);
+      expect(record.network).toBe(false);
+      expect(record.scan!.build!.checks).toHaveLength(1);
+      expect(record.scan!.build!.checks[0]).toMatchObject({ name: "after-build", status: "failed" });
+      expect(record.scan!.build!.checks[0]!.error!.length).toBeGreaterThan(0);
+      expect(record.scan!.build!.decision).toMatchObject({ mode: "block", verdict: "block" });
+      expect(() => installer.assertNotBlocked(record)).toThrow(/blocked by the check after the build/);
+      const stored = onDisk("widget")!;
+      expect(stored.status).toBe("failed");
+      expect(stored.network).toBe(false);
+      await expect(installer.rediscover(registry.get("widget")!, [])).rejects.toThrow(/blocked by the check after the build/);
+    });
+
+    it("under warn is reported and the install goes on", async () => {
+      setup({ MCPE_SCAN: "warn" });
+      docker.repoFiles = { "package.json": pkg({}) };
+      throwing();
+      const out = await checked();
+      const record = (out as { record: ProjectRecord }).record;
+      expect(record.status).toBe("ready");
+      expect(record.scan!.build!.checks[0]).toMatchObject({ name: "after-build", status: "failed" });
+      expect(record.scan!.build!.decision).toMatchObject({ mode: "warn", verdict: "build" });
+      expect(onDisk("widget")!.scan!.build!.checks[0]).toMatchObject({ name: "after-build", status: "failed" });
     });
   });
 

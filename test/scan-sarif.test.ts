@@ -254,14 +254,20 @@ describe("parseSarif: bounds", () => {
       ok(small);
       smallBest = Math.min(smallBest, performance.now() - s0);
     }
-    const t0 = performance.now();
-    const r = ok(text);
-    const full = performance.now() - t0;
+    // The full parse is also best of 2, so one pause (GC, a load spike) does not fail the test.
+    let full = Infinity;
+    let r!: ReturnType<typeof ok>;
+    for (let i = 0; i < 2; i++) {
+      const t0 = performance.now();
+      r = ok(text);
+      full = Math.min(full, performance.now() - t0);
+    }
     expect(full).toBeLessThan(40 * Math.max(smallBest, 5));
     expect(r.counts.warning).toBe(2_800_001);
     expect(r.findings).toHaveLength(20);
     expect(r.omitted).toBe(2_800_001 - 20);
-  });
+    // Five parses plus building the text: the default 5 s limit is too tight under parallel load. The ratio above is the assertion.
+  }, 30_000);
   it("looks rules up through a map, not a scan per result", () => {
     const rules = Array.from({ length: 20_000 }, (_, i) => ({ id: `r${i}`, defaultConfiguration: { level: "note" } }));
     const results = Array.from({ length: 20_000 }, (_, i) => ({ ruleId: `r${19_999 - i}` }));

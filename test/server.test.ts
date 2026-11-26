@@ -1814,6 +1814,17 @@ describe("refusal outcomes: uninstall_project and project_info", () => {
       expect(docker.calls).toEqual([]);
     });
 
+    it("network line: a sandbox made before ownership says it was not inspected and why; another error still says unknown", async () => {
+      docker.networkStateError = refused(part("container", "mcpe-demo", "before"));
+      const before = body(await app.callTool("project_info", { project: "demo" }));
+      expect(before).toContain("network: not inspected (made before ownership was recorded; see the owner line)");
+      expect(before).not.toContain("network: unknown");
+      docker.networkStateError = new Error("docker blew up");
+      const other = body(await app.callTool("project_info", { project: "demo" }));
+      expect(other).toContain("network: unknown");
+      expect(other).not.toContain("not inspected");
+    });
+
     it("flattens and cuts another installation's owner label", async () => {
       docker.ownershipResult = { state: "another", owner: `a\nb${"y".repeat(300)}` };
       const out = line(body(await app.callTool("project_info", { project: "demo" })));

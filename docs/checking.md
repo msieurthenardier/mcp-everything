@@ -114,7 +114,12 @@ that were not looked up (ranges) or has more advisories than were read.
 Only checks that ran or came out incomplete count; a check that
 failed or did not run is reported and never counts, so a scanner that fails
 or times out never blocks an install, and neither does a dependency check
-that GitHub or OSV could not answer.
+that GitHub or OSV could not answer. The exception is the check after the
+build as a whole: if it cannot run at all (for example, Docker does not answer
+while the volume is read), it is reported as one failed check named
+`after-build`, and under `block` that blocks the install, which is held like any
+other block after the build; under `warn` the install goes on with the failure
+reported.
 
 ## Adding a scanner
 
