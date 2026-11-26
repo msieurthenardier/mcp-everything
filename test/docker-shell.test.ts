@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { outputStep } from "../src/install/recipes.js";
 import { MANIFESTS, parseProbeOutput, PROBE_SCRIPT, WALK_SCRIPT, WALK_SEPARATOR, walkArguments } from "../src/sandbox/scripts.js";
 
 // The slow cases of the Docker layer's tests: the walk and the probe script run in the host's own shell, over real scratch
@@ -207,6 +208,70 @@ describe("the walk script, in a local shell", () => {
       put(dir, "README", "x");
       expect(exec(dir)).toBe("");
     });
+  });
+});
+
+/** The prelude's output step, rendered over scratch paths and run in the host's own sh. */
+describe("the recipe prelude's output step, in a local shell", () => {
+  const hasSh = fs.existsSync("/bin/sh");
+  const withRoot = (fn: (o: { root: string; output: string; prefix: string; run: () => string }) => void) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "mcpe-out-"));
+    const output = path.join(root, "ws", ".mcpe");
+    const prefix = path.join(root, "opt", "mcpe");
+    fs.mkdirSync(output, { recursive: true });
+    fs.writeFileSync(path.join(output, "stale"), "old");
+    const run = () => execFileSync("/bin/sh", ["-ec", outputStep({ output, prefix })], { encoding: "utf8" });
+    try {
+      fn({ root, output, prefix, run });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
+  const it2 = (name: string, fn: Parameters<typeof withRoot>[0]) => it.skipIf(!hasSh)(name, { timeout: 60_000 }, () => withRoot(fn));
+  const clean = (output: string) => expect(fs.readdirSync(output)).toEqual([]);
+
+  it2("makes the prefix a symlink to the output directory and clears it when there is no prefix", ({ output, prefix, run }) => {
+    expect(run()).toBe("");
+    expect(fs.readlinkSync(prefix)).toBe(output);
+    clean(output);
+  });
+
+  it2("replaces a dangling symlink", ({ root, output, prefix, run }) => {
+    fs.mkdirSync(path.dirname(prefix), { recursive: true });
+    fs.symlinkSync(path.join(root, "nowhere"), prefix);
+    run();
+    expect(fs.readlinkSync(prefix)).toBe(output);
+    clean(output);
+  });
+
+  it2("replaces a symlink to another directory, without writing into it", ({ root, output, prefix, run }) => {
+    const other = path.join(root, "other");
+    fs.mkdirSync(other);
+    fs.mkdirSync(path.dirname(prefix), { recursive: true });
+    fs.symlinkSync(other, prefix);
+    run();
+    expect(fs.readlinkSync(prefix)).toBe(output);
+    expect(fs.readdirSync(other)).toEqual([]);
+    clean(output);
+  });
+
+  it2("replaces a regular file", ({ output, prefix, run }) => {
+    fs.mkdirSync(path.dirname(prefix), { recursive: true });
+    fs.writeFileSync(prefix, "file");
+    run();
+    expect(fs.readlinkSync(prefix)).toBe(output);
+    clean(output);
+  });
+
+  it2("leaves a real directory as it is, warns once, and still clears the output directory", ({ output, prefix, run }) => {
+    fs.mkdirSync(path.join(prefix, "bin"), { recursive: true });
+    fs.writeFileSync(path.join(prefix, "bin", "tool"), "t");
+    const out = run();
+    expect(out.split("\n").filter((l) => l.startsWith("MCPE_WARN "))).toHaveLength(1);
+    expect(fs.lstatSync(prefix).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(path.join(prefix, "bin", "tool"), "utf8")).toBe("t");
+    expect(fs.statSync(output).isDirectory()).toBe(true);
+    clean(output);
   });
 });
 

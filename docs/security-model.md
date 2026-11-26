@@ -142,9 +142,12 @@ because Docker refuses an unregistered runtime and does not fall back.
 - **Register `runsc` with `--overlay2=none`:** `sudo runsc install --
   --overlay2=none`, then restart Docker. gVisor's default root-filesystem
   overlay (`--overlay2=root:self`) discards writes outside volumes when a
-  container exits, and a sandbox's build output (`/opt/mcpe`, `/root/.cargo`,
-  `/usr/local/go`) lives in the container's layer, so an idle-stopped sandbox
-  would lose its built tools. When the named runtime is `runsc` and Docker's
+  container exits. A new sandbox keeps its build output on its volume
+  (`/workspace/.mcpe`, which `/opt/mcpe` links to), so the output survives. The
+  `/opt/mcpe` link itself, `/root/.cargo`, `/usr/local/go` and system packages
+  are in the container's layer, so an idle-stopped sandbox would lose its link
+  and toolchain, and its built tools would not be found. Sandboxes created
+  before that change keep their output in the layer too. When the named runtime is `runsc` and Docker's
   registration of it does not carry `--overlay2=none`, mcp-everything logs one
   warning when it checks the runtime; it does not refuse, because the
   registration is yours.

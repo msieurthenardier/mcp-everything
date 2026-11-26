@@ -22,6 +22,7 @@ import {
 } from "./ownership.js";
 import {
   BIN_DIR,
+  GEM_DIR,
   isStoppedExecFailure,
   MANIFESTS,
   parseProbeOutput,
@@ -161,13 +162,18 @@ export class Docker extends DockerNetwork {
   }
 
   /**
-   * Run one operator scanner over a staging volume. The volume must be this installation's staging volume
-   * (checked before any container exists). The image's own entrypoint runs with `spec.command` as its arguments (or `spec.entrypoint` replaces it; "" clears it), no
-   * network unless the scanner is configured to have one, the checkout mounted read-only at /scan and the working
-   * directory /scan/repo (a checkout with no `repo` directory makes `start` fail: the caller reports it as a failed run).
+   * Run one operator scanner over a volume, by its stage. A source scanner (the default) needs this installation's
+   * staging volume and runs in /scan/repo (a checkout with no `repo` directory makes `start` fail: the caller reports
+   * it as a failed run). A build scanner (`spec.stage === "build"`) needs a sandbox volume of this installation (no
+   * role; the gate admits any such volume, the caller passes the record's own) and runs in /scan, where the build's
+   * output (/scan/.mcpe) sits beside the checkout. The volume is checked before any container exists, so a volume of
+   * the wrong role for the stage, or not ours, is refused. The image's own entrypoint runs with `spec.command` as its
+   * arguments (or `spec.entrypoint` replaces it; "" clears it), no network unless the scanner is configured to have
+   * one, and the volume mounted read-only at /scan.
    */
   async runScanner(volume: string, spec: ScannerSpec, opts: { timeoutMs: number; envFile?: string }): Promise<OneShotResult> {
-    await this.requireVolumes([{ name: volume, role: "staging" }]);
+    const build = spec.stage === "build";
+    await this.requireVolumes([{ name: volume, role: build ? "none" : "staging" }]);
     // Under containment a scanner with a network reaches its own `hosts` and nothing else, local addresses included (DD12);
     // leg 1 refuses a networked scanner without `hosts` at startup.
     const egress =
@@ -179,7 +185,7 @@ export class Docker extends DockerNetwork {
       image: spec.image,
       ...(egress ? { egress } : { network: spec.network ? "bridge" : "none" }),
       mountFlags: [`type=volume,src=${volume},dst=/scan,readonly`],
-      workdir: "/scan/repo",
+      workdir: build ? "/scan" : "/scan/repo",
       envFile: opts.envFile,
       // Straight through: "" must reach `--entrypoint ""` (clears the image's entrypoint), so never `||`.
       entrypoint: spec.entrypoint,
@@ -391,9 +397,10 @@ export class Docker extends DockerNetwork {
     this.refuseUnless([this.volumeFacts(opts.volume, vol.labels)]);
     await this.ensureImage(opts.image);
     const basePath = await this.imagePath(opts.image);
-    const path = [BIN_DIR, `${VENV_DIR}/bin`, "/root/.cargo/bin", "/usr/local/go/bin", basePath].join(":");
+    const path = [BIN_DIR, `${GEM_DIR}/bin`, `${VENV_DIR}/bin`, "/root/.cargo/bin", "/usr/local/go/bin", basePath].join(":");
     const env: Record<string, string> = {
       PATH: path,
+      GEM_HOME: GEM_DIR,
       HOME: "/root",
       TERM: "dumb",
       NO_COLOR: "1",

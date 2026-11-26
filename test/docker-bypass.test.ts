@@ -92,7 +92,7 @@ const NOT_A_START_OR_EXEC: Record<string, string> = {
   readResolvers: "a one-shot",
   invalidateResolvers: "forgets a value",
   probe: "a one-shot clone",
-  runScanner: "a one-shot scanner",
+  runScanner: "a one-shot scanner, over a staging volume (source stage) or a sandbox volume (build stage); both gated by requireVolumes",
   copyVolume: "a one-shot copy",
   hooked: "calls the hook with facts it was given",
   hookCached: "reads a cache",

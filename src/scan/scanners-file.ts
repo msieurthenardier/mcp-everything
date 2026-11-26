@@ -103,7 +103,9 @@ export function parseScannersFile(text: string, source: string): ScannerSpec[] {
     }
 
     const stage = get("stage");
-    if (stage !== undefined && stage !== "source") throw new ConfigError(`${where}: "stage" may only be "source"`);
+    if (stage !== undefined && stage !== "source" && stage !== "build") {
+      throw new ConfigError(`${where}: "stage" must be "source" or "build"`);
+    }
 
     return {
       name,
@@ -114,6 +116,7 @@ export function parseScannersFile(text: string, source: string): ScannerSpec[] {
       hosts,
       timeoutSec: timeout ?? 300,
       env: (env as string[] | undefined) ?? [],
+      ...(stage !== undefined ? { stage } : {}),
     };
   });
 }

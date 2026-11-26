@@ -342,12 +342,15 @@ Scanning is off by default. When the operator turns it on, `install_project`
 clones the repository into a staging volume and runs the built-in check and the
 operator's own scanners over the clone before anything is built. Under `block`,
 findings at or above the threshold end the install; otherwise they are reported
-and the build goes ahead. `check_project` clones and checks a repository without
-installing it, whatever the scanning setting.
+and the build goes ahead. Scanners the operator marks `"stage": "build"` run
+again after the build, over what it produced, before tools are published.
+`check_project` clones and checks a repository without installing it, whatever
+the scanning setting.
 
-The chapter covers how to turn scanning on, how to add a scanner, the built-in
-check, the dependency check, the tool-description check, and what none of this
-protects against.
+The chapter covers how to turn scanning on, how to add a scanner (at the source
+or the build stage), the check after the build, the built-in check, the
+dependency check, the tool-description check, and what none of this protects
+against.
 
 Full chapter: [docs/checking.md](docs/checking.md)
 

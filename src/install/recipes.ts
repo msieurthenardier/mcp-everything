@@ -1,4 +1,5 @@
-import { BIN_DIR, PREFIX, REPO_DIR, VENV_DIR, WORK_DIR, WORKSPACE } from "../sandbox/scripts.js";
+import path from "node:path";
+import { BIN_DIR, OUTPUT_DIR, PREFIX, REPO_DIR, VENV_DIR, WORK_DIR, WORKSPACE } from "../sandbox/scripts.js";
 import type { Ecosystem } from "../types.js";
 
 /**
@@ -6,13 +7,33 @@ import type { Ecosystem } from "../types.js";
  * nothing from the repository is ever interpolated into them. Their contract:
  *
  *   - leave runnable executables in /opt/mcpe/bin (or, for Python, console
- *     scripts in the /opt/mcpe/venv virtualenv), and
+ *     scripts in the /opt/mcpe/venv virtualenv). /opt/mcpe is a symlink to
+ *     /workspace/.mcpe, so the output is on the sandbox's volume, and
  *   - print `MCPE_WARN <message>` for non-fatal problems, and
  *   - print `MCPE_SOFT_FAIL` when a core build step failed without aborting.
  */
 
+const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/**
+ * The prelude's output step: clear the volume's output directory (every attempt, so a retry never sees the last one's
+ * output), then make `prefix` a symlink to it, unless the image has a real directory there: that is warned about and left.
+ * Only constants are interpolated, never anything from the repository.
+ */
+export function outputStep({ output, prefix }: { output: string; prefix: string }): string {
+  const parent = path.posix.dirname(prefix);
+  return `rm -rf ${q(output)}
+mkdir -p ${q(output)} ${q(parent)}
+if [ -d ${q(prefix)} ] && [ ! -L ${q(prefix)} ]; then
+  echo "MCPE_WARN the image has its own ${prefix}; the build output is not on the sandbox's volume"
+else
+  ln -sfn ${q(output)} ${q(prefix)}
+fi`;
+}
+
 const PRELUDE = `
 set -e
+${outputStep({ output: OUTPUT_DIR, prefix: PREFIX })}
 mkdir -p ${BIN_DIR} ${WORK_DIR}
 cd ${REPO_DIR}
 warn() { echo "MCPE_WARN $*"; }
