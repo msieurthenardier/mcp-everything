@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ConfigError } from "../src/errors.js";
+import { ConfigError, formatFatal } from "../src/errors.js";
+import { prepareDataDir } from "../src/server.js";
 import { INSTALLATION_ID_PATTERN, loadInstallationId } from "../src/installation.js";
 import { Registry } from "../src/registry.js";
 
@@ -313,6 +314,24 @@ describe("loadInstallationId: failures", () => {
       spy.mockRestore();
     }
     expect(names()).toEqual([]); // nothing was created
+  });
+});
+
+describe("prepareDataDir: a data directory that cannot be made is a ConfigError", () => {
+  it("names the directory and the cause, with no stack in the fatal line", () => {
+    fs.writeFileSync(path.join(dir, "file"), "x");
+    const target = path.join(dir, "file", "sub");
+    let err: unknown;
+    try {
+      prepareDataDir(target);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ConfigError);
+    expect((err as Error).message).toContain(target);
+    const line = formatFatal(err);
+    expect(line).toContain("Cannot make the data directory");
+    expect(line).not.toContain("\n    at ");
   });
 });
 

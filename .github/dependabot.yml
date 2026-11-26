@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # @types/node stays on the Node 22 major to match the Node floor (squawk 0026).
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       minor-and-patch:
         update-types:

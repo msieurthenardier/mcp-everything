@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Server, type CallToolResult, type Tool } from "@modelcontextprotocol/server";
 import type { Config } from "./config.js";
+import { ConfigError } from "./errors.js";
 import { parseRepoRef, validateGitRef } from "./forge/repo-ref.js";
 import { searchProjects } from "./forge/search.js";
 import { allowanceFor, Containment, realClock } from "./network/containment.js";
@@ -18,7 +19,7 @@ import { Docker, type ExecResult } from "./sandbox/docker.js";
 import type { SandboxRef } from "./sandbox/docker-base.js";
 import { DockerUnavailableError } from "./sandbox/errors.js";
 import type { NetworkMode, ProxyRefusalRow } from "./sandbox/network-spec.js";
-import { BEFORE_NOTE, OWNER_SHOWN, removalCommands } from "./sandbox/ownership.js";
+import { BEFORE_NOTE, OWNER_SHOWN, removalCommands, SandboxRefusedError } from "./sandbox/ownership.js";
 import { REPO_DIR, WORK_DIR } from "./sandbox/scripts.js";
 import { buildInvocation, resolveCwd, ToolInputError } from "./toolgen/invoke.js";
 import type { Ecosystem, McpServerSpec, ProjectRecord, ToolDef, WithheldTool } from "./types.js";
@@ -1122,8 +1123,9 @@ export class App {
    * `view` is Docker's own answer about the sandbox's network (`project_info` asks); without one the line is the record's
    * own flag, labelled as such, because nothing here asked Docker.
    */
-  private describe(p: ProjectRecord, verbose: boolean, view?: NetworkMode | "unknown"): string {
-    const network = view === undefined ? `network (recorded): ${p.network ? "on" : "off"}` : `network: ${view}`;
+  private describe(p: ProjectRecord, verbose: boolean, view?: NetworkMode | "unknown" | "not-inspected"): string {
+    const shown = view === "not-inspected" ? "not inspected (made before ownership was recorded; see the owner line)" : view;
+    const network = view === undefined ? `network (recorded): ${p.network ? "on" : "off"}` : `network: ${shown}`;
     const lines = [
       `${p.slug} — ${p.repo.id} (${p.status})`,
       `  source: https://${p.repo.host}/${p.repo.path}${p.commit ? ` @ ${p.commit.slice(0, 12)}` : ""}`,
@@ -1535,9 +1537,11 @@ export class App {
         const building = job !== undefined && job.stage !== "checking";
         // Docker's own view of the network, the refusals and the owner are asked together; each read is caught, so none can
         // fail the tool. The refusals and the proxy's configuration are read only for a contained sandbox that is not being built.
-        const stateRead: Promise<NetworkMode | "unknown" | undefined> = building
+        const stateRead: Promise<NetworkMode | "unknown" | "not-inspected" | undefined> = building
           ? Promise.resolve(undefined)
-          : this.docker.networkState(project.container).catch((): "unknown" => "unknown");
+          : this.docker.networkState(project.container).catch((e: unknown): "unknown" | "not-inspected" =>
+              e instanceof SandboxRefusedError && e.reason === "before" ? "not-inspected" : "unknown",
+            );
         const containedRead = stateRead.then(async (s) =>
           s === "contained"
             ? {
@@ -1813,5 +1817,9 @@ export class App {
 
 /** Make sure the data directory exists and is private before first use. */
 export function prepareDataDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch (e) {
+    throw new ConfigError(`Cannot make the data directory ${dir}: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }

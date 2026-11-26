@@ -25,7 +25,7 @@ import { inertDependencyLookup, type DependencyLookup } from "../scan/dependenci
 import { decide } from "../scan/policy.js";
 import { runScanners } from "../scan/run.js";
 import { emptyCounts } from "../scan/sarif.js";
-import { buildReport, scannersAt, type CheckOutcome, type ScanReport, type ScannerSpec } from "../scan/types.js";
+import { buildReport, scannersAt, type CheckOutcome, type ScanDecision, type ScanReport, type ScannerSpec } from "../scan/types.js";
 import { detect } from "./detect.js";
 import { discover, type McpDiscovery } from "./discovery.js";
 import { recipeFor } from "./recipes.js";
@@ -612,13 +612,32 @@ export class Installer {
     const buildScanners = this.cfg.scan.mode !== "off" && record.scan ? this.scannersFor("build") : [];
     if (record.scan && buildScanners.length > 0) {
       log("Running the scanners after the build…");
-      // A throw out of here (a refusal or an unusable volume) reaches `settleFailure` like any throw of this method: the
-      // record is `failed` with no `scan.build`, so it is not held (DD10). Accepted: it cannot happen for the install's own volume.
-      const scanned = await runScanners(this.docker, volume, buildScanners, {
-        totalTimeoutSec: this.cfg.scan.timeoutSec,
-        dataDir: this.cfg.dataDir,
-      });
-      const decision = decide(this.cfg.scan.mode, this.cfg.scan.blockAt, scanned);
+      // A throw out of here (a refusal or an unusable volume) is a stage that could not run, not a scanner that failed:
+      // it is stored as one `failed` outcome named for the stage. Under `block` it is a block (held like any other, DD10),
+      // so output that was never checked is not published; under `warn` it is reported and the install goes on.
+      let scanned: CheckOutcome[];
+      let decision: ScanDecision;
+      try {
+        scanned = await runScanners(this.docker, volume, buildScanners, {
+          totalTimeoutSec: this.cfg.scan.timeoutSec,
+          dataDir: this.cfg.dataDir,
+        });
+        decision = decide(this.cfg.scan.mode, this.cfg.scan.blockAt, scanned);
+      } catch (e) {
+        const why = oneLine(cleanTerminalText(e instanceof Error ? e.message : String(e)), 300);
+        scanned = [
+          { name: "after-build", kind: "builtin", status: "failed", counts: emptyCounts(), findings: [], omitted: 0, notes: [], error: why },
+        ];
+        decision =
+          this.cfg.scan.mode === "block"
+            ? {
+                mode: "block",
+                blockAt: this.cfg.scan.blockAt,
+                verdict: "block",
+                reason: `the check after the build could not run (${why})`,
+              }
+            : decide(this.cfg.scan.mode, this.cfg.scan.blockAt, scanned);
+      }
       record.scan.build = { checks: scanned, decision, at: new Date().toISOString() };
       if (decision.verdict === "block") {
         if (this.contained) record.warnings.push(...refusalWarnings(refused, MAX_REFUSAL_WARNINGS));

@@ -63,8 +63,8 @@ if [ -n "$ref" ]; then
   if ! git -c credential.helper= clone --quiet --depth 1 $extra --branch "$ref" -- "$url" ${REPO_DIR} >&2; then
     rm -rf ${REPO_DIR}
     git init --quiet ${REPO_DIR} >&2
-    git -C ${REPO_DIR} remote add origin "$url" >&2
-    git -C ${REPO_DIR} -c credential.helper= fetch --quiet --depth 1 origin "$ref" >&2
+    git -C ${REPO_DIR} remote add -- origin "$url" >&2
+    git -C ${REPO_DIR} -c credential.helper= fetch --quiet --depth 1 -- origin "$ref" >&2
     git -C ${REPO_DIR} checkout --quiet FETCH_HEAD >&2
   fi
 else

@@ -14,9 +14,12 @@ name: Docker gVisor measurements
 
 on:
   workflow_dispatch:
+  # Weekly (Mondays 04:17 UTC), so drift in the runner's Docker, gVisor's download or a base image shows up.
+  schedule:
+    - cron: "17 4 * * 1"
   pull_request:
     types: [opened, synchronize, ready_for_review]
-    # Advisory (not a required check): runs on demand, or for sandbox, network and install changes.
+    # Advisory (not a required check): runs on demand, weekly, or for sandbox, network and install changes.
     paths:
       - "src/sandbox/**"
       - "src/network/**"

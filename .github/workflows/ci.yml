@@ -37,13 +37,13 @@ jobs:
 
       # Vitest already fails when no test file matches, so this catches a suite
       # that was mostly skipped or excluded. The floor is kept somewhat under the
-      # passing count: 867 since 2026-11-17, when 890 passed. The step prints the
+      # passing count: 2900 since 2026-11-25, when 3076 passed. The step prints the
       # current count on every run. Raise the floor as the suite grows.
       - name: Minimum passed tests
         run: |
           node -e '
             const fs = require("fs");
-            const floor = 867;
+            const floor = 2900;
             let n;
             try {
               n = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/vitest.json", "utf8")).numPassedTests;

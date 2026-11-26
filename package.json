@@ -26,8 +26,8 @@
     "start": "node dist/index.js",
     "test": "vitest run --project default",
     "test:slow": "vitest run --project slow",
-    "test:docker": "MCPE_DOCKER_TESTS=1 vitest run test/integration",
-    "test:docker:pressure": "MCPE_DOCKER_TESTS=1 MCPE_PRESSURE_TESTS=1 vitest run test/integration -t 'under fork pressure'"
+    "test:docker": "MCPE_DOCKER_TESTS=1 vitest run --reporter=verbose test/integration",
+    "test:docker:pressure": "MCPE_DOCKER_TESTS=1 MCPE_PRESSURE_TESTS=1 vitest run --reporter=verbose test/integration -t 'under fork pressure'"
   },
   "dependencies": {
     "@modelcontextprotocol/client": "^2.4.0",
