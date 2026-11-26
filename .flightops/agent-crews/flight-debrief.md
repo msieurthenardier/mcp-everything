@@ -66,6 +66,12 @@ action: debrief-interview
 Review the implementation produced during this flight. Examine the code changes,
 test coverage, and architectural decisions made.
 
+Read first, so that what you report is current: the flight's legs (every file in
+its legs/ directory, for the leg-spec questions below), and its flight log. Read the
+log's Summary and every leg's entry under Leg Progress in full, and include its
+HAT changes and review fixes, which are part of the flight. Do not report as open
+anything the log records as settled.
+
 Provide structured input for the debrief:
 
 **Implementation Quality**:
