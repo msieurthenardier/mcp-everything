@@ -129,6 +129,11 @@ Update flight log with outcomes. Propagate changes to artifacts (flight, mission
 CLAUDE.md, README, and other project documentation as needed. When done, update leg
 status to landed and report what you implemented and how you verified it. Do not
 commit. Signal [LAND:leg].
+
+Edit files only with the Read, Edit and Write tools. Never create or change a file
+with a shell command: no sed -i, no redirection (> or >>) into a file, no heredoc
+into a file, no script (python, node) that writes files. The shell is for running
+tests, the typecheck, the build, grep and other commands that change nothing.
 ```
 
 ### Reviewer: Review
@@ -207,6 +212,10 @@ Address the following review feedback:
 
 Fix all blocking issues. Non-blocking issues: fix if straightforward, otherwise
 note as accepted. Signal [HANDOFF:review-needed] when fixes are complete.
+
+Edit files only with the Read, Edit and Write tools, the flight log included. Never
+create or change a file with a shell command: no sed -i, no redirection (> or >>)
+into a file, no heredoc into a file, no script (python, node) that writes files.
 ```
 
 ### Developer: Commit
