@@ -1,6 +1,6 @@
 # Flight: Checking What a Build Installed
 
-**Status**: landed
+**Status**: completed
 **Mission**: [Vetted and Contained Installs](../../mission.md)
 
 > **Planned with the operator on 2026-11-25**, after flight 4 (PR #33) merged. The operator asked that it not be over-engineered: it has the smallest shape that meets the criterion. Three things were decided with the operator:

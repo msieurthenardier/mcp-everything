@@ -184,3 +184,7 @@ Known from earlier debriefs, for this flight's runs:
 - The review's non-blocking item (the unknown-build-verdict line in `buildReport` was untested) was fixed with a server test, "treats a build report with an unknown verdict as absent"; removing the verdict line was confirmed to fail it.
 - **Committed** as `f76be81` (all three legs, the review fix, the artifacts), pushed. Draft PR #34 opened. The first push failed with a transient access error; the retry succeeded.
 - **Landed.** Flight → `landed`. In `flight.md`, the criteria, checkpoints, the Docker prerequisite and the completion checklist are checked, except "Code merged". Flight 5 is checked off in `mission.md`; the mission's criteria and open questions are left to its debrief, as for flights 1–4. No CLAUDE.md change is needed: there is no new command or variable. The scanners file gains `stage`, documented in `docs/checking.md`. `[COMPLETE:flight]`.
+- **Debriefed** (`/mission-control:flight-debrief`, 2026-11-25).
+  - Developer and Architect interviews held. There was no interview with the operator: the log answered its questions.
+  - Squawks 0063 (Docker suite timings) and 0064 (integration suite contributor note) were logged with the operator's OK.
+  - Flight → `completed`.
